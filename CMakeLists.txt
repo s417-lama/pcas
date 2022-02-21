@@ -4,10 +4,15 @@ cmake_minimum_required(VERSION 3.1)
 
 project(pcas VERSION 0.0.1 LANGUAGES CXX)
 
+find_package(MPI REQUIRED)
+include_directories(${MPI_INCLUDE_PATH})
+
 add_library(pcas INTERFACE)
 target_include_directories(pcas INTERFACE include)
+target_link_libraries(pcas INTERFACE ${MPI_CXX_LIBRARIES})
 
 include(CTest)
 if(BUILD_TESTING)
+  list(APPEND CMAKE_CTEST_ARGUMENTS "--output-on-failure")
   add_subdirectory(tests)
 endif()
