@@ -7,6 +7,7 @@ int main(int argc, char** argv) {
   MPI_Init(&argc, &argv);
 
   doctest::Context ctx;
+  ctx.setOption("abort-after", 5);
   ctx.setOption("force-colors", true);
   ctx.applyCommandLine(argc, argv);
 
