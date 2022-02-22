@@ -1,5 +1,6 @@
 #pragma once
 
+#include <type_traits>
 #include <vector>
 
 #include <mpi.h>
@@ -48,7 +49,8 @@ public:
   void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t size);
 
   template <access_mode Mode, typename T>
-  auto checkout(global_ptr<T> ptr, uint64_t size);
+  std::conditional_t<Mode == access_mode::read, const T*, T*>
+  checkout(global_ptr<T> ptr, uint64_t size);
 
   template <typename T>
   void checkin(T* raw_ptr);
@@ -337,7 +339,8 @@ TEST_CASE("get and put") {
 }
 
 template <access_mode Mode, typename T>
-auto pcas::checkout(global_ptr<T> ptr, uint64_t size) {
+std::conditional_t<Mode == access_mode::read, const T*, T*>
+pcas::checkout(global_ptr<T> ptr, uint64_t size) {
   T* ret = (T*)std::malloc(size * sizeof(T));
   if (Mode == access_mode::read_write ||
       Mode == access_mode::read) {
@@ -347,11 +350,7 @@ auto pcas::checkout(global_ptr<T> ptr, uint64_t size) {
     .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = (uint8_t*)ret,
     .size = size * sizeof(T), .mode = Mode,
   };
-  if constexpr (Mode == access_mode::read) {
-    return const_cast<const T*>(ret);
-  } else {
-    return ret;
-  }
+  return ret;
 }
 
 template <typename T>
