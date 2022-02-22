@@ -47,11 +47,14 @@ public:
   template <typename T>
   void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t size);
 
-  template <typename T>
-  T* checkout(global_ptr<T> ptr, uint64_t size, access_mode mode);
+  template <access_mode Mode, typename T>
+  auto checkout(global_ptr<T> ptr, uint64_t size);
 
   template <typename T>
   void checkin(T* raw_ptr);
+
+  template <typename T>
+  void checkin(const T* raw_ptr);
 };
 
 pcas::pcas(MPI_Comm comm) {
@@ -333,18 +336,22 @@ TEST_CASE("get and put") {
   }
 }
 
-template <typename T>
-T* pcas::checkout(global_ptr<T> ptr, uint64_t size, access_mode mode) {
+template <access_mode Mode, typename T>
+auto pcas::checkout(global_ptr<T> ptr, uint64_t size) {
   T* ret = (T*)std::malloc(size * sizeof(T));
-  if (mode == access_mode::read_write ||
-      mode == access_mode::read) {
+  if (Mode == access_mode::read_write ||
+      Mode == access_mode::read) {
     get(ptr, ret, size);
   }
   checkouts_[(void*)ret] = (checkout_entry){
     .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = (uint8_t*)ret,
-    .size = size * sizeof(T), .mode = mode,
+    .size = size * sizeof(T), .mode = Mode,
   };
-  return ret;
+  if constexpr (Mode == access_mode::read) {
+    return const_cast<const T*>(ret);
+  } else {
+    return ret;
+  }
 }
 
 template <typename T>
@@ -362,6 +369,11 @@ void pcas::checkin(T* raw_ptr) {
   checkouts_.erase((void*)raw_ptr);
 }
 
+template <typename T>
+void pcas::checkin(const T* raw_ptr) {
+  checkin(const_cast<T*>(raw_ptr));
+}
+
 TEST_CASE("checkout and checkin") {
   pcas pc;
 
@@ -372,7 +384,7 @@ TEST_CASE("checkout and checkin") {
   auto p = pc.malloc<int>(n);
 
   if (rank == 0) {
-    int* rp = pc.checkout(p, n, access_mode::write);
+    int* rp = pc.checkout<access_mode::write>(p, n);
     for (int i = 0; i < n; i++) {
       rp[i] = i;
     }
@@ -382,7 +394,7 @@ TEST_CASE("checkout and checkin") {
   pc.barrier();
 
   SUBCASE("read the entire array") {
-    int* rp = pc.checkout(p, n, access_mode::read);
+    const int* rp = pc.checkout<access_mode::read>(p, n);
     for (int i = 0; i < n; i++) {
       CHECK(rp[i] == i);
     }
@@ -394,7 +406,7 @@ TEST_CASE("checkout and checkin") {
     int ie = n / 5 * 4;
     int s = ie - ib;
 
-    int* rp = pc.checkout(p + ib, s, access_mode::read);
+    const int* rp = pc.checkout<access_mode::read>(p + ib, s);
     for (int i = 0; i < s; i++) {
       CHECK(rp[i] == i + ib);
     }
@@ -405,7 +417,7 @@ TEST_CASE("checkout and checkin") {
     int stride = 48;
     for (int i = rank * stride; i < n; i += nproc * stride) {
       int s = std::min(stride, n - i);
-      int* rp = pc.checkout(p + i, s, access_mode::read_write);
+      int* rp = pc.checkout<access_mode::read_write>(p + i, s);
       for (int j = 0; j < s; j++) {
         rp[j] *= 2;
       }
@@ -414,7 +426,7 @@ TEST_CASE("checkout and checkin") {
 
     pc.barrier();
 
-    int* rp = pc.checkout(p, n, access_mode::read);
+    const int* rp = pc.checkout<access_mode::read>(p, n);
     for (int i = 0; i < n; i++) {
       CHECK(rp[i] == i * 2);
     }
