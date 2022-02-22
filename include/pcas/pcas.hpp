@@ -9,6 +9,7 @@
 
 #include "pcas/defs.hpp"
 #include "pcas/util.hpp"
+#include "pcas/physical_mem.hpp"
 
 namespace pcas {
 
