@@ -8,7 +8,6 @@
 
 #include "pcas/defs.hpp"
 #include "pcas/util.hpp"
-#include "pcas/global_ptr.hpp"
 
 namespace pcas {
 
@@ -19,6 +18,8 @@ class pcas {
 
   obj_id_t obj_id_count_ = 0; // TODO: better management of used IDs
   std::vector<obj_entry> objs_;
+
+  std::unordered_map<void*, checkout_entry> checkouts_;
 
 public:
   pcas(MPI_Comm comm = MPI_COMM_WORLD);
@@ -45,6 +46,12 @@ public:
 
   template <typename T>
   void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t size);
+
+  template <typename T>
+  T* checkout(global_ptr<T> ptr, uint64_t size, access_mode mode);
+
+  template <typename T>
+  void checkin(T* raw_ptr);
 };
 
 pcas::pcas(MPI_Comm comm) {
@@ -297,7 +304,7 @@ TEST_CASE("get and put") {
     CHECK(buf[n + 1] == special);
   }
 
-  SUBCASE("get a partial part of the array") {
+  SUBCASE("get the partial array") {
     int ib = n / 5 * 2;
     int ie = n / 5 * 4;
     int s = ie - ib;
@@ -323,6 +330,95 @@ TEST_CASE("get and put") {
       CHECK(buf[1] == i);
       CHECK(buf[2] == special);
     }
+  }
+}
+
+template <typename T>
+T* pcas::checkout(global_ptr<T> ptr, uint64_t size, access_mode mode) {
+  T* ret = (T*)std::malloc(size * sizeof(T));
+  if (mode == access_mode::read_write ||
+      mode == access_mode::read) {
+    get(ptr, ret, size);
+  }
+  checkouts_[(void*)ret] = (checkout_entry){
+    .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = (uint8_t*)ret,
+    .size = size * sizeof(T), .mode = mode,
+  };
+  return ret;
+}
+
+template <typename T>
+void pcas::checkin(T* raw_ptr) {
+  auto c = checkouts_.find((void*)raw_ptr);
+  if (c == checkouts_.end()) {
+    die("The pointer %p passed to checkin() is not registered", raw_ptr);
+  }
+  checkout_entry entry = c->second;
+  if (entry.mode == access_mode::read_write ||
+      entry.mode == access_mode::write) {
+    put(entry.raw_ptr, entry.ptr, entry.size);
+  }
+  std::free(raw_ptr);
+  checkouts_.erase((void*)raw_ptr);
+}
+
+TEST_CASE("checkout and checkin") {
+  pcas pc;
+
+  int rank = pc.rank();
+  int nproc = pc.nproc();
+
+  int n = 100000;
+  auto p = pc.malloc<int>(n);
+
+  if (rank == 0) {
+    int* rp = pc.checkout(p, n, access_mode::write);
+    for (int i = 0; i < n; i++) {
+      rp[i] = i;
+    }
+    pc.checkin(rp);
+  }
+
+  pc.barrier();
+
+  SUBCASE("read the entire array") {
+    int* rp = pc.checkout(p, n, access_mode::read);
+    for (int i = 0; i < n; i++) {
+      CHECK(rp[i] == i);
+    }
+    pc.checkin(rp);
+  }
+
+  SUBCASE("read the partial array") {
+    int ib = n / 5 * 2;
+    int ie = n / 5 * 4;
+    int s = ie - ib;
+
+    int* rp = pc.checkout(p + ib, s, access_mode::read);
+    for (int i = 0; i < s; i++) {
+      CHECK(rp[i] == i + ib);
+    }
+    pc.checkin(rp);
+  }
+
+  SUBCASE("read and write the partial array") {
+    int stride = 48;
+    for (int i = rank * stride; i < n; i += nproc * stride) {
+      int s = std::min(stride, n - i);
+      int* rp = pc.checkout(p + i, s, access_mode::read_write);
+      for (int j = 0; j < s; j++) {
+        rp[j] *= 2;
+      }
+      pc.checkin(rp);
+    }
+
+    pc.barrier();
+
+    int* rp = pc.checkout(p, n, access_mode::read);
+    for (int i = 0; i < n; i++) {
+      CHECK(rp[i] == i * 2);
+    }
+    pc.checkin(rp);
   }
 }
 

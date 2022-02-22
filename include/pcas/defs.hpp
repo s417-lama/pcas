@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <mpi.h>
 
+#include "pcas/global_ptr.hpp"
+
 namespace pcas {
 
 enum class dist_policy {
@@ -21,6 +23,19 @@ struct obj_entry {
   uint64_t    block_size;
   uint8_t*    baseptr;
   MPI_Win     win;
+};
+
+enum class access_mode {
+  read,
+  write,
+  read_write,
+};
+
+struct checkout_entry {
+  global_ptr<uint8_t> ptr;
+  uint8_t*            raw_ptr;
+  uint64_t            size;
+  access_mode         mode;
 };
 
 }
