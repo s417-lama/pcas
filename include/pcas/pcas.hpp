@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <type_traits>
 
 #include <mpi.h>
@@ -133,8 +134,7 @@ global_ptr<T> pcas::malloc(uint64_t nelems,
       virtual_mem vm(nullptr, local_size * nproc_);
       physical_mem pm(local_size);
 
-      uint8_t* vm_local_addr = (uint8_t*)vm.addr() + rank_ * local_size;
-      pm.map(vm_local_addr, 0, local_size);
+      void* vm_local_addr = vm.map_physical_mem(rank_ * local_size, 0, local_size, pm);
 
       MPI_Win win = MPI_WIN_NULL;
       MPI_Win_create(vm_local_addr,
@@ -212,7 +212,7 @@ void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
   uint64_t offset_max = offset_min + nelems * sizeof(T);
   uint64_t offset     = offset_min;
 
-  CHECK(offset_max <= entry.size);
+  assert(offset_max <= entry.size);
 
   std::vector<MPI_Request> reqs;
   while (offset < offset_max) {

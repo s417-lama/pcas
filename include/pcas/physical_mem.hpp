@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cassert>
 
 #include "doctest/doctest.h"
 
@@ -12,10 +13,11 @@ namespace pcas {
 
 class physical_mem {
   int fd_ = -1;
+  uint64_t size_ = 0;
 
 public:
   physical_mem() {}
-  physical_mem(uint64_t size) {
+  physical_mem(uint64_t size) : size_(size) {
     fd_ = memfd_create("PCAS", 0);
     if (fd_ == -1) {
       perror("memfd_create");
@@ -48,6 +50,7 @@ public:
   }
 
   void* map(void* addr, uint64_t offset, uint64_t size) const {
+    assert(offset + size <= size_);
     int flags = MAP_SHARED;
     if (addr != nullptr) flags |= MAP_FIXED;
     void* ret = mmap(addr, size, PROT_WRITE, flags, fd_, offset);
@@ -67,7 +70,7 @@ public:
 
 };
 
-TEST_CASE("Map two virtual addresses to the same physical address") {
+TEST_CASE("map two virtual addresses to the same physical address") {
   physical_mem pm(16 * 4096);
   int* b1 = nullptr;
   int* b2 = nullptr;
