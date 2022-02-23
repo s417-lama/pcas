@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <cstdint>
-#include <cassert>
 #include <algorithm>
 #include <tuple>
 
@@ -49,7 +48,7 @@ TEST_CASE("calculate local block size") {
 inline auto block_index_info(uint64_t index,
                              uint64_t size,
                              int      nproc) {
-  assert(index < size);
+  CHECK(index < size);
   uint64_t size_l = local_block_size(size, nproc);
   int      owner  = index / size_l;
   uint64_t idx_b  = owner * size_l;

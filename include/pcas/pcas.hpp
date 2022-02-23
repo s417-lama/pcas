@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cassert>
 #include <type_traits>
 
 #include <mpi.h>
@@ -11,6 +10,7 @@
 #include "pcas/global_ptr.hpp"
 #include "pcas/physical_mem.hpp"
 #include "pcas/virtual_mem.hpp"
+#include "pcas/cache.hpp"
 
 namespace pcas {
 
@@ -21,16 +21,19 @@ enum class dist_policy {
 };
 
 using obj_id_t = uint64_t;
+using cache_t = cache_system<min_block_size>;
 
 struct obj_entry {
-  int          owner;
-  obj_id_t     id;
-  uint64_t     size;
-  dist_policy  dpolicy;
-  uint64_t     block_size;
-  physical_mem pm;
-  virtual_mem  vm;
-  MPI_Win      win;
+  int                           owner;
+  obj_id_t                      id;
+  uint64_t                      size;
+  uint64_t                      effective_size;
+  dist_policy                   dpolicy;
+  uint64_t                      block_size;
+  physical_mem                  home_pm;
+  virtual_mem                   vm;
+  std::vector<cache_t::entry_t> cache_entries;
+  MPI_Win                       win;
 };
 
 enum class access_mode {
@@ -47,8 +50,8 @@ struct checkout_entry {
 };
 
 class pcas {
-  int rank_;
-  int nproc_;
+  int      rank_;
+  int      nproc_;
   MPI_Comm comm_;
 
   obj_id_t obj_id_count_ = 0; // TODO: better management of used IDs
@@ -56,19 +59,24 @@ class pcas {
 
   std::unordered_map<void*, checkout_entry> checkouts_;
 
+  cache_t cache_;
+
 public:
-  pcas(MPI_Comm comm = MPI_COMM_WORLD);
+  pcas(uint64_t cache_size = 1024 * min_block_size, MPI_Comm comm = MPI_COMM_WORLD);
   ~pcas();
 
   int rank() const { return rank_; }
   int nproc() const { return nproc_; }
 
-  void barrier() const { MPI_Barrier(comm_); }
+  void barrier() {
+    cache_.evict_all();
+    MPI_Barrier(comm_);
+  }
 
   template <typename T>
-  global_ptr<T> malloc(uint64_t nelems,
-                       dist_policy dpolicy = dist_policy::block,
-                       uint64_t block_size = 0);
+  global_ptr<T> malloc(uint64_t    nelems,
+                       dist_policy dpolicy    = dist_policy::block,
+                       uint64_t    block_size = 0);
 
   template <typename T>
   void free(global_ptr<T> ptr);
@@ -91,9 +99,18 @@ public:
 
   template <typename T>
   void checkin(const T* raw_ptr);
+
+  /* unsafe APIs for debugging */
+
+  template <typename T>
+  void* get_physical_mem(global_ptr<T> ptr) {
+    obj_entry& obe = objs_[ptr.id()];
+    return obe.home_pm.anon_vm_addr();
+  }
+
 };
 
-pcas::pcas(MPI_Comm comm) {
+pcas::pcas(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
   int mpi_initialized = 0;
   MPI_Initialized(&mpi_initialized);
   if (!mpi_initialized) {
@@ -119,21 +136,21 @@ TEST_CASE("initialize and finalize PCAS") {
 }
 
 template <typename T>
-global_ptr<T> pcas::malloc(uint64_t nelems,
+global_ptr<T> pcas::malloc(uint64_t    nelems,
                            dist_policy dpolicy,
-                           uint64_t block_size) {
+                           uint64_t    block_size) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
 
   switch (dpolicy) {
     case dist_policy::block: {
-      uint64_t size_bytes = nelems * sizeof(T);
-      uint64_t local_size = local_block_size(size_bytes, nproc_);
+      uint64_t size = nelems * sizeof(T);
+      uint64_t local_size = local_block_size(size, nproc_);
+      uint64_t effective_size = local_size * nproc_;
 
-      virtual_mem vm(nullptr, local_size * nproc_);
+      virtual_mem vm(nullptr, effective_size);
       physical_mem pm(local_size);
-
       void* vm_local_addr = vm.map_physical_mem(rank_ * local_size, 0, local_size, pm);
 
       MPI_Win win = MPI_WIN_NULL;
@@ -145,15 +162,28 @@ global_ptr<T> pcas::malloc(uint64_t nelems,
                      &win);
       MPI_Win_lock_all(0, win);
 
-      obj_entry entry {
-        .owner = -1, .id = obj_id_count_++, .size = size_bytes,
+      std::vector<cache_t::entry_t> cache_entries;
+      for (uint64_t b = 0; b < effective_size / cache_t::block_size; b++) {
+        auto [owner, _idx_b, _idx_e] =
+          block_index_info(b * cache_t::block_size, effective_size, nproc_);
+        if (owner == rank_) {
+          cache_entries.push_back(nullptr);
+        } else {
+          cache_entries.push_back(cache_.alloc_entry());
+        }
+      }
+
+      obj_entry obe {
+        .owner = -1, .id = obj_id_count_++,
+        .size = size, .effective_size = effective_size,
         .dpolicy = dpolicy, .block_size = local_size,
-        .pm = std::move(pm), .vm = std::move(vm), .win = win,
+        .home_pm = std::move(pm), .vm = std::move(vm),
+        .cache_entries = std::move(cache_entries), .win = win,
       };
 
-      auto ret = global_ptr<T>(entry.owner, entry.id, 0);
+      auto ret = global_ptr<T>(obe.owner, obe.id, 0);
 
-      objs_[entry.id] = std::move(entry);
+      objs_[obe.id] = std::move(obe);
 
       return ret;
     }
@@ -169,11 +199,16 @@ void pcas::free(global_ptr<T> ptr) {
   if (ptr == global_ptr<T>()) {
     die("null pointer was passed to pcas::free()");
   }
-  obj_entry& entry = objs_[ptr.id()];
-  switch (entry.dpolicy) {
+  obj_entry& obe = objs_[ptr.id()];
+  switch (obe.dpolicy) {
     case dist_policy::block: {
-      MPI_Win_unlock_all(entry.win);
-      MPI_Win_free(&entry.win);
+      for (auto& cae : obe.cache_entries) {
+        if (cae) {
+          cache_.free_entry(cae);
+        }
+      }
+      MPI_Win_unlock_all(obe.win);
+      MPI_Win_free(&obe.win);
       break;
     }
     default: {
@@ -206,17 +241,17 @@ TEST_CASE("malloc and free with block policy") {
 
 template <typename T, typename Func>
 void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
-  obj_entry& entry = objs_[ptr.id()];
+  obj_entry& obe = objs_[ptr.id()];
 
   uint64_t offset_min = ptr.offset();
   uint64_t offset_max = offset_min + nelems * sizeof(T);
   uint64_t offset     = offset_min;
 
-  assert(offset_max <= entry.size);
+  CHECK(offset_max <= obe.size);
 
   std::vector<MPI_Request> reqs;
   while (offset < offset_max) {
-    auto [owner, idx_b, idx_e] = block_index_info(offset, entry.size, nproc_);
+    auto [owner, idx_b, idx_e] = block_index_info(offset, obe.effective_size, nproc_);
     uint64_t ib = std::max(idx_b, offset_min);
     uint64_t ie = std::min(idx_e, offset_max);
 
@@ -273,7 +308,7 @@ TEST_CASE("loop over blocks") {
 template <typename T>
 void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
   if (from_ptr.owner() == -1) {
-    obj_entry& entry = objs_[from_ptr.id()];
+    obj_entry& obe = objs_[from_ptr.id()];
     uint64_t offset = from_ptr.offset();
     std::vector<MPI_Request> reqs;
 
@@ -283,10 +318,10 @@ void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
                idx_e - idx_b,
                MPI_UINT8_T,
                owner,
-               idx_b - owner * entry.block_size,
+               idx_b - owner * obe.block_size,
                idx_e - idx_b,
                MPI_UINT8_T,
-               entry.win,
+               obe.win,
                &req);
       reqs.push_back(req);
     });
@@ -300,7 +335,7 @@ void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
 template <typename T>
 void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
   if (to_ptr.owner() == -1) {
-    obj_entry& entry = objs_[to_ptr.id()];
+    obj_entry& obe = objs_[to_ptr.id()];
     uint64_t offset = to_ptr.offset();
     std::vector<MPI_Request> reqs;
 
@@ -310,10 +345,10 @@ void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
                idx_e - idx_b,
                MPI_UINT8_T,
                owner,
-               idx_b - owner * entry.block_size,
+               idx_b - owner * obe.block_size,
                idx_e - idx_b,
                MPI_UINT8_T,
-               entry.win,
+               obe.win,
                &req);
       reqs.push_back(req);
     });
@@ -321,7 +356,7 @@ void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
     MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
 
     // ensure remote completion
-    MPI_Win_flush_all(entry.win);
+    MPI_Win_flush_all(obe.win);
   } else {
     die("unimplemented");
   }
@@ -393,15 +428,63 @@ TEST_CASE("get and put") {
 template <access_mode Mode, typename T>
 std::conditional_t<Mode == access_mode::read, const T*, T*>
 pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
-  T* ret = (T*)std::malloc(nelems * sizeof(T));
-  if (Mode == access_mode::read_write ||
-      Mode == access_mode::read) {
-    get(ptr, ret, nelems);
+  obj_entry& obe = objs_[ptr.id()];
+
+  std::vector<std::pair<cache_t::entry_t, uint64_t>> filled_cache_entries;
+  std::vector<MPI_Request> reqs;
+
+  uint64_t cache_entry_b = ptr.offset() / cache_t::block_size;
+  uint64_t cache_entry_e =
+    (ptr.offset() + nelems * sizeof(T) + cache_t::block_size - 1) / cache_t::block_size;
+  for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
+    auto cae = obe.cache_entries[b];
+    if (cae) {
+      bool hit = cache_.checkout(cae);
+      if (!hit) {
+        // TODO: fix the assumption cache_t::block_size == min_block_size
+        auto [owner, _idx_b, _idx_e] =
+          block_index_info(b * cache_t::block_size, obe.effective_size, nproc_);
+
+        uint64_t vm_offset = b * cache_t::block_size;
+        filled_cache_entries.push_back(std::make_pair(cae, vm_offset));
+
+        if (Mode == access_mode::read_write ||
+            Mode == access_mode::read) {
+          void* cache_block_ptr = cache_.pm().anon_vm_addr();
+
+          CHECK(vm_offset >= owner * obe.block_size);
+          CHECK(vm_offset - owner * obe.block_size + cache_t::block_size <= obe.block_size);
+
+          MPI_Request req;
+          MPI_Rget((uint8_t*)cache_block_ptr + cae->pm_offset,
+                   cache_t::block_size,
+                   MPI_UINT8_T,
+                   owner,
+                   vm_offset - owner * obe.block_size,
+                   cache_t::block_size,
+                   MPI_UINT8_T,
+                   obe.win,
+                   &req);
+          reqs.push_back(req);
+        }
+      }
+    }
   }
+
+  for (auto [cae, vm_offset] : filled_cache_entries) {
+    physical_mem& cache_pm = cache_.pm();
+    obe.vm.map_physical_mem(vm_offset, cae->pm_offset, cache_t::block_size, cache_pm);
+  }
+
+  MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+
+  T* ret = (T*)((uint8_t*)obe.vm.addr() + ptr.offset());
+
   checkouts_[(void*)ret] = (checkout_entry){
     .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = (uint8_t*)ret,
     .size = nelems * sizeof(T), .mode = Mode,
   };
+
   return ret;
 }
 
@@ -411,12 +494,25 @@ void pcas::checkin(T* raw_ptr) {
   if (c == checkouts_.end()) {
     die("The pointer %p passed to checkin() is not registered", raw_ptr);
   }
-  checkout_entry entry = c->second;
-  if (entry.mode == access_mode::read_write ||
-      entry.mode == access_mode::write) {
-    put(entry.raw_ptr, entry.ptr, entry.size);
+  checkout_entry che = c->second;
+  if (che.mode == access_mode::read_write ||
+      che.mode == access_mode::write) {
+    // TODO: temporarily reuse the implementation of PUT for now
+    put(che.raw_ptr, che.ptr, che.size);
   }
-  std::free(raw_ptr);
+
+  obj_entry& obe = objs_[che.ptr.id()];
+
+  uint64_t cache_entry_b = che.ptr.offset() / cache_t::block_size;
+  uint64_t cache_entry_e =
+    (che.ptr.offset() + che.size + cache_t::block_size - 1) / cache_t::block_size;
+  for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
+    auto cae = obe.cache_entries[b];
+    if (cae) {
+      cache_.checkin(cae);
+    }
+  }
+
   checkouts_.erase((void*)raw_ptr);
 }
 
@@ -425,29 +521,26 @@ void pcas::checkin(const T* raw_ptr) {
   checkin(const_cast<T*>(raw_ptr));
 }
 
-TEST_CASE("checkout and checkin") {
+TEST_CASE("checkout and checkin (small, aligned)") {
   pcas pc;
 
   int rank = pc.rank();
   int nproc = pc.nproc();
 
-  int n = 100000;
-  auto p = pc.malloc<int>(n);
+  int n = min_block_size * nproc;
+  auto p = pc.malloc<uint8_t>(n);
 
-  if (rank == 0) {
-    int* rp = pc.checkout<access_mode::write>(p, n);
-    for (int i = 0; i < n; i++) {
-      rp[i] = i;
-    }
-    pc.checkin(rp);
+  uint8_t* home_ptr = (uint8_t*)pc.get_physical_mem(p);
+  for (uint64_t i = 0; i < min_block_size; i++) {
+    home_ptr[i] = rank;
   }
 
   pc.barrier();
 
   SUBCASE("read the entire array") {
-    const int* rp = pc.checkout<access_mode::read>(p, n);
+    const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
     for (int i = 0; i < n; i++) {
-      CHECK(rp[i] == i);
+      CHECK_MESSAGE(rp[i] == i / min_block_size, "rank: ", rank, ", i: ", i);
     }
     pc.checkin(rp);
   }
@@ -457,19 +550,74 @@ TEST_CASE("checkout and checkin") {
     int ie = n / 5 * 4;
     int s = ie - ib;
 
-    const int* rp = pc.checkout<access_mode::read>(p + ib, s);
+    const uint8_t* rp = pc.checkout<access_mode::read>(p + ib, s);
     for (int i = 0; i < s; i++) {
-      CHECK(rp[i] == i + ib);
+      CHECK_MESSAGE(rp[i] == (i + ib) / min_block_size, "rank: ", rank, ", i: ", i);
     }
     pc.checkin(rp);
   }
 
+  pc.free(p);
+}
+
+TEST_CASE("checkout and checkin (large, not aligned)") {
+  pcas pc(16 * min_block_size);
+
+  int rank = pc.rank();
+  int nproc = pc.nproc();
+
+  int n = 100000;
+  auto p = pc.malloc<int>(n);
+
+  int max_checkout_size = (16 - 2) * min_block_size / sizeof(int);
+
+  if (rank == 0) {
+    for (int i = 0; i < n; i += max_checkout_size) {
+      int m = std::min(max_checkout_size, n - i);
+      int* rp = pc.checkout<access_mode::write>(p + i, m);
+      for (int j = 0; j < m; j++) {
+        rp[j] = i + j;
+      }
+      pc.checkin(rp);
+    }
+  }
+
+  pc.barrier();
+
+  SUBCASE("read the entire array") {
+    for (int i = 0; i < n; i += max_checkout_size) {
+      int m = std::min(max_checkout_size, n - i);
+      const int* rp = pc.checkout<access_mode::read>(p + i, m);
+      for (int j = 0; j < m; j++) {
+        CHECK(rp[j] == i + j);
+      }
+      pc.checkin(rp);
+    }
+  }
+
+  SUBCASE("read the partial array") {
+    int ib = n / 5 * 2;
+    int ie = n / 5 * 4;
+    int s = ie - ib;
+
+    for (int i = 0; i < s; i += max_checkout_size) {
+      int m = std::min(max_checkout_size, s - i);
+      const int* rp = pc.checkout<access_mode::read>(p + ib + i, m);
+      for (int j = 0; j < m; j++) {
+        CHECK(rp[j] == i + ib + j);
+      }
+      pc.checkin(rp);
+    }
+  }
+
   SUBCASE("read and write the partial array") {
     int stride = 48;
+    REQUIRE(stride <= max_checkout_size);
     for (int i = rank * stride; i < n; i += nproc * stride) {
       int s = std::min(stride, n - i);
       int* rp = pc.checkout<access_mode::read_write>(p + i, s);
       for (int j = 0; j < s; j++) {
+        CHECK(rp[j] == j + i);
         rp[j] *= 2;
       }
       pc.checkin(rp);
@@ -477,11 +625,14 @@ TEST_CASE("checkout and checkin") {
 
     pc.barrier();
 
-    const int* rp = pc.checkout<access_mode::read>(p, n);
-    for (int i = 0; i < n; i++) {
-      CHECK(rp[i] == i * 2);
+    for (int i = 0; i < n; i += max_checkout_size) {
+      int m = std::min(max_checkout_size, n - i);
+      const int* rp = pc.checkout<access_mode::read>(p + i, m);
+      for (int j = 0; j < m; j++) {
+        CHECK(rp[j] == (i + j) * 2);
+      }
+      pc.checkin(rp);
     }
-    pc.checkin(rp);
   }
 
   pc.free(p);

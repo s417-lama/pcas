@@ -5,11 +5,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
-#include <cassert>
 
 #include "doctest/doctest.h"
 
-#include "physical_mem.hpp"
+#include "pcas/util.hpp"
+#include "pcas/physical_mem.hpp"
 
 namespace pcas {
 
@@ -17,28 +17,28 @@ class virtual_mem {
   void* addr_ = nullptr;
   uint64_t size_;
 
-  void mmap_no_physical_mem(void* addr, uint64_t size) {
+  void* mmap_no_physical_mem(void* addr, uint64_t size) const {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     if (addr != nullptr) flags |= MAP_FIXED;
-    addr_ = mmap(addr, size, PROT_NONE, flags, -1, 0);
-    if (addr_ == MAP_FAILED) {
+    void* ret = mmap(addr, size, PROT_NONE, flags, -1, 0);
+    if (ret == MAP_FAILED) {
       perror("mmap");
-      exit(1);
+      die("virtual_mem: mmap(%p, %ld, ...) failed", addr, size);
     }
+    return ret;
   }
 
-  void munmap_(void* addr, uint64_t size) {
+  void munmap_(void* addr, uint64_t size) const {
     if (munmap(addr, size) == -1) {
       perror("munmap");
-      exit(1);
+      die("virtual_mem: munmap(%p, %ld) failed", addr, size);
     }
   }
 
 public:
   virtual_mem() {}
-  virtual_mem(void* addr, uint64_t size) {
-    mmap_no_physical_mem(addr, size);
-    size_ = size;
+  virtual_mem(void* addr, uint64_t size) : size_(size) {
+    addr_ = mmap_no_physical_mem(addr, size);
   }
 
   virtual_mem(const virtual_mem&) = delete;
@@ -64,17 +64,18 @@ public:
   void* addr() const { return addr_; }
   uint64_t size() const { return size_; }
 
-  void* map_physical_mem(uint64_t vm_offset, uint64_t pm_offset, uint64_t size, physical_mem& pm) {
-    assert(vm_offset + size <= size_);
+  void* map_physical_mem(uint64_t vm_offset, uint64_t pm_offset, uint64_t size, physical_mem& pm) const {
+    CHECK(vm_offset + size <= size_);
     munmap_((uint8_t*)addr_ + vm_offset, size); // TODO: needed?
     void* ret = pm.map((uint8_t*)addr_ + vm_offset, pm_offset, size);
-    assert(ret == (uint8_t*)addr_ + vm_offset);
+    CHECK(ret == (uint8_t*)addr_ + vm_offset);
     return ret;
   }
 
-  void unmap_physical_mem(uint64_t vm_offset, uint64_t size) {
+  void unmap_physical_mem(uint64_t vm_offset, uint64_t size) const {
     munmap_((uint8_t*)addr_ + vm_offset, size);
-    mmap_no_physical_mem((uint8_t*)addr_ + vm_offset, size);
+    void* ret = mmap_no_physical_mem((uint8_t*)addr_ + vm_offset, size);
+    CHECK(ret == (uint8_t*)addr_ + vm_offset);
   }
 
 };
