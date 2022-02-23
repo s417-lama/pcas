@@ -11,9 +11,10 @@
 namespace pcas {
 
 class physical_mem {
-  int fd_;
+  int fd_ = -1;
 
 public:
+  physical_mem() {}
   physical_mem(uint64_t size) {
     fd_ = memfd_create("PCAS", 0);
     if (fd_ == -1) {
@@ -27,11 +28,26 @@ public:
     }
   }
 
+  physical_mem(const physical_mem&) = delete;
+
+  physical_mem(physical_mem&& pm) : fd_(pm.fd_) { pm.fd_ = -1; };
+
   ~physical_mem() {
-    close(fd_);
+    if (fd_ != -1) {
+      close(fd_);
+    }
   }
 
-  void* map(void* addr, uint64_t offset, uint64_t size) {
+  physical_mem& operator=(const physical_mem&) = delete;
+
+  physical_mem& operator=(physical_mem&& pm) {
+    this->~physical_mem();
+    fd_ = pm.fd_;
+    pm.fd_ = -1;
+    return *this;
+  }
+
+  void* map(void* addr, uint64_t offset, uint64_t size) const {
     int flags = MAP_SHARED;
     if (addr != nullptr) flags |= MAP_FIXED;
     void* ret = mmap(addr, size, PROT_WRITE, flags, fd_, offset);
@@ -42,7 +58,7 @@ public:
     return ret;
   }
 
-  void unmap(void* addr, uint64_t size) {
+  void unmap(void* addr, uint64_t size) const {
     if (munmap(addr, size) == -1) {
       perror("munmap");
       exit(1);

@@ -1,17 +1,49 @@
 #pragma once
 
 #include <type_traits>
-#include <vector>
 
 #include <mpi.h>
 
 #include "doctest/doctest.h"
 
-#include "pcas/defs.hpp"
 #include "pcas/util.hpp"
+#include "pcas/global_ptr.hpp"
 #include "pcas/physical_mem.hpp"
+#include "pcas/virtual_mem.hpp"
 
 namespace pcas {
+
+enum class dist_policy {
+  local,
+  block,
+  block_cyclic,
+};
+
+using obj_id_t = uint64_t;
+
+struct obj_entry {
+  int          owner;
+  obj_id_t     id;
+  uint64_t     size;
+  dist_policy  dpolicy;
+  uint64_t     block_size;
+  physical_mem pm;
+  virtual_mem  vm;
+  MPI_Win      win;
+};
+
+enum class access_mode {
+  read,
+  write,
+  read_write,
+};
+
+struct checkout_entry {
+  global_ptr<uint8_t> ptr;
+  uint8_t*            raw_ptr;
+  uint64_t            size;
+  access_mode         mode;
+};
 
 class pcas {
   int rank_;
@@ -19,7 +51,7 @@ class pcas {
   MPI_Comm comm_;
 
   obj_id_t obj_id_count_ = 0; // TODO: better management of used IDs
-  std::vector<obj_entry> objs_;
+  std::unordered_map<obj_id_t, obj_entry> objs_;
 
   std::unordered_map<void*, checkout_entry> checkouts_;
 
@@ -33,7 +65,7 @@ public:
   void barrier() const { MPI_Barrier(comm_); }
 
   template <typename T>
-  global_ptr<T> malloc(uint64_t size,
+  global_ptr<T> malloc(uint64_t nelems,
                        dist_policy dpolicy = dist_policy::block,
                        uint64_t block_size = 0);
 
@@ -41,17 +73,17 @@ public:
   void free(global_ptr<T> ptr);
 
   template <typename T, typename Func>
-  void for_each_block(global_ptr<T> ptr, uint64_t size, Func fn);
+  void for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn);
 
   template <typename T>
-  void get(global_ptr<T> from_ptr, T* to_ptr, uint64_t size);
+  void get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems);
 
   template <typename T>
-  void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t size);
+  void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
 
   template <access_mode Mode, typename T>
   std::conditional_t<Mode == access_mode::read, const T*, T*>
-  checkout(global_ptr<T> ptr, uint64_t size);
+  checkout(global_ptr<T> ptr, uint64_t nelems);
 
   template <typename T>
   void checkin(T* raw_ptr);
@@ -86,33 +118,44 @@ TEST_CASE("initialize and finalize PCAS") {
 }
 
 template <typename T>
-global_ptr<T> pcas::malloc(uint64_t size,
+global_ptr<T> pcas::malloc(uint64_t nelems,
                            dist_policy dpolicy,
                            uint64_t block_size) {
+  if (nelems == 0) {
+    die("nelems cannot be 0");
+  }
+
   switch (dpolicy) {
     case dist_policy::block: {
-      uint64_t size_bytes = size * sizeof(T);
+      uint64_t size_bytes = nelems * sizeof(T);
       uint64_t local_size = local_block_size(size_bytes, nproc_);
 
-      uint8_t* baseptr = nullptr;
+      virtual_mem vm(nullptr, local_size * nproc_);
+      physical_mem pm(local_size);
+
+      uint8_t* vm_local_addr = (uint8_t*)vm.addr() + rank_ * local_size;
+      pm.map(vm_local_addr, 0, local_size);
+
       MPI_Win win = MPI_WIN_NULL;
-      MPI_Win_allocate(local_size * sizeof(T),
-                       1,
-                       MPI_INFO_NULL,
-                       comm_,
-                       &baseptr,
-                       &win);
+      MPI_Win_create(vm_local_addr,
+                     local_size,
+                     1,
+                     MPI_INFO_NULL,
+                     comm_,
+                     &win);
       MPI_Win_lock_all(0, win);
 
-      obj_entry entry = (obj_entry){
+      obj_entry entry {
         .owner = -1, .id = obj_id_count_++, .size = size_bytes,
         .dpolicy = dpolicy, .block_size = local_size,
-        .baseptr = baseptr, .win = win
+        .pm = std::move(pm), .vm = std::move(vm), .win = win,
       };
 
-      objs_.push_back(entry);
+      auto ret = global_ptr<T>(entry.owner, entry.id, 0);
 
-      return global_ptr<T>(entry.owner, entry.id, 0);
+      objs_[entry.id] = std::move(entry);
+
+      return ret;
     }
     default: {
       die("unimplemented");
@@ -123,7 +166,10 @@ global_ptr<T> pcas::malloc(uint64_t size,
 
 template <typename T>
 void pcas::free(global_ptr<T> ptr) {
-  obj_entry entry = objs_[ptr.id()];
+  if (ptr == global_ptr<T>()) {
+    die("null pointer was passed to pcas::free()");
+  }
+  obj_entry& entry = objs_[ptr.id()];
   switch (entry.dpolicy) {
     case dist_policy::block: {
       MPI_Win_unlock_all(entry.win);
@@ -135,34 +181,35 @@ void pcas::free(global_ptr<T> ptr) {
       break;
     }
   }
+  objs_.erase(ptr.id());
 }
 
 TEST_CASE("malloc and free with block policy") {
   pcas pc;
   int n = 10;
   SUBCASE("free immediately") {
-    for (int i = 0; i < n; i++) {
+    for (int i = 1; i < n; i++) {
       auto p = pc.malloc<int>(i * 1234);
       pc.free(p);
     }
   }
   SUBCASE("free after accumulation") {
     global_ptr<int> ptrs[n];
-    for (int i = 0; i < n; i++) {
+    for (int i = 1; i < n; i++) {
       ptrs[i] = pc.malloc<int>(i * 2743);
     }
-    for (int i = 0; i < n; i++) {
+    for (int i = 1; i < n; i++) {
       pc.free(ptrs[i]);
     }
   }
 }
 
 template <typename T, typename Func>
-void pcas::for_each_block(global_ptr<T> ptr, uint64_t size, Func fn) {
-  obj_entry entry = objs_[ptr.id()];
+void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
+  obj_entry& entry = objs_[ptr.id()];
 
   uint64_t offset_min = ptr.offset();
-  uint64_t offset_max = offset_min + size * sizeof(T);
+  uint64_t offset_max = offset_min + nelems * sizeof(T);
   uint64_t offset     = offset_min;
 
   CHECK(offset_max <= entry.size);
@@ -219,22 +266,24 @@ TEST_CASE("loop over blocks") {
     CHECK(prev_owner == o2);
     CHECK(prev_ie == e * sizeof(int));
   }
+
+  pc.free(p);
 }
 
 template <typename T>
-void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t size) {
+void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
   if (from_ptr.owner() == -1) {
-    obj_entry entry = objs_[from_ptr.id()];
+    obj_entry& entry = objs_[from_ptr.id()];
     uint64_t offset = from_ptr.offset();
     std::vector<MPI_Request> reqs;
 
-    for_each_block(from_ptr, size, [&](int owner, uint64_t idx_b, uint64_t idx_e) {
+    for_each_block(from_ptr, nelems, [&](int owner, uint64_t idx_b, uint64_t idx_e) {
       MPI_Request req;
       MPI_Rget((uint8_t*)to_ptr - offset + idx_b,
                idx_e - idx_b,
                MPI_UINT8_T,
                owner,
-               idx_b,
+               idx_b - owner * entry.block_size,
                idx_e - idx_b,
                MPI_UINT8_T,
                entry.win,
@@ -249,19 +298,19 @@ void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t size) {
 }
 
 template <typename T>
-void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t size) {
+void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
   if (to_ptr.owner() == -1) {
-    obj_entry entry = objs_[to_ptr.id()];
+    obj_entry& entry = objs_[to_ptr.id()];
     uint64_t offset = to_ptr.offset();
     std::vector<MPI_Request> reqs;
 
-    for_each_block(to_ptr, size, [&](int owner, uint64_t idx_b, uint64_t idx_e) {
+    for_each_block(to_ptr, nelems, [&](int owner, uint64_t idx_b, uint64_t idx_e) {
       MPI_Request req;
       MPI_Rput((uint8_t*)from_ptr - offset + idx_b,
                idx_e - idx_b,
                MPI_UINT8_T,
                owner,
-               idx_b,
+               idx_b - owner * entry.block_size,
                idx_e - idx_b,
                MPI_UINT8_T,
                entry.win,
@@ -337,19 +386,21 @@ TEST_CASE("get and put") {
       CHECK(buf[2] == special);
     }
   }
+
+  pc.free(p);
 }
 
 template <access_mode Mode, typename T>
 std::conditional_t<Mode == access_mode::read, const T*, T*>
-pcas::checkout(global_ptr<T> ptr, uint64_t size) {
-  T* ret = (T*)std::malloc(size * sizeof(T));
+pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
+  T* ret = (T*)std::malloc(nelems * sizeof(T));
   if (Mode == access_mode::read_write ||
       Mode == access_mode::read) {
-    get(ptr, ret, size);
+    get(ptr, ret, nelems);
   }
   checkouts_[(void*)ret] = (checkout_entry){
     .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = (uint8_t*)ret,
-    .size = size * sizeof(T), .mode = Mode,
+    .size = nelems * sizeof(T), .mode = Mode,
   };
   return ret;
 }
@@ -432,6 +483,8 @@ TEST_CASE("checkout and checkin") {
     }
     pc.checkin(rp);
   }
+
+  pc.free(p);
 }
 
 }

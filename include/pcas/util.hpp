@@ -9,8 +9,6 @@
 
 #include "doctest/doctest.h"
 
-#include "pcas/defs.hpp"
-
 namespace pcas {
 
 __attribute__((noinline))
