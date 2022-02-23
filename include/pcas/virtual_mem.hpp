@@ -18,7 +18,7 @@ class virtual_mem {
   uint64_t size_;
 
   void mmap_no_physical_mem(void* addr, uint64_t size) {
-    int flags = MAP_SHARED | MAP_ANONYMOUS;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     if (addr != nullptr) flags |= MAP_FIXED;
     addr_ = mmap(addr, size, PROT_NONE, flags, -1, 0);
     if (addr_ == MAP_FAILED) {
