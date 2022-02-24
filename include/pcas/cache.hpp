@@ -89,7 +89,7 @@ public:
 
   ~cache_system() {
     PCAS_CHECK(entries_.size() == 0);
-    for ([[maybe_unused]] auto e : cache_map_) {
+    for (auto e : cache_map_) {
       PCAS_CHECK(e == nullptr);
     }
   }
@@ -159,7 +159,7 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
 
   PCAS_SUBCASE("basic test") {
     for (int i = 0; i < nent; i++) {
-      [[maybe_unused]] bool hit = cs.checkout(cache_entries[i]);
+      bool hit = cs.checkout(cache_entries[i]);
       PCAS_CHECK_MESSAGE(!hit, "should not be cached at the beginning");
       cs.checkin(cache_entries[i]);
     }
@@ -167,14 +167,14 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
     cs.evict_all();
 
     for (int i = 0; i < nblk; i++) {
-      [[maybe_unused]] bool hit = cs.checkout(cache_entries[i]);
+      bool hit = cs.checkout(cache_entries[i]);
       PCAS_CHECK_MESSAGE(!hit, "should not be cached after evicting all cache");
       cs.checkin(cache_entries[i]);
     }
 
     for (int it = 0; it < 3; it++) {
       for (int i = 0; i < nblk; i++) {
-        [[maybe_unused]] bool hit = cs.checkout(cache_entries[i]);
+        bool hit = cs.checkout(cache_entries[i]);
         PCAS_CHECK_MESSAGE(hit, "should be cached when the working set fits into the cache");
         cs.checkin(cache_entries[i]);
       }

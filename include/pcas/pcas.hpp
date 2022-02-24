@@ -285,8 +285,8 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
     int e = n / 5 * 4;
     int s = e - b;
 
-    [[maybe_unused]] auto [o1, _ib1, _ie1] = block_index_info(b * sizeof(int), n * sizeof(int), nproc);
-    [[maybe_unused]] auto [o2, _ib2, _ie2] = block_index_info(e * sizeof(int), n * sizeof(int), nproc);
+    auto [o1, _ib1, _ie1] = block_index_info(b * sizeof(int), n * sizeof(int), nproc);
+    auto [o2, _ib2, _ie2] = block_index_info(e * sizeof(int), n * sizeof(int), nproc);
 
     int prev_owner = o1 - 1;
     uint64_t prev_ie = b * sizeof(int);

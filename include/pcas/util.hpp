@@ -30,11 +30,17 @@
 
 #define PCAS_TEST_CASE(name)            [[maybe_unused]] static inline void PCAS_ANON_NAME(__pcas_test_anon_fn)()
 #define PCAS_SUBCASE(name)
-#define PCAS_CHECK(cond)                assert(cond)
-#define PCAS_CHECK_MESSAGE(cond, ...)   assert(cond)
-#define PCAS_REQUIRE(cond)              assert(cond)
-#define PCAS_REQUIRE_MESSAGE(cond, ...) assert(cond)
+#define PCAS_CHECK(cond)                PCAS_ASSERT(cond)
+#define PCAS_CHECK_MESSAGE(cond, ...)   PCAS_ASSERT(cond)
+#define PCAS_REQUIRE(cond)              PCAS_ASSERT(cond)
+#define PCAS_REQUIRE_MESSAGE(cond, ...) PCAS_ASSERT(cond)
 
+#endif
+
+#ifdef NDEBUG
+#define PCAS_ASSERT(cond) do { (void)sizeof(cond); } while (0)
+#else
+#define PCAS_ASSERT(cond) assert(cond)
 #endif
 
 namespace pcas {
@@ -85,7 +91,7 @@ inline auto block_index_info(uint64_t index,
 }
 
 PCAS_TEST_CASE("[pcas::util] get block information at specified index") {
-  [[maybe_unused]] int mb = min_block_size;
+  int mb = min_block_size;
   PCAS_CHECK(block_index_info(0         , mb * 4     , 4) == std::make_tuple(0, 0     , mb         ));
   PCAS_CHECK(block_index_info(mb        , mb * 4     , 4) == std::make_tuple(1, mb    , mb * 2     ));
   PCAS_CHECK(block_index_info(mb * 2    , mb * 4     , 4) == std::make_tuple(2, mb * 2, mb * 3     ));
