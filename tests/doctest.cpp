@@ -1,4 +1,5 @@
 #define DOCTEST_CONFIG_IMPLEMENT
+#define DOCTEST_CONFIG_NO_SHORT_MACRO_NAMES
 #include "doctest/doctest.h"
 
 #include "pcas/pcas.hpp"

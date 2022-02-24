@@ -7,7 +7,35 @@
 #include <algorithm>
 #include <tuple>
 
-#include "doctest/doctest.h"
+#ifdef DOCTEST_LIBRARY_INCLUDED
+
+#define PCAS_TEST_CASE(name)            DOCTEST_TEST_CASE(name)
+#define PCAS_SUBCASE(name)              DOCTEST_SUBCASE(name)
+#define PCAS_CHECK(cond)                DOCTEST_CHECK(cond)
+#define PCAS_CHECK_MESSAGE(cond, ...)   DOCTEST_CHECK_MESSAGE(cond, __VA_ARGS__)
+#define PCAS_REQUIRE(cond)              DOCTEST_REQUIRE(cond)
+#define PCAS_REQUIRE_MESSAGE(cond, ...) DOCTEST_REQUIRE_MESSAGE(cond, __VA_ARGS__)
+
+#else
+
+#include <cassert>
+
+#define PCAS_CONCAT_(x, y) x##y
+#define PCAS_CONCAT(x, y) PCAS_CONCAT_(x, y)
+#ifdef __COUNTER__
+#define PCAS_ANON_NAME(x) PCAS_CONCAT(x, __COUNTER__)
+#else
+#define PCAS_ANON_NAME(x) PCAS_CONCAT(x, __LINE__)
+#endif
+
+#define PCAS_TEST_CASE(name)            __attribute__((unused)) static inline void PCAS_ANON_NAME(__pcas_test_anon_fn)()
+#define PCAS_SUBCASE(name)
+#define PCAS_CHECK(cond)                assert(cond)
+#define PCAS_CHECK_MESSAGE(cond, ...)   assert(cond)
+#define PCAS_REQUIRE(cond)              assert(cond)
+#define PCAS_REQUIRE_MESSAGE(cond, ...) assert(cond)
+
+#endif
 
 namespace pcas {
 
@@ -34,21 +62,21 @@ inline uint64_t local_block_size(uint64_t size, int nproc) {
   return nblock_l * min_block_size;
 }
 
-TEST_CASE("calculate local block size") {
-  CHECK(local_block_size(min_block_size * 4     , 4) == min_block_size    );
-  CHECK(local_block_size(min_block_size * 12    , 4) == min_block_size * 3);
-  CHECK(local_block_size(min_block_size * 13    , 4) == min_block_size * 4);
-  CHECK(local_block_size(min_block_size * 12 + 1, 4) == min_block_size * 4);
-  CHECK(local_block_size(min_block_size * 12 - 1, 4) == min_block_size * 3);
-  CHECK(local_block_size(1                      , 4) == min_block_size    );
-  CHECK(local_block_size(1                      , 1) == min_block_size    );
-  CHECK(local_block_size(min_block_size * 3     , 1) == min_block_size * 3);
+PCAS_TEST_CASE("[pcas::util] calculate local block size") {
+  PCAS_CHECK(local_block_size(min_block_size * 4     , 4) == min_block_size    );
+  PCAS_CHECK(local_block_size(min_block_size * 12    , 4) == min_block_size * 3);
+  PCAS_CHECK(local_block_size(min_block_size * 13    , 4) == min_block_size * 4);
+  PCAS_CHECK(local_block_size(min_block_size * 12 + 1, 4) == min_block_size * 4);
+  PCAS_CHECK(local_block_size(min_block_size * 12 - 1, 4) == min_block_size * 3);
+  PCAS_CHECK(local_block_size(1                      , 4) == min_block_size    );
+  PCAS_CHECK(local_block_size(1                      , 1) == min_block_size    );
+  PCAS_CHECK(local_block_size(min_block_size * 3     , 1) == min_block_size * 3);
 }
 
 inline auto block_index_info(uint64_t index,
                              uint64_t size,
                              int      nproc) {
-  CHECK(index < size);
+  PCAS_CHECK(index < size);
   uint64_t size_l = local_block_size(size, nproc);
   int      owner  = index / size_l;
   uint64_t idx_b  = owner * size_l;
@@ -56,17 +84,17 @@ inline auto block_index_info(uint64_t index,
   return std::make_tuple(owner, idx_b, idx_e);
 }
 
-TEST_CASE("get block information at specified index") {
+PCAS_TEST_CASE("[pcas::util] get block information at specified index") {
   int mb = min_block_size;
-  CHECK(block_index_info(0         , mb * 4     , 4) == std::make_tuple(0, 0     , mb         ));
-  CHECK(block_index_info(mb        , mb * 4     , 4) == std::make_tuple(1, mb    , mb * 2     ));
-  CHECK(block_index_info(mb * 2    , mb * 4     , 4) == std::make_tuple(2, mb * 2, mb * 3     ));
-  CHECK(block_index_info(mb * 3    , mb * 4     , 4) == std::make_tuple(3, mb * 3, mb * 4     ));
-  CHECK(block_index_info(mb * 4 - 1, mb * 4     , 4) == std::make_tuple(3, mb * 3, mb * 4     ));
-  CHECK(block_index_info(0         , mb * 12    , 4) == std::make_tuple(0, 0     , mb * 3     ));
-  CHECK(block_index_info(mb        , mb * 12    , 4) == std::make_tuple(0, 0     , mb * 3     ));
-  CHECK(block_index_info(mb * 3    , mb * 12    , 4) == std::make_tuple(1, mb * 3, mb * 6     ));
-  CHECK(block_index_info(mb * 11   , mb * 12 - 1, 4) == std::make_tuple(3, mb * 9, mb * 12 - 1));
+  PCAS_CHECK(block_index_info(0         , mb * 4     , 4) == std::make_tuple(0, 0     , mb         ));
+  PCAS_CHECK(block_index_info(mb        , mb * 4     , 4) == std::make_tuple(1, mb    , mb * 2     ));
+  PCAS_CHECK(block_index_info(mb * 2    , mb * 4     , 4) == std::make_tuple(2, mb * 2, mb * 3     ));
+  PCAS_CHECK(block_index_info(mb * 3    , mb * 4     , 4) == std::make_tuple(3, mb * 3, mb * 4     ));
+  PCAS_CHECK(block_index_info(mb * 4 - 1, mb * 4     , 4) == std::make_tuple(3, mb * 3, mb * 4     ));
+  PCAS_CHECK(block_index_info(0         , mb * 12    , 4) == std::make_tuple(0, 0     , mb * 3     ));
+  PCAS_CHECK(block_index_info(mb        , mb * 12    , 4) == std::make_tuple(0, 0     , mb * 3     ));
+  PCAS_CHECK(block_index_info(mb * 3    , mb * 12    , 4) == std::make_tuple(1, mb * 3, mb * 6     ));
+  PCAS_CHECK(block_index_info(mb * 11   , mb * 12 - 1, 4) == std::make_tuple(3, mb * 9, mb * 12 - 1));
 }
 
 }

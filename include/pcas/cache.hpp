@@ -8,8 +8,6 @@
 #include <list>
 #include <random>
 
-#include "doctest/doctest.h"
-
 #include "pcas/util.hpp"
 #include "pcas/physical_mem.hpp"
 
@@ -38,10 +36,10 @@ private:
   std::vector<entry*> cache_map_;
 
   void evict(uint64_t block_num) {
-    CHECK(block_num < nblocks_);
+    PCAS_CHECK(block_num < nblocks_);
     entry* e = cache_map_[block_num];
-    CHECK(e);
-    CHECK(e->checkout_count == 0);
+    PCAS_CHECK(e);
+    PCAS_CHECK(e->checkout_count == 0);
     e->cached = false;
     cache_map_[block_num] = nullptr;
   }
@@ -83,16 +81,16 @@ private:
 
 public:
   cache_system(uint64_t size) : size_(size) {
-    CHECK(size % BlockSize == 0);
+    PCAS_CHECK(size % BlockSize == 0);
     nblocks_ = size / BlockSize;
     pm_ = physical_mem(size);
     cache_map_ = std::vector<entry*>(nblocks_, nullptr);
   }
 
   ~cache_system() {
-    CHECK(entries_.size() == 0);
+    PCAS_CHECK(entries_.size() == 0);
     for (auto e : cache_map_) {
-      CHECK(e == nullptr);
+      PCAS_CHECK(e == nullptr);
     }
   }
 
@@ -105,11 +103,11 @@ public:
   }
 
   void free_entry(entry_t e) {
-    CHECK(e);
+    PCAS_CHECK(e);
     if (e->cached) {
-      CHECK(e->checkout_count == 0);
+      PCAS_CHECK(e->checkout_count == 0);
       uint64_t b = e->pm_offset / BlockSize;
-      CHECK(b < nblocks_);
+      PCAS_CHECK(b < nblocks_);
       cache_map_[b] = nullptr;
     }
     entries_.remove(e); // TODO: heavy?
@@ -117,7 +115,7 @@ public:
   }
 
   bool checkout(entry_t e) {
-    CHECK(e);
+    PCAS_CHECK(e);
     bool hit = true;
     if (!e->cached) {
       int block_num = get_empty_block();
@@ -131,9 +129,9 @@ public:
   }
 
   void checkin(entry_t e) {
-    CHECK(e);
-    CHECK(e->checkout_count > 0);
-    CHECK(e->cached);
+    PCAS_CHECK(e);
+    PCAS_CHECK(e->checkout_count > 0);
+    PCAS_CHECK(e->cached);
     e->checkout_count--;
   }
 
@@ -148,7 +146,7 @@ public:
 
 };
 
-TEST_CASE("cache system") {
+PCAS_TEST_CASE("[pcas::cache] testing cache system") {
   int nblk = 100;
   using cache_t = cache_system<min_block_size>;
   cache_t cs(nblk * min_block_size);
@@ -159,10 +157,10 @@ TEST_CASE("cache system") {
     cache_entries.push_back(cs.alloc_entry());
   }
 
-  SUBCASE("basic test") {
+  PCAS_SUBCASE("basic test") {
     for (int i = 0; i < nent; i++) {
       bool hit = cs.checkout(cache_entries[i]);
-      CHECK_MESSAGE(!hit, "should not be cached at the beginning");
+      PCAS_CHECK_MESSAGE(!hit, "should not be cached at the beginning");
       cs.checkin(cache_entries[i]);
     }
 
@@ -170,26 +168,26 @@ TEST_CASE("cache system") {
 
     for (int i = 0; i < nblk; i++) {
       bool hit = cs.checkout(cache_entries[i]);
-      CHECK_MESSAGE(!hit, "should not be cached after evicting all cache");
+      PCAS_CHECK_MESSAGE(!hit, "should not be cached after evicting all cache");
       cs.checkin(cache_entries[i]);
     }
 
     for (int it = 0; it < 3; it++) {
       for (int i = 0; i < nblk; i++) {
         bool hit = cs.checkout(cache_entries[i]);
-        CHECK_MESSAGE(hit, "should be cached when the working set fits into the cache");
+        PCAS_CHECK_MESSAGE(hit, "should be cached when the working set fits into the cache");
         cs.checkin(cache_entries[i]);
       }
     }
   }
 
-  SUBCASE("cache entry being checking out should not be evicted") {
+  PCAS_SUBCASE("cache entry being checking out should not be evicted") {
     cs.checkout(cache_entries[0]);
 
     for (int it = 0; it < 3; it++) {
       for (int i = 1; i < nent; i++) {
         cs.checkout(cache_entries[i]);
-        CHECK(cache_entries[i]->pm_offset != cache_entries[0]->pm_offset);
+        PCAS_CHECK(cache_entries[i]->pm_offset != cache_entries[0]->pm_offset);
         cs.checkin(cache_entries[i]);
       }
     }
@@ -197,16 +195,16 @@ TEST_CASE("cache system") {
     cs.checkin(cache_entries[0]);
   }
 
-  SUBCASE("a block can be checkout out for many times") {
+  PCAS_SUBCASE("a block can be checkout out for many times") {
     cs.checkout(cache_entries[0]);
-    CHECK(cache_entries[0]->checkout_count == 1);
+    PCAS_CHECK(cache_entries[0]->checkout_count == 1);
     cs.checkout(cache_entries[0]);
-    CHECK(cache_entries[0]->checkout_count == 2);
+    PCAS_CHECK(cache_entries[0]->checkout_count == 2);
 
     cs.checkin(cache_entries[0]);
-    CHECK(cache_entries[0]->checkout_count == 1);
+    PCAS_CHECK(cache_entries[0]->checkout_count == 1);
     cs.checkin(cache_entries[0]);
-    CHECK(cache_entries[0]->checkout_count == 0);
+    PCAS_CHECK(cache_entries[0]->checkout_count == 0);
   }
 
   cs.evict_all();

@@ -4,8 +4,6 @@
 
 #include <mpi.h>
 
-#include "doctest/doctest.h"
-
 #include "pcas/util.hpp"
 #include "pcas/global_ptr.hpp"
 #include "pcas/physical_mem.hpp"
@@ -129,7 +127,7 @@ pcas::~pcas() {
   barrier();
 }
 
-TEST_CASE("initialize and finalize PCAS") {
+PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
   for (int i = 0; i < 3; i++) {
     pcas pc;
   }
@@ -219,16 +217,16 @@ void pcas::free(global_ptr<T> ptr) {
   objs_.erase(ptr.id());
 }
 
-TEST_CASE("malloc and free with block policy") {
+PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
   pcas pc;
   int n = 10;
-  SUBCASE("free immediately") {
+  PCAS_SUBCASE("free immediately") {
     for (int i = 1; i < n; i++) {
       auto p = pc.malloc<int>(i * 1234);
       pc.free(p);
     }
   }
-  SUBCASE("free after accumulation") {
+  PCAS_SUBCASE("free after accumulation") {
     global_ptr<int> ptrs[n];
     for (int i = 1; i < n; i++) {
       ptrs[i] = pc.malloc<int>(i * 2743);
@@ -247,7 +245,7 @@ void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
   uint64_t offset_max = offset_min + nelems * sizeof(T);
   uint64_t offset     = offset_min;
 
-  CHECK(offset_max <= obe.size);
+  PCAS_CHECK(offset_max <= obe.size);
 
   std::vector<MPI_Request> reqs;
   while (offset < offset_max) {
@@ -261,7 +259,7 @@ void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
   }
 }
 
-TEST_CASE("loop over blocks") {
+PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
   pcas pc;
 
   int nproc = pc.nproc();
@@ -269,20 +267,20 @@ TEST_CASE("loop over blocks") {
   int n = 100000;
   auto p = pc.malloc<int>(n);
 
-  SUBCASE("loop over the entire array") {
+  PCAS_SUBCASE("loop over the entire array") {
     int prev_owner = -1;
     int prev_ie = 0;
     pc.for_each_block(p, n, [&](int owner, uint64_t ib, uint64_t ie) {
-      CHECK(owner == prev_owner + 1);
-      CHECK(ib == prev_ie);
+      PCAS_CHECK(owner == prev_owner + 1);
+      PCAS_CHECK(ib == prev_ie);
       prev_owner = owner;
       prev_ie = ie;
     });
-    CHECK(prev_owner == nproc - 1);
-    CHECK(prev_ie == n * sizeof(int));
+    PCAS_CHECK(prev_owner == nproc - 1);
+    PCAS_CHECK(prev_ie == n * sizeof(int));
   }
 
-  SUBCASE("loop over the partial array") {
+  PCAS_SUBCASE("loop over the partial array") {
     int b = n / 5 * 2;
     int e = n / 5 * 4;
     int s = e - b;
@@ -293,13 +291,13 @@ TEST_CASE("loop over blocks") {
     int prev_owner = o1 - 1;
     int prev_ie = b * sizeof(int);
     pc.for_each_block(p + b, s, [&](int owner, uint64_t ib, uint64_t ie) {
-      CHECK(owner == prev_owner + 1);
-      CHECK(ib == prev_ie);
+      PCAS_CHECK(owner == prev_owner + 1);
+      PCAS_CHECK(ib == prev_ie);
       prev_owner = owner;
       prev_ie = ie;
     });
-    CHECK(prev_owner == o2);
-    CHECK(prev_ie == e * sizeof(int));
+    PCAS_CHECK(prev_owner == o2);
+    PCAS_CHECK(prev_ie == e * sizeof(int));
   }
 
   pc.free(p);
@@ -362,7 +360,7 @@ void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
   }
 }
 
-TEST_CASE("get and put") {
+PCAS_TEST_CASE("[pcas::pcas] get and put") {
   pcas pc;
 
   int rank = pc.rank();
@@ -381,20 +379,20 @@ TEST_CASE("get and put") {
 
   pc.barrier();
 
-  SUBCASE("get the entire array") {
+  PCAS_SUBCASE("get the entire array") {
     int special = 417;
     buf[0] = buf[n + 1] = special;
 
     pc.get(p, buf + 1, n);
 
     for (int i = 0; i < n; i++) {
-      CHECK(buf[i + 1] == i);
+      PCAS_CHECK(buf[i + 1] == i);
     }
-    CHECK(buf[0]     == special);
-    CHECK(buf[n + 1] == special);
+    PCAS_CHECK(buf[0]     == special);
+    PCAS_CHECK(buf[n + 1] == special);
   }
 
-  SUBCASE("get the partial array") {
+  PCAS_SUBCASE("get the partial array") {
     int ib = n / 5 * 2;
     int ie = n / 5 * 4;
     int s = ie - ib;
@@ -405,20 +403,20 @@ TEST_CASE("get and put") {
     pc.get(p + ib, buf + 1, s);
 
     for (int i = 0; i < s; i++) {
-      CHECK(buf[i + 1] == i + ib);
+      PCAS_CHECK(buf[i + 1] == i + ib);
     }
-    CHECK(buf[0]     == special);
-    CHECK(buf[s + 1] == special);
+    PCAS_CHECK(buf[0]     == special);
+    PCAS_CHECK(buf[s + 1] == special);
   }
 
-  SUBCASE("get each element") {
+  PCAS_SUBCASE("get each element") {
     for (int i = 0; i < n; i++) {
       int special = 417;
       buf[0] = buf[2] = special;
       pc.get(p + i, &buf[1], 1);
-      CHECK(buf[0] == special);
-      CHECK(buf[1] == i);
-      CHECK(buf[2] == special);
+      PCAS_CHECK(buf[0] == special);
+      PCAS_CHECK(buf[1] == i);
+      PCAS_CHECK(buf[2] == special);
     }
   }
 
@@ -452,8 +450,8 @@ pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
             Mode == access_mode::read) {
           void* cache_block_ptr = cache_.pm().anon_vm_addr();
 
-          CHECK(vm_offset >= owner * obe.block_size);
-          CHECK(vm_offset - owner * obe.block_size + cache_t::block_size <= obe.block_size);
+          PCAS_CHECK(vm_offset >= owner * obe.block_size);
+          PCAS_CHECK(vm_offset - owner * obe.block_size + cache_t::block_size <= obe.block_size);
 
           MPI_Request req;
           MPI_Rget((uint8_t*)cache_block_ptr + cae->pm_offset,
@@ -521,7 +519,7 @@ void pcas::checkin(const T* raw_ptr) {
   checkin(const_cast<T*>(raw_ptr));
 }
 
-TEST_CASE("checkout and checkin (small, aligned)") {
+PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
   pcas pc;
 
   int rank = pc.rank();
@@ -537,22 +535,22 @@ TEST_CASE("checkout and checkin (small, aligned)") {
 
   pc.barrier();
 
-  SUBCASE("read the entire array") {
+  PCAS_SUBCASE("read the entire array") {
     const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
     for (int i = 0; i < n; i++) {
-      CHECK_MESSAGE(rp[i] == i / min_block_size, "rank: ", rank, ", i: ", i);
+      PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size, "rank: ", rank, ", i: ", i);
     }
     pc.checkin(rp);
   }
 
-  SUBCASE("read the partial array") {
+  PCAS_SUBCASE("read the partial array") {
     int ib = n / 5 * 2;
     int ie = n / 5 * 4;
     int s = ie - ib;
 
     const uint8_t* rp = pc.checkout<access_mode::read>(p + ib, s);
     for (int i = 0; i < s; i++) {
-      CHECK_MESSAGE(rp[i] == (i + ib) / min_block_size, "rank: ", rank, ", i: ", i);
+      PCAS_CHECK_MESSAGE(rp[i] == (i + ib) / min_block_size, "rank: ", rank, ", i: ", i);
     }
     pc.checkin(rp);
   }
@@ -560,7 +558,7 @@ TEST_CASE("checkout and checkin (small, aligned)") {
   pc.free(p);
 }
 
-TEST_CASE("checkout and checkin (large, not aligned)") {
+PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
   pcas pc(16 * min_block_size);
 
   int rank = pc.rank();
@@ -584,18 +582,18 @@ TEST_CASE("checkout and checkin (large, not aligned)") {
 
   pc.barrier();
 
-  SUBCASE("read the entire array") {
+  PCAS_SUBCASE("read the entire array") {
     for (int i = 0; i < n; i += max_checkout_size) {
       int m = std::min(max_checkout_size, n - i);
       const int* rp = pc.checkout<access_mode::read>(p + i, m);
       for (int j = 0; j < m; j++) {
-        CHECK(rp[j] == i + j);
+        PCAS_CHECK(rp[j] == i + j);
       }
       pc.checkin(rp);
     }
   }
 
-  SUBCASE("read the partial array") {
+  PCAS_SUBCASE("read the partial array") {
     int ib = n / 5 * 2;
     int ie = n / 5 * 4;
     int s = ie - ib;
@@ -604,20 +602,20 @@ TEST_CASE("checkout and checkin (large, not aligned)") {
       int m = std::min(max_checkout_size, s - i);
       const int* rp = pc.checkout<access_mode::read>(p + ib + i, m);
       for (int j = 0; j < m; j++) {
-        CHECK(rp[j] == i + ib + j);
+        PCAS_CHECK(rp[j] == i + ib + j);
       }
       pc.checkin(rp);
     }
   }
 
-  SUBCASE("read and write the partial array") {
+  PCAS_SUBCASE("read and write the partial array") {
     int stride = 48;
-    REQUIRE(stride <= max_checkout_size);
+    PCAS_REQUIRE(stride <= max_checkout_size);
     for (int i = rank * stride; i < n; i += nproc * stride) {
       int s = std::min(stride, n - i);
       int* rp = pc.checkout<access_mode::read_write>(p + i, s);
       for (int j = 0; j < s; j++) {
-        CHECK(rp[j] == j + i);
+        PCAS_CHECK(rp[j] == j + i);
         rp[j] *= 2;
       }
       pc.checkin(rp);
@@ -629,7 +627,7 @@ TEST_CASE("checkout and checkin (large, not aligned)") {
       int m = std::min(max_checkout_size, n - i);
       const int* rp = pc.checkout<access_mode::read>(p + i, m);
       for (int j = 0; j < m; j++) {
-        CHECK(rp[j] == (i + j) * 2);
+        PCAS_CHECK(rp[j] == (i + j) * 2);
       }
       pc.checkin(rp);
     }

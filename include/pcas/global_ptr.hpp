@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <unistd.h>
 
-#include "doctest/doctest.h"
+#include <pcas/util.hpp>
 
 namespace pcas {
 
@@ -66,7 +66,7 @@ public:
 
   template <class Diff>
   this_t& operator-=(Diff diff) {
-    CHECK(offset_ >= diff * sizeof(T));
+    PCAS_CHECK(offset_ >= diff * sizeof(T));
     offset_ -= diff * sizeof(T);
     return *this;
   }
@@ -84,14 +84,14 @@ public:
 
   template <class Diff>
   this_t operator-(Diff diff) const noexcept {
-    CHECK(offset_ >= diff * sizeof(T));
+    PCAS_CHECK(offset_ >= diff * sizeof(T));
     return global_ptr(owner_, id_, offset_ - diff * sizeof(T));
   }
 
   std::ptrdiff_t operator-(const this_t& p) const noexcept {
-    CHECK(belong_to_same_obj(p));
-    CHECK(offset_ % sizeof(T) == 0);
-    CHECK(p.offset_ % sizeof(T) == 0);
+    PCAS_CHECK(belong_to_same_obj(p));
+    PCAS_CHECK(offset_ % sizeof(T) == 0);
+    PCAS_CHECK(p.offset_ % sizeof(T) == 0);
     return offset_ / sizeof(T) - p.offset_ / sizeof(T);
   }
 
@@ -111,64 +111,64 @@ inline bool operator!=(const global_ptr<T>& p1, const global_ptr<U>& p2) noexcep
   return !p1.is_equal(p2);
 }
 
-TEST_CASE("global pointer manipulation") {
+PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
   global_ptr<int> p1(0, 0, 0);
   global_ptr<int> p2(1, 0, 0);
   global_ptr<int> p3(1, 1, 0);
 
-  SUBCASE("initialization") {
+  PCAS_SUBCASE("initialization") {
     global_ptr<int> p1_(p1);
     global_ptr<int> p2_(p1.owner(), p1.id(), p1.offset());
-    CHECK(p1_ == p2_);
+    PCAS_CHECK(p1_ == p2_);
   }
 
-  SUBCASE("addition and subtraction") {
+  PCAS_SUBCASE("addition and subtraction") {
     auto p = p1 + 4;
-    CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 4));
-    CHECK(p - 2  == global_ptr<int>(0, 0, sizeof(int) * 2));
+    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 4));
+    PCAS_CHECK(p - 2  == global_ptr<int>(0, 0, sizeof(int) * 2));
     p++;
-    CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 5));
+    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 5));
     p--;
-    CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 4));
+    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 4));
     p += 10;
-    CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 14));
+    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 14));
     p -= 5;
-    CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 9));
-    CHECK(p - p1 == 9);
-    CHECK(p1 - p == -9);
-    CHECK(p - p  == 0);
+    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 9));
+    PCAS_CHECK(p - p1 == 9);
+    PCAS_CHECK(p1 - p == -9);
+    PCAS_CHECK(p - p  == 0);
   }
 
-  SUBCASE("equality") {
-    CHECK(p1 == p1);
-    CHECK(p2 == p2);
-    CHECK(p3 == p3);
-    CHECK(p1 != p2);
-    CHECK(p2 != p3);
-    CHECK(p3 != p1);
-    CHECK(p1 + 1 != p1);
-    CHECK((p1 + 1) - 1 == p1);
+  PCAS_SUBCASE("equality") {
+    PCAS_CHECK(p1 == p1);
+    PCAS_CHECK(p2 == p2);
+    PCAS_CHECK(p3 == p3);
+    PCAS_CHECK(p1 != p2);
+    PCAS_CHECK(p2 != p3);
+    PCAS_CHECK(p3 != p1);
+    PCAS_CHECK(p1 + 1 != p1);
+    PCAS_CHECK((p1 + 1) - 1 == p1);
   }
 
-  SUBCASE("boolean") {
-    CHECK(p1);
-    CHECK(p2);
-    CHECK(p3);
-    CHECK(!p1 == false);
-    CHECK(!!p1);
+  PCAS_SUBCASE("boolean") {
+    PCAS_CHECK(p1);
+    PCAS_CHECK(p2);
+    PCAS_CHECK(p3);
+    PCAS_CHECK(!p1 == false);
+    PCAS_CHECK(!!p1);
     global_ptr<void> nullp;
-    CHECK(!nullp);
-    CHECK(!global_ptr<void>());
+    PCAS_CHECK(!nullp);
+    PCAS_CHECK(!global_ptr<void>());
   }
 
-  SUBCASE("dereference") {
-    CHECK(&p1[0] == p1);
-    CHECK(&p1[10] == p1 + 10);
+  PCAS_SUBCASE("dereference") {
+    PCAS_CHECK(&p1[0] == p1);
+    PCAS_CHECK(&p1[10] == p1 + 10);
   }
 
-  SUBCASE("cast") {
-    CHECK(p1 == static_cast<global_ptr<char>>(p1));
-    CHECK(p1 + 4 == static_cast<global_ptr<char>>(p1) + 4 * sizeof(int));
+  PCAS_SUBCASE("cast") {
+    PCAS_CHECK(p1 == static_cast<global_ptr<char>>(p1));
+    PCAS_CHECK(p1 + 4 == static_cast<global_ptr<char>>(p1) + 4 * sizeof(int));
   }
 }
 
