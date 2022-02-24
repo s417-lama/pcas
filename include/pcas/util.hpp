@@ -28,7 +28,7 @@
 #define PCAS_ANON_NAME(x) PCAS_CONCAT(x, __LINE__)
 #endif
 
-#define PCAS_TEST_CASE(name)            __attribute__((unused)) static inline void PCAS_ANON_NAME(__pcas_test_anon_fn)()
+#define PCAS_TEST_CASE(name)            [[maybe_unused]] static inline void PCAS_ANON_NAME(__pcas_test_anon_fn)()
 #define PCAS_SUBCASE(name)
 #define PCAS_CHECK(cond)                assert(cond)
 #define PCAS_CHECK_MESSAGE(cond, ...)   assert(cond)
@@ -85,7 +85,7 @@ inline auto block_index_info(uint64_t index,
 }
 
 PCAS_TEST_CASE("[pcas::util] get block information at specified index") {
-  int mb = min_block_size;
+  [[maybe_unused]] int mb = min_block_size;
   PCAS_CHECK(block_index_info(0         , mb * 4     , 4) == std::make_tuple(0, 0     , mb         ));
   PCAS_CHECK(block_index_info(mb        , mb * 4     , 4) == std::make_tuple(1, mb    , mb * 2     ));
   PCAS_CHECK(block_index_info(mb * 2    , mb * 4     , 4) == std::make_tuple(2, mb * 2, mb * 3     ));

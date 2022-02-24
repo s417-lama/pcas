@@ -72,7 +72,7 @@ public:
 
   void unmap_physical_mem(uint64_t vm_offset, uint64_t size) const {
     munmap_((uint8_t*)addr_ + vm_offset, size);
-    void* ret = mmap_no_physical_mem((uint8_t*)addr_ + vm_offset, size);
+    [[maybe_unused]] void* ret = mmap_no_physical_mem((uint8_t*)addr_ + vm_offset, size);
     PCAS_CHECK(ret == (uint8_t*)addr_ + vm_offset);
   }
 

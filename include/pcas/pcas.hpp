@@ -269,7 +269,7 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
 
   PCAS_SUBCASE("loop over the entire array") {
     int prev_owner = -1;
-    int prev_ie = 0;
+    uint64_t prev_ie = 0;
     pc.for_each_block(p, n, [&](int owner, uint64_t ib, uint64_t ie) {
       PCAS_CHECK(owner == prev_owner + 1);
       PCAS_CHECK(ib == prev_ie);
@@ -285,11 +285,11 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
     int e = n / 5 * 4;
     int s = e - b;
 
-    auto [o1, _ib1, _ie1] = block_index_info(b * sizeof(int), n * sizeof(int), nproc);
-    auto [o2, _ib2, _ie2] = block_index_info(e * sizeof(int), n * sizeof(int), nproc);
+    [[maybe_unused]] auto [o1, _ib1, _ie1] = block_index_info(b * sizeof(int), n * sizeof(int), nproc);
+    [[maybe_unused]] auto [o2, _ib2, _ie2] = block_index_info(e * sizeof(int), n * sizeof(int), nproc);
 
     int prev_owner = o1 - 1;
-    int prev_ie = b * sizeof(int);
+    uint64_t prev_ie = b * sizeof(int);
     pc.for_each_block(p + b, s, [&](int owner, uint64_t ib, uint64_t ie) {
       PCAS_CHECK(owner == prev_owner + 1);
       PCAS_CHECK(ib == prev_ie);
