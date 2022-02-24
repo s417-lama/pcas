@@ -18,8 +18,6 @@
 
 #else
 
-#include <cassert>
-
 #define PCAS_CONCAT_(x, y) x##y
 #define PCAS_CONCAT(x, y) PCAS_CONCAT_(x, y)
 #ifdef __COUNTER__
@@ -40,6 +38,7 @@
 #ifdef NDEBUG
 #define PCAS_ASSERT(cond) do { (void)sizeof(cond); } while (0)
 #else
+#include <cassert>
 #define PCAS_ASSERT(cond) assert(cond)
 #endif
 
