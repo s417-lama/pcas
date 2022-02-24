@@ -48,7 +48,7 @@ private:
     // TODO: implement more smart eviction (e.g., LRU)
     // randomly select a victim first
     uint64_t max_trial = nblocks_ * 10;
-    static std::mt19937 engine;
+    static std::mt19937 engine(0);
     std::uniform_int_distribution<> dist(0, nblocks_ - 1);
     for (uint64_t i = 0; i < max_trial; i++) {
       uint64_t b = dist(engine);
