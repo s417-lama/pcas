@@ -1,6 +1,7 @@
 #pragma once
 
 #include <type_traits>
+#include <unordered_map>
 
 #include <mpi.h>
 
@@ -296,7 +297,8 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
       prev_owner = owner;
       prev_ie = ie;
     });
-    PCAS_CHECK(prev_owner == o2);
+    auto& o2_ = o2; // structured bindings cannot be captured by lambda until C++20
+    PCAS_CHECK(prev_owner == o2_);
     PCAS_CHECK(prev_ie == e * sizeof(int));
   }
 
@@ -450,8 +452,9 @@ pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
             Mode == access_mode::read) {
           void* cache_block_ptr = cache_.pm().anon_vm_addr();
 
-          PCAS_CHECK(vm_offset >= owner * obe.block_size);
-          PCAS_CHECK(vm_offset - owner * obe.block_size + cache_t::block_size <= obe.block_size);
+          auto& owner_ = owner; // structured bindings cannot be captured by lambda until C++20
+          PCAS_CHECK(vm_offset >= owner_ * obe.block_size);
+          PCAS_CHECK(vm_offset - owner_ * obe.block_size + cache_t::block_size <= obe.block_size);
 
           MPI_Request req;
           MPI_Rget((uint8_t*)cache_block_ptr + cae->pm_offset,
