@@ -546,6 +546,28 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
     pc.checkin(rp);
   }
 
+  PCAS_SUBCASE("read and write the entire array") {
+    for (int it = 0; it < nproc; it++) {
+      if (it == rank) {
+        uint8_t* rp = pc.checkout<access_mode::read_write>(p, n);
+        for (int i = 0; i < n; i++) {
+          PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it, "it: ", it, ", rank: ", rank, ", i: ", i);
+          rp[i]++;
+        }
+        pc.checkin(rp);
+      }
+      pc.barrier();
+
+      const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
+      for (int i = 0; i < n; i++) {
+        PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it + 1, "it: ", it, ", rank: ", rank, ", i: ", i);
+      }
+      pc.checkin(rp);
+
+      pc.barrier();
+    }
+  }
+
   PCAS_SUBCASE("read the partial array") {
     int ib = n / 5 * 2;
     int ie = n / 5 * 4;

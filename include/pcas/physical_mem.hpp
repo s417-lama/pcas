@@ -59,7 +59,7 @@ public:
     PCAS_CHECK(offset + size <= size_);
     int flags = MAP_SHARED;
     if (addr != nullptr) flags |= MAP_FIXED;
-    void* ret = mmap(addr, size, PROT_WRITE, flags, fd_, offset);
+    void* ret = mmap(addr, size, PROT_READ | PROT_WRITE, flags, fd_, offset);
     if (ret == MAP_FAILED) {
       perror("mmap");
       die("[pcas::physical_mem] mmap(%p, %ld, ...) failed", addr, size);
@@ -79,26 +79,28 @@ public:
 };
 
 PCAS_TEST_CASE("[pcas::physical_mem] map two virtual addresses to the same physical address") {
-  physical_mem pm(16 * 4096);
+  uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
+
+  physical_mem pm(16 * pagesize);
   int* b1 = nullptr;
   int* b2 = nullptr;
 
   PCAS_SUBCASE("map to random address") {
-    b1 = (int*)pm.map(nullptr, 3 * 4096, 4096);
-    b2 = (int*)pm.map(nullptr, 3 * 4096, 4096);
+    b1 = (int*)pm.map(nullptr, 3 * pagesize, pagesize);
+    b2 = (int*)pm.map(nullptr, 3 * pagesize, pagesize);
   }
 
   PCAS_SUBCASE("map to specified address") {
-    int* tmp1 = (int*)pm.map(nullptr, 0, 4096); // get an available address
-    int* tmp2 = (int*)pm.map(nullptr, 0, 4096); // get an available address
-    pm.unmap(tmp1, 4096);
-    pm.unmap(tmp2, 4096);
-    b1 = (int*)pm.map(tmp1, 3 * 4096, 4096);
-    b2 = (int*)pm.map(tmp2, 3 * 4096, 4096);
+    int* tmp1 = (int*)pm.map(nullptr, 0, pagesize); // get an available address
+    int* tmp2 = (int*)pm.map(nullptr, 0, pagesize); // get an available address
+    pm.unmap(tmp1, pagesize);
+    pm.unmap(tmp2, pagesize);
+    b1 = (int*)pm.map(tmp1, 3 * pagesize, pagesize);
+    b2 = (int*)pm.map(tmp2, 3 * pagesize, pagesize);
   }
 
   PCAS_SUBCASE("use anonymous virtual address") {
-    b1 = (int*)pm.map(nullptr, 0, 16 * 4096);
+    b1 = (int*)pm.map(nullptr, 0, 16 * pagesize);
     b2 = (int*)pm.anon_vm_addr();
   }
 
@@ -109,8 +111,8 @@ PCAS_TEST_CASE("[pcas::physical_mem] map two virtual addresses to the same physi
   PCAS_CHECK(b1[0] == 417);
   PCAS_CHECK(b2[0] == 417);
 
-  pm.unmap(b1, 4096);
-  pm.unmap(b2, 4096);
+  pm.unmap(b1, pagesize);
+  pm.unmap(b2, pagesize);
 }
 
 }
