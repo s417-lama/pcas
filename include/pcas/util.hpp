@@ -62,8 +62,8 @@ inline void die(const char* fmt, ...) {
 constexpr uint64_t min_block_size = 65536;
 
 inline uint64_t local_block_size(uint64_t size, int nproc) {
-  int nblock_g = (size + min_block_size - 1) / min_block_size;
-  int nblock_l = (nblock_g + nproc - 1) / nproc;
+  uint64_t nblock_g = (size + min_block_size - 1) / min_block_size;
+  uint64_t nblock_l = (nblock_g + nproc - 1) / nproc;
   return nblock_l * min_block_size;
 }
 
