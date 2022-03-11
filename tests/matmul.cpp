@@ -117,7 +117,7 @@ void matmul_check(pcas::global_ptr<real_t> A,
     pc.get(C + i * n + j, &c_computed, 1);
 
     if (std::abs(c_ans - c_computed) > 1e-6) {
-      pcas::die("C[%ld][%ld] Got: %f, Expected: %f\n", i, j, c_computed, c_ans);
+      pcas::die("C[%lu][%lu] Got: %f, Expected: %f\n", i, j, c_computed, c_ans);
     }
   }
 

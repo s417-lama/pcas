@@ -26,7 +26,7 @@ public:
 
     if (ftruncate(fd_, size) == -1) {
       perror("ftruncate");
-      die("[pcas::physical_mem] ftruncate(%d, %ld) failed", fd_, size);
+      die("[pcas::physical_mem] ftruncate(%d, %lu) failed", fd_, size);
     }
 
     anon_vm_addr_ = map(nullptr, 0, size);
@@ -62,7 +62,7 @@ public:
     void* ret = mmap(addr, size, PROT_READ | PROT_WRITE, flags, fd_, offset);
     if (ret == MAP_FAILED) {
       perror("mmap");
-      die("[pcas::physical_mem] mmap(%p, %ld, ...) failed", addr, size);
+      die("[pcas::physical_mem] mmap(%p, %lu, ...) failed", addr, size);
     }
     return ret;
   }
@@ -70,7 +70,7 @@ public:
   void unmap(void* addr, uint64_t size) const {
     if (munmap(addr, size) == -1) {
       perror("munmap");
-      die("[pcas::physical_mem] munmap(%p, %ld) failed", addr, size);
+      die("[pcas::physical_mem] munmap(%p, %lu) failed", addr, size);
     }
   }
 

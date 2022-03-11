@@ -21,7 +21,7 @@ class virtual_mem {
     void* ret = mmap(addr, size, PROT_NONE, flags, -1, 0);
     if (ret == MAP_FAILED) {
       perror("mmap");
-      die("[pcas::virtual_mem] mmap(%p, %ld, ...) failed", addr, size);
+      die("[pcas::virtual_mem] mmap(%p, %lu, ...) failed", addr, size);
     }
     return ret;
   }
@@ -29,7 +29,7 @@ class virtual_mem {
   void munmap_(void* addr, uint64_t size) const {
     if (munmap(addr, size) == -1) {
       perror("munmap");
-      die("[pcas::virtual_mem] munmap(%p, %ld) failed", addr, size);
+      die("[pcas::virtual_mem] munmap(%p, %lu) failed", addr, size);
     }
   }
 
