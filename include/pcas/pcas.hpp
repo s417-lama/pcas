@@ -109,7 +109,7 @@ public:
 
 };
 
-pcas::pcas(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
+inline pcas::pcas(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
   int mpi_initialized = 0;
   MPI_Initialized(&mpi_initialized);
   if (!mpi_initialized) {
@@ -124,7 +124,7 @@ pcas::pcas(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
   barrier();
 }
 
-pcas::~pcas() {
+inline pcas::~pcas() {
   barrier();
 }
 
@@ -135,9 +135,9 @@ PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
 }
 
 template <typename T>
-global_ptr<T> pcas::malloc(uint64_t    nelems,
-                           dist_policy dpolicy,
-                           uint64_t    block_size) {
+inline global_ptr<T> pcas::malloc(uint64_t    nelems,
+                                  dist_policy dpolicy,
+                                  uint64_t    block_size) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
@@ -194,7 +194,7 @@ global_ptr<T> pcas::malloc(uint64_t    nelems,
 }
 
 template <typename T>
-void pcas::free(global_ptr<T> ptr) {
+inline void pcas::free(global_ptr<T> ptr) {
   if (ptr == global_ptr<T>()) {
     die("null pointer was passed to pcas::free()");
   }
@@ -239,7 +239,7 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
 }
 
 template <typename T, typename Func>
-void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
+inline void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
   obj_entry& obe = objs_[ptr.id()];
 
   uint64_t offset_min = ptr.offset();
@@ -306,7 +306,7 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
 }
 
 template <typename T>
-void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
+inline void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
   if (from_ptr.owner() == -1) {
     obj_entry& obe = objs_[from_ptr.id()];
     uint64_t offset = from_ptr.offset();
@@ -333,7 +333,7 @@ void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
 }
 
 template <typename T>
-void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
+inline void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
   if (to_ptr.owner() == -1) {
     obj_entry& obe = objs_[to_ptr.id()];
     uint64_t offset = to_ptr.offset();
@@ -426,7 +426,7 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
 }
 
 template <access_mode Mode, typename T>
-std::conditional_t<Mode == access_mode::read, const T*, T*>
+inline std::conditional_t<Mode == access_mode::read, const T*, T*>
 pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
   obj_entry& obe = objs_[ptr.id()];
 
@@ -490,7 +490,7 @@ pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
 }
 
 template <typename T>
-void pcas::checkin(T* raw_ptr) {
+inline void pcas::checkin(T* raw_ptr) {
   auto c = checkouts_.find((void*)raw_ptr);
   if (c == checkouts_.end()) {
     die("The pointer %p passed to checkin() is not registered", raw_ptr);
@@ -518,7 +518,7 @@ void pcas::checkin(T* raw_ptr) {
 }
 
 template <typename T>
-void pcas::checkin(const T* raw_ptr) {
+inline void pcas::checkin(const T* raw_ptr) {
   checkin(const_cast<T*>(raw_ptr));
 }
 
