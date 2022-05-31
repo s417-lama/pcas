@@ -10,7 +10,7 @@ include_directories(${MPI_CXX_INCLUDE_PATH})
 
 add_library(pcas INTERFACE)
 target_include_directories(pcas INTERFACE include)
-target_link_libraries(pcas INTERFACE ${MPI_CXX_LIBRARIES})
+target_link_libraries(pcas INTERFACE ${MPI_CXX_LIBRARIES} rt)
 target_compile_options(pcas INTERFACE -Wall)
 
 if(MPI_CXX_COMPILE_FLAGS)

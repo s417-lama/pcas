@@ -1,6 +1,8 @@
 #pragma once
 
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
@@ -18,11 +20,23 @@ class physical_mem {
 public:
   physical_mem() {}
   physical_mem(uint64_t size) : size_(size) {
+#if (__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 27)
     fd_ = memfd_create("PCAS", 0);
     if (fd_ == -1) {
       perror("memfd_create");
       die("[pcas::physical_mem] memfd_create() failed");
     }
+#else
+    static int counter = 0;
+    char s[256];
+    snprintf(s, 255, "/pcas_%d_%d", getpid(), counter++);
+    printf("%s\n", s);
+    fd_ = shm_open(s, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    if (fd_ == -1) {
+      perror("shm_open");
+      die("[pcas::physical_mem] shm_open() failed");
+    }
+#endif
 
     if (ftruncate(fd_, size) == -1) {
       perror("ftruncate");
