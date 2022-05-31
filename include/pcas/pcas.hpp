@@ -248,7 +248,6 @@ inline void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
 
   PCAS_CHECK(offset_max <= obe.size);
 
-  std::vector<MPI_Request> reqs;
   while (offset < offset_max) {
     auto [owner, idx_b, idx_e] = block_index_info(offset, obe.effective_size, nproc_);
     uint64_t ib = std::max(idx_b, offset_min);

@@ -24,6 +24,9 @@ if(MPI_CXX_LINK_FLAGS)
   target_link_options(pcas INTERFACE ${MPI_CXX_LINK_OPTIONS})
 endif()
 
+include(GNUInstallDirs)
+install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+
 include(CTest)
 if(BUILD_TESTING)
   list(APPEND CMAKE_CTEST_ARGUMENTS "--output-on-failure")
