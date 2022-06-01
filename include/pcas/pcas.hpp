@@ -67,9 +67,17 @@ public:
   int rank() const { return rank_; }
   int nproc() const { return nproc_; }
 
-  void barrier() {
+  void release() {
+  }
+
+  void acquire() {
     cache_.evict_all();
+  }
+
+  void barrier() {
+    release();
     MPI_Barrier(comm_);
+    acquire();
   }
 
   template <typename T>
@@ -125,7 +133,7 @@ inline pcas::pcas(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
 }
 
 inline pcas::~pcas() {
-  barrier();
+  /* barrier(); */
 }
 
 PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
