@@ -3,4 +3,4 @@
 	url = https://github.com/doctest/doctest.git
 [submodule "massivelogger"]
 	path = massivelogger
-	url = git@github.com:massivethreads/massivelogger.git
+	url = https://github.com/massivethreads/massivelogger.git

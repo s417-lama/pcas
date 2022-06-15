@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.13)
 project(pcas VERSION 0.0.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 
+option(PCAS_ENABLE_MLOG "Use MassiveLogger" ON)
+
 # set(CMAKE_VERBOSE_MAKEFILE 1)
 
 find_package(MPI REQUIRED)
@@ -12,6 +14,12 @@ add_library(pcas INTERFACE)
 target_include_directories(pcas INTERFACE include)
 target_link_libraries(pcas INTERFACE ${MPI_CXX_LIBRARIES} rt)
 target_compile_options(pcas INTERFACE -Wall)
+
+if(PCAS_ENABLE_MLOG)
+  add_library(mlog INTERFACE)
+  target_include_directories(mlog INTERFACE ./massivelogger/include)
+  target_link_libraries(pcas INTERFACE mlog)
+endif()
 
 if(MPI_CXX_COMPILE_FLAGS)
   message(STATUS "MPI_CXX_COMPILE_FLAGS = ${MPI_CXX_COMPILE_FLAGS}")

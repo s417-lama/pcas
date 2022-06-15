@@ -10,6 +10,7 @@
 #include "pcas/physical_mem.hpp"
 #include "pcas/virtual_mem.hpp"
 #include "pcas/cache.hpp"
+#include "pcas/logger/logger.hpp"
 
 namespace pcas {
 
@@ -130,6 +131,8 @@ inline pcas::pcas(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
   MPI_Comm_size(comm_, &nproc_);
 
   barrier();
+
+  logger::init(rank_, nproc_);
 }
 
 inline pcas::~pcas() {
@@ -435,6 +438,8 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
 template <access_mode Mode, typename T>
 inline std::conditional_t<Mode == access_mode::read, const T*, T*>
 pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
+  auto ev = logger::record<logger_kind::Checkout>(nelems * sizeof(T));
+
   obj_entry& obe = objs_[ptr.id()];
 
   std::vector<std::pair<cache_t::entry_t, uint64_t>> filled_cache_entries;
@@ -498,6 +503,8 @@ pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
 template <typename T>
 inline void pcas::checkin(T* raw_ptr) {
+  auto ev = logger::record<logger_kind::Checkin>();
+
   auto c = checkouts_.find((void*)raw_ptr);
   if (c == checkouts_.end()) {
     die("The pointer %p passed to checkin() is not registered", raw_ptr);

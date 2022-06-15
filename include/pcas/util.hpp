@@ -4,8 +4,10 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <cstdint>
+#include <iostream>
 #include <algorithm>
 #include <tuple>
+#include <sstream>
 
 #ifdef DOCTEST_LIBRARY_INCLUDED
 
@@ -100,6 +102,33 @@ PCAS_TEST_CASE("[pcas::util] get block information at specified index") {
   PCAS_CHECK(block_index_info(mb        , mb * 12    , 4) == std::make_tuple(0, 0     , mb * 3     ));
   PCAS_CHECK(block_index_info(mb * 3    , mb * 12    , 4) == std::make_tuple(1, mb * 3, mb * 6     ));
   PCAS_CHECK(block_index_info(mb * 11   , mb * 12 - 1, 4) == std::make_tuple(3, mb * 9, mb * 12 - 1));
+}
+
+template <typename T>
+inline T get_env_(const char* env_var, T default_val) {
+  if (const char* val_str = std::getenv(env_var)) {
+    T val;
+    std::stringstream ss(val_str);
+    ss >> val;
+    if (ss.fail()) {
+      fprintf(stderr, "Environment variable '%s' is invalid.\n", env_var);
+      exit(1);
+    }
+    return val;
+  } else {
+    return default_val;
+  }
+}
+
+template <typename T>
+inline T get_env(const char* env_var, T default_val, int rank) {
+  static bool print_env = get_env_("PCAS_PRINT_ENV", false);
+
+  T val = get_env_(env_var, default_val);
+  if (print_env && rank == 0) {
+    std::cout << env_var << " = " << val << std::endl;
+  }
+  return val;
 }
 
 }
