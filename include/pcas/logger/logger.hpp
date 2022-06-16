@@ -3,16 +3,16 @@
 #include <cstdio>
 #include <cstdint>
 
-#include "pcas/global_clock.hpp"
+#include "pcas/wallclock.hpp"
 #include "pcas/logger/kind.hpp"
 #include "pcas/logger/impl_dummy.hpp"
-#include "pcas/logger/impl_trace.hpp"
 
 namespace pcas {
 namespace logger {
 
 template <typename ParentPolicy>
 struct policy {
+  static const char* outfile_prefix() { return "pcas"; }
   using wallclock_t = typename ParentPolicy::wallclock_t;
   using logger_kind_t = typename ParentPolicy::logger_kind_t;
   template <typename P>
@@ -21,7 +21,7 @@ struct policy {
 
 // unused
 struct policy_default {
-  using wallclock_t = global_clock;
+  using wallclock_t = wallclock_native;
   using logger_kind_t = kind;
   template <typename P>
   using impl_t = impl_dummy<P>;

@@ -10,7 +10,7 @@
 #include "pcas/physical_mem.hpp"
 #include "pcas/virtual_mem.hpp"
 #include "pcas/cache.hpp"
-#include "pcas/global_clock.hpp"
+#include "pcas/wallclock.hpp"
 #include "pcas/logger/logger.hpp"
 
 namespace pcas {
@@ -51,7 +51,7 @@ struct checkout_entry {
 };
 
 struct policy_default {
-  using wallclock_t = global_clock;
+  using wallclock_t = wallclock_native;
   using logger_kind_t = logger::kind;
   template <typename P>
   using logger_impl_t = logger::impl_dummy<P>;
