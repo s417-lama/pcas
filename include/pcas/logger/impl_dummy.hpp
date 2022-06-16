@@ -2,12 +2,13 @@
 
 #include <cstdint>
 
-#include "pcas/logger/kind.hpp"
-
 namespace pcas {
-namespace logger_impl {
+namespace logger {
 
-class policy_dummy {
+template <typename P>
+class impl_dummy {
+  using kind = typename P::logger_kind_t;
+
 public:
   using begin_data_t = void*;
 
@@ -16,12 +17,12 @@ public:
   static void flush_and_print_stat(uint64_t t_begin, uint64_t t_end) {}
   static void warmup() {}
   static void clear() {}
-  template <kind::value K>
+  template <typename kind::value K>
   static begin_data_t begin_event() { return nullptr; }
-  template <kind::value K>
+  template <typename kind::value K>
   static void end_event(begin_data_t bd) {}
-  template <kind::value K, typename MISC>
-  static void end_event(begin_data_t bd, MISC m) {}
+  template <typename kind::value K, typename Misc>
+  static void end_event(begin_data_t bd, Misc m) {}
 };
 
 }

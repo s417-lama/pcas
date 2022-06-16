@@ -3,54 +3,74 @@
 #include <cstdio>
 #include <cstdint>
 
+#include "pcas/global_clock.hpp"
 #include "pcas/logger/kind.hpp"
-#include "pcas/logger/policy_dummy.hpp"
-#include "pcas/logger/policy_trace.hpp"
+#include "pcas/logger/impl_dummy.hpp"
+#include "pcas/logger/impl_trace.hpp"
 
 namespace pcas {
-namespace logger_impl {
+namespace logger {
+
+template <typename ParentPolicy>
+struct policy {
+  using wallclock_t = typename ParentPolicy::wallclock_t;
+  using logger_kind_t = typename ParentPolicy::logger_kind_t;
+  template <typename P>
+  using impl_t = typename ParentPolicy::template logger_impl_t<P>;
+};
+
+// unused
+struct policy_default {
+  using wallclock_t = global_clock;
+  using logger_kind_t = kind;
+  template <typename P>
+  using impl_t = impl_dummy<P>;
+};
 
 template <typename P>
 class logger_if {
+  using kind = typename P::logger_kind_t;
+  using impl = typename P::template impl_t<P>;
+
 public:
-  using begin_data_t = typename P::begin_data_t;
+  using begin_data_t = typename impl::begin_data_t;
 
   static void init(int rank, int n_ranks) {
-    P::init(rank, n_ranks);
+    impl::init(rank, n_ranks);
   }
 
   static void flush(uint64_t t_begin, uint64_t t_end) {
-    P::flush(t_begin, t_end);
+    impl::flush(t_begin, t_end);
   }
 
   static void flush_and_print_stat(uint64_t t_begin, uint64_t t_end) {
-    P::flush_and_print_stat(t_begin, t_end);
+    impl::flush_and_print_stat(t_begin, t_end);
   }
 
   static void warmup() {
-    P::warmup();
+    impl::warmup();
   }
 
   static void clear() {
-    P::clear();
+    impl::clear();
   }
 
-  template <kind::value K>
+  template <typename kind::value K>
   static begin_data_t begin_event() {
-    return P::template begin_event<K>();
+    return impl::template begin_event<K>();
   }
 
-  template <kind::value K>
+  template <typename kind::value K>
   static void end_event(begin_data_t bd) {
-    P::template end_event<K>(bd);
+    impl::template end_event<K>(bd);
   }
 
-  template <kind::value K, typename MISC>
-  static void end_event(begin_data_t bd, MISC m) {
-    P::template end_event<K, MISC>(bd, m);
+  template <typename kind::value K, typename Misc>
+  static void end_event(begin_data_t bd, Misc m) {
+    impl::template end_event<K, Misc>(bd, m);
   }
 
-  template <kind::value K>
+  template <typename kind::value K>
   class scope_event {
     begin_data_t bd_;
   public:
@@ -62,12 +82,12 @@ public:
     }
   };
 
-  template <kind::value K, typename MISC>
+  template <typename kind::value K, typename Misc>
   class scope_event_m {
     begin_data_t bd_;
-    MISC m_;
+    Misc m_;
   public:
-    scope_event_m(MISC m) {
+    scope_event_m(Misc m) {
       bd_ = begin_event<K>();
       m_ = m;
     };
@@ -76,12 +96,12 @@ public:
     }
   };
 
-  template <kind::value K>
+  template <typename kind::value K>
   static scope_event<K> record() {
     return scope_event<K>();
   }
 
-  template <kind::value K, typename Misc>
+  template <typename kind::value K, typename Misc>
   static scope_event_m<K, Misc> record(Misc m) {
     return scope_event_m<K, Misc>(m);
   }
@@ -89,15 +109,4 @@ public:
 };
 
 }
-
-#ifndef PCAS_LOGGER_POLICY
-#define PCAS_LOGGER_POLICY policy_dummy
-#endif
-
-using logger = logger_impl::logger_if<logger_impl::PCAS_LOGGER_POLICY>;
-
-#undef PCAS_LOGGER_POLICY
-
-using logger_kind = logger_impl::kind::value;
-
 }

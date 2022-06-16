@@ -10,18 +10,19 @@
 #include "mlog/mlog.h"
 
 #include "pcas/util.hpp"
-#include "pcas/global_clock.hpp"
-#include "pcas/logger/kind.hpp"
 
 namespace pcas {
-namespace logger_impl {
+namespace logger {
 
-class policy_trace {
+template <typename P>
+class impl_trace {
 public:
   using begin_data_t = void*;
 
 private:
-  using this_t = policy_trace;
+  using this_t = impl_trace;
+  using kind = typename P::logger_kind_t;
+  using wallclock = typename P::wallclock_t;
 
   int rank_;
   int n_ranks_;
@@ -43,7 +44,7 @@ private:
     return my_instance;
   }
 
-  template <kind::value K>
+  template <typename kind::value K>
   static void* logger_decoder_tl_(FILE* stream, int _rank0, int _rank1, void* buf0, void* buf1) {
     this_t& lgr = get_instance_();
 
@@ -60,13 +61,13 @@ private:
     return buf1;
   }
 
-  template <kind::value K, typename MISC>
+  template <typename kind::value K, typename Misc>
   static void* logger_decoder_tl_w_misc_(FILE* stream, int _rank0, int _rank1, void* buf0, void* buf1) {
     this_t& lgr = get_instance_();
 
     uint64_t t0 = MLOG_READ_ARG(&buf0, uint64_t);
     uint64_t t1 = MLOG_READ_ARG(&buf1, uint64_t);
-    MISC     m  = MLOG_READ_ARG(&buf1, MISC);
+    Misc     m  = MLOG_READ_ARG(&buf1, Misc);
 
     if (t1 < lgr.t_begin_ || lgr.t_end_ < t0) {
       return buf1;
@@ -99,7 +100,7 @@ private:
     }
   }
 
-  template <kind::value K>
+  template <typename kind::value K>
   static void acc_stat_(uint64_t t0, uint64_t t1) {
     this_t& lgr = get_instance_();
     uint64_t t0_ = std::max(t0, lgr.t_begin_);
@@ -112,7 +113,7 @@ private:
 
   static void print_stat_(int rank) {
     for (size_t k = 1; k < kind::size(); k++) {
-      print_kind_stat_(kind((kind::value)k), rank);
+      print_kind_stat_(kind((typename kind::value)k), rank);
     }
     printf("\n");
   }
@@ -129,8 +130,8 @@ public:
 
     mlog_init(&lgr.md_, 1, size);
 
-    global_clock::init();
-    global_clock::sync();
+    wallclock::init();
+    wallclock::sync();
 
     char filename[128];
     sprintf(filename, "pcas_log_%d.ignore", rank);
@@ -195,11 +196,11 @@ public:
     mlog_clear_all(&lgr.md_);
   }
 
-  template <kind::value K>
+  template <typename kind::value K>
   static begin_data_t begin_event() {
     if (kind(K).is_valid()) {
       this_t& lgr = get_instance_();
-      uint64_t t = global_clock::get_time();
+      uint64_t t = wallclock::get_time();
       begin_data_t bd = MLOG_BEGIN(&lgr.md_, 0, t);
       return bd;
     } else {
@@ -207,22 +208,22 @@ public:
     }
   }
 
-  template <kind::value K>
+  template <typename kind::value K>
   static void end_event(begin_data_t bd) {
     if (kind(K).is_valid()) {
       this_t& lgr = get_instance_();
-      uint64_t t = global_clock::get_time();
+      uint64_t t = wallclock::get_time();
       auto fn = &logger_decoder_tl_<K>;
       MLOG_END(&lgr.md_, 0, bd, fn, t);
     }
   }
 
-  template <kind::value K, typename MISC>
-  static void end_event(begin_data_t bd, MISC m) {
+  template <typename kind::value K, typename Misc>
+  static void end_event(begin_data_t bd, Misc m) {
     if (kind(K).is_valid()) {
       this_t& lgr = get_instance_();
-      uint64_t t = global_clock::get_time();
-      auto fn = &logger_decoder_tl_w_misc_<K, MISC>;
+      uint64_t t = wallclock::get_time();
+      auto fn = &logger_decoder_tl_w_misc_<K, Misc>;
       MLOG_END(&lgr.md_, 0, bd, fn, t, m);
     }
   }

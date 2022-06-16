@@ -10,6 +10,7 @@
 #include "pcas/physical_mem.hpp"
 #include "pcas/virtual_mem.hpp"
 #include "pcas/cache.hpp"
+#include "pcas/global_clock.hpp"
 #include "pcas/logger/logger.hpp"
 
 namespace pcas {
@@ -49,7 +50,20 @@ struct checkout_entry {
   access_mode         mode;
 };
 
-class pcas {
+struct policy_default {
+  using wallclock_t = global_clock;
+  using logger_kind_t = logger::kind;
+  template <typename P>
+  using logger_impl_t = logger::impl_dummy<P>;
+};
+
+template <typename P>
+class pcas_if;
+
+using pcas = pcas_if<policy_default>;
+
+template <typename P>
+class pcas_if {
   int      rank_;
   int      nproc_;
   MPI_Comm comm_;
@@ -62,8 +76,11 @@ class pcas {
   cache_t cache_;
 
 public:
-  pcas(uint64_t cache_size = 1024 * min_block_size, MPI_Comm comm = MPI_COMM_WORLD);
-  ~pcas();
+  using logger = typename logger::template logger_if<logger::policy<P>>;
+  using logger_kind = typename P::logger_kind_t::value;
+
+  pcas_if(uint64_t cache_size = 1024 * min_block_size, MPI_Comm comm = MPI_COMM_WORLD);
+  ~pcas_if();
 
   int rank() const { return rank_; }
   int nproc() const { return nproc_; }
@@ -118,7 +135,8 @@ public:
 
 };
 
-inline pcas::pcas(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
+template <typename P>
+inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
   int mpi_initialized = 0;
   MPI_Initialized(&mpi_initialized);
   if (!mpi_initialized) {
@@ -135,7 +153,8 @@ inline pcas::pcas(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
   logger::init(rank_, nproc_);
 }
 
-inline pcas::~pcas() {
+template <typename P>
+inline pcas_if<P>::~pcas_if() {
   /* barrier(); */
 }
 
@@ -145,10 +164,11 @@ PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
   }
 }
 
+template <typename P>
 template <typename T>
-inline global_ptr<T> pcas::malloc(uint64_t    nelems,
-                                  dist_policy dpolicy,
-                                  uint64_t    block_size) {
+inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
+                                        dist_policy dpolicy,
+                                        uint64_t    block_size) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
@@ -204,8 +224,9 @@ inline global_ptr<T> pcas::malloc(uint64_t    nelems,
   }
 }
 
+template <typename P>
 template <typename T>
-inline void pcas::free(global_ptr<T> ptr) {
+inline void pcas_if<P>::free(global_ptr<T> ptr) {
   if (ptr == global_ptr<T>()) {
     die("null pointer was passed to pcas::free()");
   }
@@ -249,8 +270,9 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
   }
 }
 
+template <typename P>
 template <typename T, typename Func>
-inline void pcas::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
+inline void pcas_if<P>::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
   obj_entry& obe = objs_[ptr.id()];
 
   uint64_t offset_min = ptr.offset();
@@ -315,8 +337,9 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
   pc.free(p);
 }
 
+template <typename P>
 template <typename T>
-inline void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
   if (from_ptr.owner() == -1) {
     obj_entry& obe = objs_[from_ptr.id()];
     uint64_t offset = from_ptr.offset();
@@ -342,8 +365,9 @@ inline void pcas::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
   }
 }
 
+template <typename P>
 template <typename T>
-inline void pcas::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
   if (to_ptr.owner() == -1) {
     obj_entry& obe = objs_[to_ptr.id()];
     uint64_t offset = to_ptr.offset();
@@ -435,10 +459,11 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
   pc.free(p);
 }
 
+template <typename P>
 template <access_mode Mode, typename T>
 inline std::conditional_t<Mode == access_mode::read, const T*, T*>
-pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
-  auto ev = logger::record<logger_kind::Checkout>(nelems * sizeof(T));
+pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
+  auto ev = logger::template record<logger_kind::Checkout>(nelems * sizeof(T));
 
   obj_entry& obe = objs_[ptr.id()];
 
@@ -501,9 +526,10 @@ pcas::checkout(global_ptr<T> ptr, uint64_t nelems) {
   return ret;
 }
 
+template <typename P>
 template <typename T>
-inline void pcas::checkin(T* raw_ptr) {
-  auto ev = logger::record<logger_kind::Checkin>();
+inline void pcas_if<P>::checkin(T* raw_ptr) {
+  auto ev = logger::template record<logger_kind::Checkin>();
 
   auto c = checkouts_.find((void*)raw_ptr);
   if (c == checkouts_.end()) {
@@ -531,8 +557,9 @@ inline void pcas::checkin(T* raw_ptr) {
   checkouts_.erase((void*)raw_ptr);
 }
 
+template <typename P>
 template <typename T>
-inline void pcas::checkin(const T* raw_ptr) {
+inline void pcas_if<P>::checkin(const T* raw_ptr) {
   checkin(const_cast<T*>(raw_ptr));
 }
 
