@@ -86,9 +86,11 @@ public:
   int nproc() const { return nproc_; }
 
   void release() {
+    auto ev = logger::template record<logger_kind::Release>();
   }
 
   void acquire() {
+    auto ev = logger::template record<logger_kind::Acquire>();
     cache_.evict_all();
   }
 
@@ -148,9 +150,9 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm) : cache_(cache_si
   MPI_Comm_rank(comm_, &rank_);
   MPI_Comm_size(comm_, &nproc_);
 
-  barrier();
-
   logger::init(rank_, nproc_);
+
+  barrier();
 }
 
 template <typename P>
