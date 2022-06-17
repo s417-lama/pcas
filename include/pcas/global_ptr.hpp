@@ -27,11 +27,9 @@ class global_ptr {
 public:
   global_ptr() : owner_(-2), id_(0), offset_(0) {}
   global_ptr(int owner, obj_id_t id, uint64_t offset) : owner_(owner), id_(id), offset_(offset) {}
-  global_ptr(const this_t& p) {
-    owner_  = p.owner_;
-    id_     = p.id_;
-    offset_ = p.offset_;
-  }
+
+  global_ptr(const this_t&) = default;
+  this_t& operator=(const this_t&) = default;
 
   int owner() const noexcept { return owner_; }
   obj_id_t id() const noexcept { return id_; }

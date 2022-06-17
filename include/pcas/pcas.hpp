@@ -87,10 +87,12 @@ public:
 
   void release() {
     auto ev = logger::template record<logger_kind::Release>();
+    PCAS_CHECK(checkouts_.empty());
   }
 
   void acquire() {
     auto ev = logger::template record<logger_kind::Acquire>();
+    PCAS_CHECK(checkouts_.empty());
     cache_.evict_all();
   }
 
@@ -170,7 +172,7 @@ template <typename P>
 template <typename T>
 inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
                                         dist_policy dpolicy,
-                                        uint64_t    block_size) {
+                                        uint64_t    block_size [[maybe_unused]]) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
