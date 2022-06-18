@@ -480,35 +480,40 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
     auto cae = obe.cache_entries[b];
     if (cae) {
+      uint64_t vm_offset = b * cache_t::block_size;
       bool hit = cache_.checkout(cae);
       if (!hit) {
+        filled_cache_entries.push_back(std::make_pair(cae, vm_offset));
+      }
+      // Suppose that a cache block is represented as [a1, a2].
+      // If a1 is checked out with write-only access mode, then [a1, a2] is allocated a cache entry,
+      // but fetch for a1 and a2 is skipped.  Later, if a2 is checked out with read access mode,
+      // the data for a2 would not be fetched because it is already in the cache.
+      // Thus, we allocate a `fetched` flag to each cache entry to indicate if the entire cache block
+      // has been already fetched or not.
+      bool wants_fetch = Mode != access_mode::write;
+      if (cache_.needs_fetch(cae, wants_fetch)) {
         // TODO: fix the assumption cache_t::block_size == min_block_size
         auto [owner, _idx_b, _idx_e] =
           block_index_info(b * cache_t::block_size, obe.effective_size, nproc_);
 
-        uint64_t vm_offset = b * cache_t::block_size;
-        filled_cache_entries.push_back(std::make_pair(cae, vm_offset));
+        void* cache_block_ptr = cache_.pm().anon_vm_addr();
 
-        if (Mode == access_mode::read_write ||
-            Mode == access_mode::read) {
-          void* cache_block_ptr = cache_.pm().anon_vm_addr();
+        auto& owner_ = owner; // structured bindings cannot be captured by lambda until C++20
+        PCAS_CHECK(vm_offset >= owner_ * obe.block_size);
+        PCAS_CHECK(vm_offset - owner_ * obe.block_size + cache_t::block_size <= obe.block_size);
 
-          auto& owner_ = owner; // structured bindings cannot be captured by lambda until C++20
-          PCAS_CHECK(vm_offset >= owner_ * obe.block_size);
-          PCAS_CHECK(vm_offset - owner_ * obe.block_size + cache_t::block_size <= obe.block_size);
-
-          MPI_Request req;
-          MPI_Rget((uint8_t*)cache_block_ptr + cae->pm_offset,
-                   cache_t::block_size,
-                   MPI_UINT8_T,
-                   owner,
-                   vm_offset - owner * obe.block_size,
-                   cache_t::block_size,
-                   MPI_UINT8_T,
-                   obe.win,
-                   &req);
-          reqs.push_back(req);
-        }
+        MPI_Request req;
+        MPI_Rget((uint8_t*)cache_block_ptr + cae->pm_offset,
+                 cache_t::block_size,
+                 MPI_UINT8_T,
+                 owner,
+                 vm_offset - owner * obe.block_size,
+                 cache_t::block_size,
+                 MPI_UINT8_T,
+                 obe.win,
+                 &req);
+        reqs.push_back(req);
       }
     }
   }
@@ -555,6 +560,14 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
     auto cae = obe.cache_entries[b];
     if (cae) {
       cache_.checkin(cae);
+      // If the entire cache block is written, we consider that it is already fetched.
+      // If only a part of the block is written, we need to fetch the block when this block
+      // is checked out with read access mode.
+      if (che.mode == access_mode::write &&
+          che.ptr.offset() <= b * cache_t::block_size &&
+          (b + 1) * cache_t::block_size <= che.ptr.offset() + che.size) {
+        cache_.already_fetched(cae);
+      }
     }
   }
 

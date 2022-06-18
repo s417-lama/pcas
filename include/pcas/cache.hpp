@@ -19,6 +19,7 @@ class cache_system {
 
   struct entry {
     bool     cached         = false;
+    bool     fetched        = false;
     int      checkout_count = 0;
     uint64_t pm_offset;
   };
@@ -41,6 +42,7 @@ private:
     PCAS_CHECK(e);
     PCAS_CHECK(e->checkout_count == 0);
     e->cached = false;
+    e->fetched = false;
     cache_map_[block_num] = nullptr;
   }
 
@@ -116,16 +118,16 @@ public:
 
   bool checkout(entry_t e) {
     PCAS_CHECK(e);
-    bool hit = true;
-    if (!e->cached) {
+    e->checkout_count++;
+    if (e->cached) {
+      return true;
+    } else {
       int block_num = get_empty_block();
       e->pm_offset = block_num * BlockSize;
       e->cached = true;
       cache_map_[block_num] = e;
-      hit = false;
+      return false;
     }
-    e->checkout_count++;
-    return hit;
   }
 
   void checkin(entry_t e) {
@@ -133,6 +135,23 @@ public:
     PCAS_CHECK(e->checkout_count > 0);
     PCAS_CHECK(e->cached);
     e->checkout_count--;
+  }
+
+  bool needs_fetch(entry_t e, bool wants_fetch) {
+    PCAS_CHECK(e);
+    PCAS_CHECK(e->cached);
+    if (wants_fetch && !e->fetched) {
+      e->fetched = true;
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  void already_fetched(entry_t e) {
+    PCAS_CHECK(e);
+    PCAS_CHECK(e->cached);
+    e->fetched = true;
   }
 
   void evict_all() {
