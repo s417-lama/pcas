@@ -30,7 +30,6 @@ public:
     static int counter = 0;
     char s[256];
     snprintf(s, 255, "/pcas_%d_%d", getpid(), counter++);
-    printf("%s\n", s);
     fd_ = shm_open(s, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
     if (fd_ == -1) {
       perror("shm_open");
