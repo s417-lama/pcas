@@ -26,13 +26,6 @@ class virtual_mem {
     return ret;
   }
 
-  void munmap_(void* addr, uint64_t size) const {
-    if (munmap(addr, size) == -1) {
-      perror("munmap");
-      die("[pcas::virtual_mem] munmap(%p, %lu) failed", addr, size);
-    }
-  }
-
 public:
   virtual_mem() {}
   virtual_mem(void* addr, uint64_t size) : size_(size) {
@@ -45,7 +38,7 @@ public:
 
   ~virtual_mem() {
     if (addr_) {
-      munmap_(addr_, size_);
+      unmap(addr_, size_);
     }
   }
 
@@ -62,16 +55,23 @@ public:
   void* addr() const { return addr_; }
   uint64_t size() const { return size_; }
 
+  static void unmap(void* addr, uint64_t size) {
+    if (munmap(addr, size) == -1) {
+      perror("munmap");
+      die("[pcas::virtual_mem] munmap(%p, %lu) failed", addr, size);
+    }
+  }
+
   void* map_physical_mem(uint64_t vm_offset, uint64_t pm_offset, uint64_t size, physical_mem& pm) const {
     PCAS_CHECK(vm_offset + size <= size_);
-    munmap_((uint8_t*)addr_ + vm_offset, size); // TODO: needed?
+    unmap((uint8_t*)addr_ + vm_offset, size); // TODO: needed?
     void* ret = pm.map((uint8_t*)addr_ + vm_offset, pm_offset, size);
     PCAS_CHECK(ret == (uint8_t*)addr_ + vm_offset);
     return ret;
   }
 
   void unmap_physical_mem(uint64_t vm_offset, uint64_t size) const {
-    munmap_((uint8_t*)addr_ + vm_offset, size);
+    unmap((uint8_t*)addr_ + vm_offset, size);
     void* ret = mmap_no_physical_mem((uint8_t*)addr_ + vm_offset, size);
     PCAS_CHECK(ret == (uint8_t*)addr_ + vm_offset);
   }

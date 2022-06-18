@@ -471,7 +471,8 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
   obj_entry& obe = objs_[ptr.id()];
 
-  std::vector<std::pair<cache_t::entry_t, uint64_t>> filled_cache_entries;
+  // tuple(prev_entry, new_entry, block_num)
+  std::vector<std::tuple<cache_t::entry_t, cache_t::entry_t, cache_t::block_num_t>> filled_cache_entries;
   std::vector<MPI_Request> reqs;
 
   uint64_t cache_entry_b = ptr.offset() / cache_t::block_size;
@@ -481,9 +482,9 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     auto cae = obe.cache_entries[b];
     if (cae) {
       uint64_t vm_offset = b * cache_t::block_size;
-      bool hit = cache_.checkout(cae);
+      auto [hit, prev_cae] = cache_.checkout(cae);
       if (!hit) {
-        filled_cache_entries.push_back(std::make_pair(cae, vm_offset));
+        filled_cache_entries.push_back(std::make_tuple(prev_cae, cae, vm_offset));
       }
       // Suppose that a cache block is represented as [a1, a2].
       // If a1 is checked out with write-only access mode, then [a1, a2] is allocated a cache entry,
@@ -504,7 +505,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         PCAS_CHECK(vm_offset - owner_ * obe.block_size + cache_t::block_size <= obe.block_size);
 
         MPI_Request req;
-        MPI_Rget((uint8_t*)cache_block_ptr + cae->pm_offset,
+        MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size,
                  cache_t::block_size,
                  MPI_UINT8_T,
                  owner,
@@ -518,9 +519,15 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     }
   }
 
-  for (auto [cae, vm_offset] : filled_cache_entries) {
+  // Overlap communication and memory remapping
+  for (auto [prev_cae, new_cae, vm_offset] : filled_cache_entries) {
+    if (prev_cae) {
+      PCAS_CHECK(prev_cae->vm_addr);
+      virtual_mem::unmap(prev_cae->vm_addr, cache_t::block_size);
+    }
     physical_mem& cache_pm = cache_.pm();
-    obe.vm.map_physical_mem(vm_offset, cae->pm_offset, cache_t::block_size, cache_pm);
+    obe.vm.map_physical_mem(vm_offset, new_cae->block_num * cache_t::block_size, cache_t::block_size, cache_pm);
+    new_cae->vm_addr = (uint8_t*)obe.vm.addr() + vm_offset;
   }
 
   MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);

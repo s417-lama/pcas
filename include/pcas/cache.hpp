@@ -7,9 +7,11 @@
 #include <vector>
 #include <list>
 #include <random>
+#include <limits>
 
 #include "pcas/util.hpp"
 #include "pcas/physical_mem.hpp"
+#include "pcas/virtual_mem.hpp"
 
 namespace pcas {
 
@@ -17,53 +19,57 @@ template <uint64_t BlockSize>
 class cache_system {
   static_assert(BlockSize % min_block_size == 0);
 
+public:
+  using block_num_t = uint64_t;
+
   struct entry {
-    bool     cached         = false;
-    bool     fetched        = false;
-    int      checkout_count = 0;
-    uint64_t pm_offset;
+    bool        cached         = false;
+    bool        fetched        = false;
+    int         checkout_count = 0;
+    block_num_t block_num      = std::numeric_limits<block_num_t>::max();
+    uint8_t*    vm_addr        = nullptr;
   };
 
-public:
   using entry_t = entry*;
 
+  // FIXME: not used inside this class
   static constexpr uint64_t block_size = BlockSize;
 
 private:
   physical_mem        pm_;
   uint64_t            size_;
-  uint64_t            nblocks_;
+  block_num_t         nblocks_;
   std::list<entry*>   entries_; // TODO: needed?
   std::vector<entry*> cache_map_;
 
-  void evict(uint64_t block_num) {
-    PCAS_CHECK(block_num < nblocks_);
-    entry* e = cache_map_[block_num];
+  void evict(block_num_t b) {
+    PCAS_CHECK(b < nblocks_);
+    entry* e = cache_map_[b];
     PCAS_CHECK(e);
+    PCAS_CHECK(e->cached);
     PCAS_CHECK(e->checkout_count == 0);
     e->cached = false;
     e->fetched = false;
-    cache_map_[block_num] = nullptr;
   }
 
-  uint64_t evict_one() {
+  block_num_t evict_one() {
     // TODO: implement more smart eviction (e.g., LRU)
     // randomly select a victim first
     uint64_t max_trial = nblocks_ * 10;
     static std::mt19937 engine(0);
     std::uniform_int_distribution<> dist(0, nblocks_ - 1);
     for (uint64_t i = 0; i < max_trial; i++) {
-      uint64_t b = dist(engine);
+      block_num_t b = dist(engine);
       entry* e = cache_map_[b];
-      if (e && e->checkout_count == 0) {
+      if (e && e->cached && e->checkout_count == 0) {
         evict(b);
         return b;
       }
     }
     // check sequentially
-    for (uint64_t b = 0; b < nblocks_; b++) {
+    for (block_num_t b = 0; b < nblocks_; b++) {
       entry* e = cache_map_[b];
-      if (e && e->checkout_count == 0) {
+      if (e && e->cached && e->checkout_count == 0) {
         evict(b);
         return b;
       }
@@ -72,9 +78,10 @@ private:
     return 0;
   }
 
-  uint64_t get_empty_block() {
-    for (uint64_t b = 0; b < nblocks_; b++) {
-      if (cache_map_[b] == nullptr) {
+  block_num_t get_empty_block() {
+    for (block_num_t b = 0; b < nblocks_; b++) {
+      entry_t e = cache_map_[b];
+      if (!e || !e->cached) {
         return b;
       }
     }
@@ -106,27 +113,35 @@ public:
 
   void free_entry(entry_t e) {
     PCAS_CHECK(e);
-    if (e->cached) {
+    block_num_t b = e->block_num;
+    if (b < nblocks_ && cache_map_[b] == e) {
       PCAS_CHECK(e->checkout_count == 0);
-      uint64_t b = e->pm_offset / BlockSize;
-      PCAS_CHECK(b < nblocks_);
+      virtual_mem::unmap(e->vm_addr, BlockSize);
       cache_map_[b] = nullptr;
     }
     entries_.remove(e); // TODO: heavy?
     delete e;
   }
 
-  bool checkout(entry_t e) {
+  // return (hit, prev_entry)
+  std::tuple<bool, entry_t> checkout(entry_t e) {
     PCAS_CHECK(e);
     e->checkout_count++;
     if (e->cached) {
-      return true;
-    } else {
-      int block_num = get_empty_block();
-      e->pm_offset = block_num * BlockSize;
+      // cache hit
+      return std::make_tuple(true, nullptr);
+    } else if (e->block_num < nblocks_ && cache_map_[e->block_num] == e) {
+      // the entry has been invalidated but remains in the cache
       e->cached = true;
-      cache_map_[block_num] = e;
-      return false;
+      return std::make_tuple(false, nullptr);
+    } else {
+      // the entry needs a new cache block
+      block_num_t b = get_empty_block();
+      e->block_num = b;
+      e->cached = true;
+      entry_t prev_e = cache_map_[b];
+      cache_map_[b] = e;
+      return std::make_tuple(false, prev_e);
     }
   }
 
@@ -155,9 +170,9 @@ public:
   }
 
   void evict_all() {
-    for (uint64_t b = 0; b < nblocks_; b++) {
+    for (block_num_t b = 0; b < nblocks_; b++) {
       entry* e = cache_map_[b];
-      if (e) {
+      if (e && e->cached) {
         evict(b);
       }
     }
@@ -178,7 +193,7 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
 
   PCAS_SUBCASE("basic test") {
     for (int i = 0; i < nent; i++) {
-      bool hit = cs.checkout(cache_entries[i]);
+      auto [hit, _prev_e] = cs.checkout(cache_entries[i]);
       PCAS_CHECK_MESSAGE(!hit, "should not be cached at the beginning");
       cs.checkin(cache_entries[i]);
     }
@@ -186,14 +201,14 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
     cs.evict_all();
 
     for (int i = 0; i < nblk; i++) {
-      bool hit = cs.checkout(cache_entries[i]);
+      auto [hit, _prev_e] = cs.checkout(cache_entries[i]);
       PCAS_CHECK_MESSAGE(!hit, "should not be cached after evicting all cache");
       cs.checkin(cache_entries[i]);
     }
 
     for (int it = 0; it < 3; it++) {
       for (int i = 0; i < nblk; i++) {
-        bool hit = cs.checkout(cache_entries[i]);
+        auto [hit, _prev_e] = cs.checkout(cache_entries[i]);
         PCAS_CHECK_MESSAGE(hit, "should be cached when the working set fits into the cache");
         cs.checkin(cache_entries[i]);
       }
@@ -206,7 +221,7 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
     for (int it = 0; it < 3; it++) {
       for (int i = 1; i < nent; i++) {
         cs.checkout(cache_entries[i]);
-        PCAS_CHECK(cache_entries[i]->pm_offset != cache_entries[0]->pm_offset);
+        PCAS_CHECK(cache_entries[i]->block_num != cache_entries[0]->block_num);
         cs.checkin(cache_entries[i]);
       }
     }
