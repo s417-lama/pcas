@@ -10,17 +10,22 @@
 
 #include "pcas/util.hpp"
 
+#define USE_MEMFD_CREATE ((__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 27))
+
 namespace pcas {
 
 class physical_mem {
   int      fd_           = -1;
   uint64_t size_         = 0;
   void*    anon_vm_addr_ = nullptr;
+#if !USE_MEMFD_CREATE
+  char     shm_name_[256];
+#endif
 
 public:
   physical_mem() {}
   physical_mem(uint64_t size) : size_(size) {
-#if (__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 27)
+#if USE_MEMFD_CREATE
     fd_ = memfd_create("PCAS", 0);
     if (fd_ == -1) {
       perror("memfd_create");
@@ -28,9 +33,8 @@ public:
     }
 #else
     static int counter = 0;
-    char s[256];
-    snprintf(s, 255, "/pcas_%d_%d", getpid(), counter++);
-    fd_ = shm_open(s, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    snprintf(shm_name_, 255, "/pcas_%d_%d", getpid(), counter++);
+    fd_ = shm_open(shm_name_, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     if (fd_ == -1) {
       perror("shm_open");
       die("[pcas::physical_mem] shm_open() failed");
@@ -54,6 +58,9 @@ public:
     if (fd_ != -1) {
       unmap(anon_vm_addr_, size_);
       close(fd_);
+#if !USE_MEMFD_CREATE
+      shm_unlink(shm_name_);
+#endif
     }
   }
 
