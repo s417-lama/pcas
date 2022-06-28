@@ -39,7 +39,6 @@ private:
   physical_mem        pm_;
   uint64_t            size_;
   block_num_t         nblocks_;
-  std::list<entry*>   entries_; // TODO: needed?
   std::vector<entry*> cache_map_;
 
   void evict(block_num_t b) {
@@ -97,7 +96,6 @@ public:
   }
 
   ~cache_system() {
-    PCAS_CHECK(entries_.size() == 0);
     for (auto e : cache_map_) {
       PCAS_CHECK(e == nullptr);
     }
@@ -107,7 +105,6 @@ public:
 
   entry_t alloc_entry() {
     entry* e = new entry();
-    entries_.push_back(e);
     return e;
   }
 
@@ -119,7 +116,6 @@ public:
       virtual_mem::unmap(e->vm_addr, BlockSize);
       cache_map_[b] = nullptr;
     }
-    entries_.remove(e); // TODO: heavy?
     delete e;
   }
 
