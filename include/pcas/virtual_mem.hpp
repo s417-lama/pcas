@@ -15,17 +15,6 @@ class virtual_mem {
   void* addr_ = nullptr;
   uint64_t size_;
 
-  void* mmap_no_physical_mem(void* addr, uint64_t size) const {
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-    if (addr != nullptr) flags |= MAP_FIXED;
-    void* ret = mmap(addr, size, PROT_NONE, flags, -1, 0);
-    if (ret == MAP_FAILED) {
-      perror("mmap");
-      die("[pcas::virtual_mem] mmap(%p, %lu, ...) failed", addr, size);
-    }
-    return ret;
-  }
-
 public:
   virtual_mem() {}
   virtual_mem(void* addr, uint64_t size) : size_(size) {
@@ -55,25 +44,35 @@ public:
   void* addr() const { return addr_; }
   uint64_t size() const { return size_; }
 
-  static void unmap(void* addr, uint64_t size) {
-    if (munmap(addr, size) == -1) {
-      perror("munmap");
-      die("[pcas::virtual_mem] munmap(%p, %lu) failed", addr, size);
-    }
-  }
-
   void* map_physical_mem(uint64_t vm_offset, uint64_t pm_offset, uint64_t size, physical_mem& pm) const {
     PCAS_CHECK(vm_offset + size <= size_);
-    unmap((uint8_t*)addr_ + vm_offset, size); // TODO: needed?
     void* ret = pm.map((uint8_t*)addr_ + vm_offset, pm_offset, size);
     PCAS_CHECK(ret == (uint8_t*)addr_ + vm_offset);
     return ret;
   }
 
   void unmap_physical_mem(uint64_t vm_offset, uint64_t size) const {
-    unmap((uint8_t*)addr_ + vm_offset, size);
     void* ret = mmap_no_physical_mem((uint8_t*)addr_ + vm_offset, size);
     PCAS_CHECK(ret == (uint8_t*)addr_ + vm_offset);
+  }
+
+  // TODO: reconsider this abstraction...
+  static void* mmap_no_physical_mem(void* addr, uint64_t size) {
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (addr != nullptr) flags |= MAP_FIXED;
+    void* ret = mmap(addr, size, PROT_NONE, flags, -1, 0);
+    if (ret == MAP_FAILED) {
+      perror("mmap");
+      die("[pcas::virtual_mem] mmap(%p, %lu, ...) failed", addr, size);
+    }
+    return ret;
+  }
+
+  static void unmap(void* addr, uint64_t size) {
+    if (munmap(addr, size) == -1) {
+      perror("munmap");
+      die("[pcas::virtual_mem] munmap(%p, %lu) failed", addr, size);
+    }
   }
 
 };

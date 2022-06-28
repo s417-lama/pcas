@@ -523,7 +523,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   for (auto [prev_cae, new_cae, vm_offset] : filled_cache_entries) {
     if (prev_cae) {
       PCAS_CHECK(prev_cae->vm_addr);
-      virtual_mem::unmap(prev_cae->vm_addr, cache_t::block_size);
+      virtual_mem::mmap_no_physical_mem(prev_cae->vm_addr, cache_t::block_size);
     }
     physical_mem& cache_pm = cache_.pm();
     obe.vm.map_physical_mem(vm_offset, new_cae->block_num * cache_t::block_size, cache_t::block_size, cache_pm);
