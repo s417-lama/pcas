@@ -551,18 +551,39 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
   if (c == checkouts_.end()) {
     die("The pointer %p passed to checkin() is not registered", raw_ptr);
   }
-  checkout_entry che = c->second;
-  if (che.mode == access_mode::read_write ||
-      che.mode == access_mode::write) {
-    // TODO: temporarily reuse the implementation of PUT for now
-    put(che.raw_ptr, che.ptr, che.size);
-  }
 
+  checkout_entry che = c->second;
   obj_entry& obe = objs_[che.ptr.id()];
 
   uint64_t cache_entry_b = che.ptr.offset() / cache_t::block_size;
   uint64_t cache_entry_e =
     (che.ptr.offset() + che.size + cache_t::block_size - 1) / cache_t::block_size;
+
+  if (che.mode == access_mode::read_write ||
+      che.mode == access_mode::write) {
+    for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
+      auto cae = obe.cache_entries[b];
+      if (cae) {
+        uint64_t offset_in_block_b = (che.ptr.offset() > b * cache_t::block_size) ?
+                                     che.ptr.offset() - b * cache_t::block_size : 0;
+        uint64_t offset_in_block_e = (che.ptr.offset() + che.size < (b + 1) * cache_t::block_size) ?
+                                     che.ptr.offset() + che.size - b * cache_t::block_size : cache_t::block_size;
+        void* cache_block_ptr = cache_.pm().anon_vm_addr();
+        auto [owner, _idx_b, _idx_e] =
+          block_index_info(b * cache_t::block_size, obe.effective_size, nproc_);
+        MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
+                offset_in_block_e - offset_in_block_b,
+                MPI_UINT8_T,
+                owner,
+                b * cache_t::block_size - owner * obe.block_size + offset_in_block_b,
+                offset_in_block_e - offset_in_block_b,
+                MPI_UINT8_T,
+                obe.win);
+      }
+    }
+    MPI_Win_flush_all(obe.win);
+  }
+
   for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
     auto cae = obe.cache_entries[b];
     if (cae) {
