@@ -12,6 +12,11 @@
 
 #define USE_MEMFD_CREATE ((__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 27))
 
+#if !USE_MEMFD_CREATE
+// for getting MPI rank
+#include <mpi.h>
+#endif
+
 namespace pcas {
 
 class physical_mem {
@@ -32,8 +37,12 @@ public:
       die("[pcas::physical_mem] memfd_create() failed");
     }
 #else
+    // FIXME: rank retrieval
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
     static int counter = 0;
-    snprintf(shm_name_, 255, "/pcas_%d_%d", getpid(), counter++);
+    snprintf(shm_name_, 255, "/pcas_%d_%d", rank, counter++);
     fd_ = shm_open(shm_name_, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     if (fd_ == -1) {
       perror("shm_open");
