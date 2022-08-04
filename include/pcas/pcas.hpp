@@ -50,6 +50,23 @@ struct checkout_entry {
   access_mode         mode;
 };
 
+using epoch_t = uint64_t;
+
+struct release_remote_region {
+  epoch_t request; // requested epoch from remote
+  epoch_t epoch; // current epoch of the owner
+};
+
+struct release_manager {
+  release_remote_region* remote;
+  MPI_Win win;
+};
+
+struct release_handler {
+  int rank;
+  epoch_t epoch;
+};
+
 struct policy_default {
   using wallclock_t = wallclock_native;
   using logger_kind_t = logger::kind;
@@ -74,6 +91,9 @@ class pcas_if {
   std::unordered_map<void*, checkout_entry> checkouts_;
 
   cache_t cache_;
+
+  bool cache_dirty_ = false;
+  release_manager rm_;
 
 public:
   using logger = typename logger::template logger_if<logger::policy<P>>;
@@ -115,6 +135,9 @@ public:
     for (auto win : wins) {
       MPI_Win_flush_all(win);
     }
+
+    cache_dirty_ = false;
+    rm_.remote->epoch++;
   }
 
   void release() {
@@ -124,11 +147,58 @@ public:
     flush_dirty_cache();
   }
 
-  void acquire() {
+  void release_lazy(release_handler* handler) {
+    PCAS_CHECK(checkouts_.empty());
+
+    epoch_t next_epoch = cache_dirty_ ? rm_.remote->epoch + 1 : 0; // 0 means clean
+    *handler = {.rank = rank_, .epoch = next_epoch};
+  }
+
+  epoch_t get_remote_epoch(int target_rank) {
+    epoch_t remote_epoch;
+
+    MPI_Request req;
+    MPI_Rget(&remote_epoch,
+             sizeof(epoch_t),
+             MPI_UINT8_T,
+             target_rank,
+             offsetof(release_remote_region, epoch),
+             sizeof(epoch_t),
+             MPI_UINT8_T,
+             rm_.win,
+             &req);
+    MPI_Wait(&req, MPI_STATUS_IGNORE);
+
+    return remote_epoch;
+  }
+
+  void send_release_request(int target_rank, epoch_t request) {
+    epoch_t prev;
+    MPI_Fetch_and_op(&request,
+                     &prev,
+                     MPI_UINT64_T, // should match epoch_t
+                     target_rank,
+                     offsetof(release_remote_region, request),
+                     MPI_MAX,
+                     rm_.win);
+    MPI_Win_flush(target_rank, rm_.win);
+  }
+
+  void acquire(release_handler handler = {.rank = 0, .epoch = 0}) {
     auto ev = logger::template record<logger_kind::Acquire>();
     PCAS_CHECK(checkouts_.empty());
 
     flush_dirty_cache();
+
+    if (handler.epoch != 0) {
+      if (get_remote_epoch(handler.rank) < handler.epoch) {
+        send_release_request(handler.rank, handler.epoch);
+        // need to wait for the execution of a release by the remote worker
+        while (get_remote_epoch(handler.rank) < handler.epoch) {
+          usleep(10); // TODO: better interval?
+        };
+      }
+    }
 
     cache_.evict_all();
   }
@@ -137,6 +207,15 @@ public:
     release();
     MPI_Barrier(comm_);
     acquire();
+  }
+
+  void poll() {
+    if (rm_.remote->request > rm_.remote->epoch) {
+      auto ev = logger::template record<logger_kind::ReleaseLazy>();
+      PCAS_CHECK(rm_.remote->request == rm_.remote->epoch + 1);
+      flush_dirty_cache();
+      PCAS_CHECK(rm_.remote->request == rm_.remote->epoch);
+    }
   }
 
   template <typename T>
@@ -190,6 +269,17 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm) : cache_(cache_si
   MPI_Comm_size(comm_, &nproc_);
 
   logger::init(rank_, nproc_);
+
+  MPI_Win_allocate(sizeof(release_remote_region),
+                   1,
+                   MPI_INFO_NULL,
+                   comm_,
+                   &rm_.remote,
+                   &rm_.win);
+  MPI_Win_lock_all(0, rm_.win);
+
+  rm_.remote->request = 1;
+  rm_.remote->epoch = 1;
 
   barrier();
 }
@@ -613,6 +703,7 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
         uint64_t offset_in_block_e = (che.ptr.offset() + che.size < (b + 1) * cache_t::block_size) ?
                                      che.ptr.offset() + che.size - b * cache_t::block_size : cache_t::block_size;
         sections_insert(cae->dirty_sections, {offset_in_block_b, offset_in_block_e});
+        cache_dirty_ = true;
       }
     }
   }

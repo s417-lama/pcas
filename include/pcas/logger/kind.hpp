@@ -13,6 +13,7 @@ public:
     Checkout,
     Checkin,
     Release,
+    ReleaseLazy,
     Acquire,
 
     _NKinds,
@@ -71,6 +72,7 @@ public:
       case value::Checkout:      return "checkout";
       case value::Checkin:       return "checkin";
       case value::Release:       return "release";
+      case value::ReleaseLazy:   return "release_lazy";
       case value::Acquire:       return "acquire";
 
       default:                   return "other";
