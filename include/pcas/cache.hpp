@@ -28,6 +28,8 @@ public:
     int         checkout_count = 0;
     block_num_t block_num      = std::numeric_limits<block_num_t>::max();
     uint8_t*    vm_addr        = nullptr;
+    obj_id_t    obj_id;
+    sections    dirty_sections;
   };
 
   using entry_t = entry*;
@@ -41,12 +43,17 @@ private:
   block_num_t         nblocks_;
   std::vector<entry*> cache_map_;
 
+  bool is_evictable(entry_t e) {
+    return e && e->cached && e->checkout_count == 0 && e->dirty_sections.empty();
+  }
+
   void evict(block_num_t b) {
     PCAS_CHECK(b < nblocks_);
     entry* e = cache_map_[b];
     PCAS_CHECK(e);
     PCAS_CHECK(e->cached);
     PCAS_CHECK(e->checkout_count == 0);
+    PCAS_CHECK(e->dirty_sections.empty());
     e->cached = false;
     e->fetched = false;
   }
@@ -60,7 +67,7 @@ private:
     for (uint64_t i = 0; i < max_trial; i++) {
       block_num_t b = dist(engine);
       entry* e = cache_map_[b];
-      if (e && e->cached && e->checkout_count == 0) {
+      if (is_evictable(e)) {
         evict(b);
         return b;
       }
@@ -68,7 +75,7 @@ private:
     // check sequentially
     for (block_num_t b = 0; b < nblocks_; b++) {
       entry* e = cache_map_[b];
-      if (e && e->cached && e->checkout_count == 0) {
+      if (is_evictable(e)) {
         evict(b);
         return b;
       }
@@ -103,13 +110,15 @@ public:
 
   physical_mem& pm() { return pm_; }
 
-  entry_t alloc_entry() {
+  entry_t alloc_entry(obj_id_t obj_id) {
     entry* e = new entry();
+    e->obj_id = obj_id;
     return e;
   }
 
   void free_entry(entry_t e) {
     PCAS_CHECK(e);
+    PCAS_CHECK(e->dirty_sections.empty());
     block_num_t b = e->block_num;
     if (b < nblocks_ && cache_map_[b] == e) {
       PCAS_CHECK(e->checkout_count == 0);
@@ -128,6 +137,7 @@ public:
       return std::make_tuple(true, nullptr);
     } else if (e->block_num < nblocks_ && cache_map_[e->block_num] == e) {
       // the entry has been invalidated but remains in the cache
+      PCAS_CHECK(e->dirty_sections.empty());
       e->cached = true;
       return std::make_tuple(false, nullptr);
     } else {
@@ -148,29 +158,20 @@ public:
     e->checkout_count--;
   }
 
-  bool needs_fetch(entry_t e, bool wants_fetch) {
-    PCAS_CHECK(e);
-    PCAS_CHECK(e->cached);
-    if (wants_fetch && !e->fetched) {
-      e->fetched = true;
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  void already_fetched(entry_t e) {
-    PCAS_CHECK(e);
-    PCAS_CHECK(e->cached);
-    e->fetched = true;
-  }
-
   void evict_all() {
     for (block_num_t b = 0; b < nblocks_; b++) {
       entry* e = cache_map_[b];
       if (e && e->cached) {
         evict(b);
       }
+    }
+  }
+
+  template <typename Func>
+  void for_each_block(Func f) {
+    for (block_num_t b = 0; b < nblocks_; b++) {
+      entry* e = cache_map_[b];
+      f(e);
     }
   }
 
@@ -184,7 +185,7 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
   std::vector<cache_t::entry_t> cache_entries;
   int nent = 1000;
   for (int i = 0; i < nent; i++) {
-    cache_entries.push_back(cs.alloc_entry());
+    cache_entries.push_back(cs.alloc_entry(0));
   }
 
   PCAS_SUBCASE("basic test") {

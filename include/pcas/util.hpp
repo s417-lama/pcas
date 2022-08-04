@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <tuple>
 #include <sstream>
+#include <forward_list>
 
 #ifdef DOCTEST_LIBRARY_INCLUDED
 
@@ -45,6 +46,8 @@
 #endif
 
 namespace pcas {
+
+using obj_id_t = uint64_t;
 
 __attribute__((noinline))
 inline void die(const char* fmt, ...) {
@@ -129,6 +132,103 @@ inline T get_env(const char* env_var, T default_val, int rank) {
     std::cout << env_var << " = " << val << std::endl;
   }
   return val;
+}
+
+using section = std::pair<uint32_t, uint32_t>;
+using sections = std::forward_list<section>;
+
+inline section section_merge(section s1, section s2) {
+  return section{std::min(s1.first, s2.first), std::max(s1.second, s2.second)};
+}
+
+inline void sections_insert(sections& ss, section s) {
+  auto it = ss.before_begin();
+
+  // skip until it overlaps s (or s < it)
+  while (std::next(it) != ss.end() && std::next(it)->second < s.first) it++;
+
+  if (std::next(it) == ss.end() || s.second < std::next(it)->first) {
+    // no overlap
+    ss.insert_after(it, s);
+  } else {
+    // at least two sections are overlapping -> merge
+    it++;
+    *it = section_merge(*it, s);
+
+    while (std::next(it) != ss.end() && it->second >= std::next(it)->first) {
+      *it = section_merge(*it, *std::next(it));
+      ss.erase_after(it);
+    }
+  }
+}
+
+PCAS_TEST_CASE("[pcas::util] sections insert") {
+  sections ss;
+  sections_insert(ss, {2, 5});
+  PCAS_CHECK(ss == (sections{{2, 5}}));
+  sections_insert(ss, {11, 20});
+  PCAS_CHECK(ss == (sections{{2, 5}, {11, 20}}));
+  sections_insert(ss, {20, 21});
+  PCAS_CHECK(ss == (sections{{2, 5}, {11, 21}}));
+  sections_insert(ss, {15, 23});
+  PCAS_CHECK(ss == (sections{{2, 5}, {11, 23}}));
+  sections_insert(ss, {8, 23});
+  PCAS_CHECK(ss == (sections{{2, 5}, {8, 23}}));
+  sections_insert(ss, {7, 25});
+  PCAS_CHECK(ss == (sections{{2, 5}, {7, 25}}));
+  sections_insert(ss, {0, 7});
+  PCAS_CHECK(ss == (sections{{0, 25}}));
+  sections_insert(ss, {30, 50});
+  PCAS_CHECK(ss == (sections{{0, 25}, {30, 50}}));
+  sections_insert(ss, {30, 50});
+  PCAS_CHECK(ss == (sections{{0, 25}, {30, 50}}));
+  sections_insert(ss, {35, 45});
+  PCAS_CHECK(ss == (sections{{0, 25}, {30, 50}}));
+  sections_insert(ss, {60, 100});
+  PCAS_CHECK(ss == (sections{{0, 25}, {30, 50}, {60, 100}}));
+  sections_insert(ss, {0, 120});
+  PCAS_CHECK(ss == (sections{{0, 120}}));
+  sections_insert(ss, {200, 300});
+  PCAS_CHECK(ss == (sections{{0, 120}, {200, 300}}));
+  sections_insert(ss, {600, 700});
+  PCAS_CHECK(ss == (sections{{0, 120}, {200, 300}, {600, 700}}));
+  sections_insert(ss, {400, 500});
+  PCAS_CHECK(ss == (sections{{0, 120}, {200, 300}, {400, 500}, {600, 700}}));
+  sections_insert(ss, {300, 600});
+  PCAS_CHECK(ss == (sections{{0, 120}, {200, 700}}));
+  sections_insert(ss, {50, 600});
+  PCAS_CHECK(ss == (sections{{0, 700}}));
+}
+
+inline sections sections_inverse(const sections& ss, section s_range) {
+  sections ret;
+  auto it = ret.before_begin();
+  for (auto [b, e] : ss) {
+    if (s_range.first < b) {
+      it = ret.insert_after(it, {s_range.first, std::min(b, s_range.second)});
+    }
+    if (s_range.first < e) {
+      s_range.first = e;
+      if (s_range.first >= s_range.second) break;
+    }
+  }
+  if (s_range.first < s_range.second) {
+    ret.insert_after(it, s_range);
+  }
+  return ret;
+}
+
+PCAS_TEST_CASE("[pcas::util] sections inverse") {
+  sections ss{{2, 5}, {6, 9}, {11, 20}, {50, 100}};
+  PCAS_CHECK(sections_inverse(ss, {0, 120}) == (sections{{0, 2}, {5, 6}, {9, 11}, {20, 50}, {100, 120}}));
+  PCAS_CHECK(sections_inverse(ss, {0, 100}) == (sections{{0, 2}, {5, 6}, {9, 11}, {20, 50}}));
+  PCAS_CHECK(sections_inverse(ss, {0, 25}) == (sections{{0, 2}, {5, 6}, {9, 11}, {20, 25}}));
+  PCAS_CHECK(sections_inverse(ss, {8, 15}) == (sections{{9, 11}}));
+  PCAS_CHECK(sections_inverse(ss, {30, 40}) == (sections{{30, 40}}));
+  PCAS_CHECK(sections_inverse(ss, {50, 100}) == (sections{}));
+  PCAS_CHECK(sections_inverse(ss, {60, 90}) == (sections{}));
+  PCAS_CHECK(sections_inverse(ss, {2, 5}) == (sections{}));
+  PCAS_CHECK(sections_inverse(ss, {2, 6}) == (sections{{5, 6}}));
 }
 
 }

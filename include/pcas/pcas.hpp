@@ -2,6 +2,7 @@
 
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <mpi.h>
 
@@ -21,7 +22,6 @@ enum class dist_policy {
   block_cyclic,
 };
 
-using obj_id_t = uint64_t;
 using cache_t = cache_system<min_block_size>;
 
 struct obj_entry {
@@ -85,14 +85,51 @@ public:
   int rank() const { return rank_; }
   int nproc() const { return nproc_; }
 
+  void flush_dirty_cache() {
+    std::unordered_set<MPI_Win> wins;
+
+    cache_.for_each_block([&](cache_t::entry_t cae) {
+      if (cae && !cae->dirty_sections.empty()) {
+        obj_entry& obe = objs_[cae->obj_id];
+        void* cache_block_ptr = cache_.pm().anon_vm_addr();
+        uint64_t vm_offset = cae->vm_addr - (uint8_t*)obe.vm.addr();
+        auto [owner, _idx_b, _idx_e] =
+          block_index_info(vm_offset, obe.effective_size, nproc_);
+
+        for (auto [offset_in_block_b, offset_in_block_e] : cae->dirty_sections) {
+          MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
+                  offset_in_block_e - offset_in_block_b,
+                  MPI_UINT8_T,
+                  owner,
+                  vm_offset - owner * obe.block_size + offset_in_block_b,
+                  offset_in_block_e - offset_in_block_b,
+                  MPI_UINT8_T,
+                  obe.win);
+        }
+        cae->dirty_sections.clear();
+
+        wins.insert(obe.win);
+      }
+    });
+
+    for (auto win : wins) {
+      MPI_Win_flush_all(win);
+    }
+  }
+
   void release() {
     auto ev = logger::template record<logger_kind::Release>();
     PCAS_CHECK(checkouts_.empty());
+
+    flush_dirty_cache();
   }
 
   void acquire() {
     auto ev = logger::template record<logger_kind::Acquire>();
     PCAS_CHECK(checkouts_.empty());
+
+    flush_dirty_cache();
+
     cache_.evict_all();
   }
 
@@ -196,6 +233,8 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
                      &win);
       MPI_Win_lock_all(0, win);
 
+      obj_id_t obj_id = obj_id_count_++;
+
       std::vector<cache_t::entry_t> cache_entries;
       for (uint64_t b = 0; b < effective_size / cache_t::block_size; b++) {
         auto [owner, _idx_b, _idx_e] =
@@ -203,12 +242,12 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
         if (owner == rank_) {
           cache_entries.push_back(nullptr);
         } else {
-          cache_entries.push_back(cache_.alloc_entry());
+          cache_entries.push_back(cache_.alloc_entry(obj_id));
         }
       }
 
       obj_entry obe {
-        .owner = -1, .id = obj_id_count_++,
+        .owner = -1, .id = obj_id,
         .size = size, .effective_size = effective_size,
         .dpolicy = dpolicy, .block_size = local_size,
         .home_pm = std::move(pm), .vm = std::move(vm),
@@ -492,8 +531,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       // the data for a2 would not be fetched because it is already in the cache.
       // Thus, we allocate a `fetched` flag to each cache entry to indicate if the entire cache block
       // has been already fetched or not.
-      bool wants_fetch = Mode != access_mode::write;
-      if (cache_.needs_fetch(cae, wants_fetch)) {
+      if (Mode != access_mode::write && !cae->fetched) {
         // TODO: fix the assumption cache_t::block_size == min_block_size
         auto [owner, _idx_b, _idx_e] =
           block_index_info(b * cache_t::block_size, obe.effective_size, nproc_);
@@ -504,17 +542,23 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         PCAS_CHECK(vm_offset >= owner_ * obe.block_size);
         PCAS_CHECK(vm_offset - owner_ * obe.block_size + cache_t::block_size <= obe.block_size);
 
-        MPI_Request req;
-        MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size,
-                 cache_t::block_size,
-                 MPI_UINT8_T,
-                 owner,
-                 vm_offset - owner * obe.block_size,
-                 cache_t::block_size,
-                 MPI_UINT8_T,
-                 obe.win,
-                 &req);
-        reqs.push_back(req);
+        // fetch only nondirty sections
+        for (auto [offset_in_block_b, offset_in_block_e] :
+             sections_inverse(cae->dirty_sections, {0, cache_t::block_size})) {
+          MPI_Request req;
+          MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
+                   offset_in_block_e - offset_in_block_b,
+                   MPI_UINT8_T,
+                   owner,
+                   vm_offset - owner * obe.block_size + offset_in_block_b,
+                   offset_in_block_e - offset_in_block_b,
+                   MPI_UINT8_T,
+                   obe.win,
+                   &req);
+          reqs.push_back(req);
+        }
+
+        cae->fetched = true;
       }
     }
   }
@@ -568,20 +612,9 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
                                      che.ptr.offset() - b * cache_t::block_size : 0;
         uint64_t offset_in_block_e = (che.ptr.offset() + che.size < (b + 1) * cache_t::block_size) ?
                                      che.ptr.offset() + che.size - b * cache_t::block_size : cache_t::block_size;
-        void* cache_block_ptr = cache_.pm().anon_vm_addr();
-        auto [owner, _idx_b, _idx_e] =
-          block_index_info(b * cache_t::block_size, obe.effective_size, nproc_);
-        MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
-                offset_in_block_e - offset_in_block_b,
-                MPI_UINT8_T,
-                owner,
-                b * cache_t::block_size - owner * obe.block_size + offset_in_block_b,
-                offset_in_block_e - offset_in_block_b,
-                MPI_UINT8_T,
-                obe.win);
+        sections_insert(cae->dirty_sections, {offset_in_block_b, offset_in_block_e});
       }
     }
-    MPI_Win_flush_all(obe.win);
   }
 
   for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
@@ -594,7 +627,7 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
       if (che.mode == access_mode::write &&
           che.ptr.offset() <= b * cache_t::block_size &&
           (b + 1) * cache_t::block_size <= che.ptr.offset() + che.size) {
-        cache_.already_fetched(cae);
+        cae->fetched = true;
       }
     }
   }
