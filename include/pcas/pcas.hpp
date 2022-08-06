@@ -95,6 +95,11 @@ class pcas_if {
   bool cache_dirty_ = false;
   release_manager rm_;
 
+  std::unordered_set<MPI_Win> flushing_wins_;
+
+  uint64_t n_dirty_cache_blocks_ = 0;
+  uint64_t max_dirty_cache_blocks_;
+
 public:
   using logger = typename logger::template logger_if<logger::policy<P>>;
   using logger_kind = typename P::logger_kind_t::value;
@@ -106,35 +111,55 @@ public:
   int nproc() const { return nproc_; }
 
   void flush_dirty_cache() {
-    std::unordered_set<MPI_Win> wins;
+    if (cache_dirty_) {
+      cache_.for_each_block([&](cache_t::entry_t cae) {
+        if (cae && !cae->dirty_sections.empty() && cae->checkout_count == 0) {
+          PCAS_CHECK(!cae->flushing);
 
-    cache_.for_each_block([&](cache_t::entry_t cae) {
-      if (cae && !cae->dirty_sections.empty()) {
-        obj_entry& obe = objs_[cae->obj_id];
-        void* cache_block_ptr = cache_.pm().anon_vm_addr();
-        uint64_t vm_offset = cae->vm_addr - (uint8_t*)obe.vm.addr();
-        auto [owner, _idx_b, _idx_e] =
-          block_index_info(vm_offset, obe.effective_size, nproc_);
+          obj_entry& obe = objs_[cae->obj_id];
+          void* cache_block_ptr = cache_.pm().anon_vm_addr();
+          uint64_t vm_offset = cae->vm_addr - (uint8_t*)obe.vm.addr();
+          auto [owner, _idx_b, _idx_e] =
+            block_index_info(vm_offset, obe.effective_size, nproc_);
 
-        for (auto [offset_in_block_b, offset_in_block_e] : cae->dirty_sections) {
-          MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
-                  offset_in_block_e - offset_in_block_b,
-                  MPI_UINT8_T,
-                  owner,
-                  vm_offset - owner * obe.block_size + offset_in_block_b,
-                  offset_in_block_e - offset_in_block_b,
-                  MPI_UINT8_T,
-                  obe.win);
+          for (auto [offset_in_block_b, offset_in_block_e] : cae->dirty_sections) {
+            MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
+                    offset_in_block_e - offset_in_block_b,
+                    MPI_UINT8_T,
+                    owner,
+                    vm_offset - owner * obe.block_size + offset_in_block_b,
+                    offset_in_block_e - offset_in_block_b,
+                    MPI_UINT8_T,
+                    obe.win);
+          }
+          cae->dirty_sections.clear();
+          cae->flushing = true;
+
+          flushing_wins_.insert(obe.win);
+          n_dirty_cache_blocks_--;
         }
-        cae->dirty_sections.clear();
-
-        wins.insert(obe.win);
-      }
-    });
-
-    for (auto win : wins) {
-      MPI_Win_flush_all(win);
+      });
     }
+  }
+
+  void complete_flush() {
+    if (!flushing_wins_.empty()) {
+      for (auto win : flushing_wins_) {
+        MPI_Win_flush_all(win);
+      }
+      flushing_wins_.clear();
+
+      cache_.for_each_block([&](cache_t::entry_t cae) {
+        if (cae && cae->flushing) cae->flushing = false;
+      });
+    }
+  }
+
+  void ensure_all_cache_clean() {
+    PCAS_CHECK(checkouts_.empty());
+    flush_dirty_cache();
+    complete_flush();
+    PCAS_CHECK(n_dirty_cache_blocks_ == 0);
 
     cache_dirty_ = false;
     rm_.remote->epoch++;
@@ -142,9 +167,7 @@ public:
 
   void release() {
     auto ev = logger::template record<logger_kind::Release>();
-    PCAS_CHECK(checkouts_.empty());
-
-    flush_dirty_cache();
+    ensure_all_cache_clean();
   }
 
   void release_lazy(release_handler* handler) {
@@ -186,9 +209,7 @@ public:
 
   void acquire(release_handler handler = {.rank = 0, .epoch = 0}) {
     auto ev = logger::template record<logger_kind::Acquire>();
-    PCAS_CHECK(checkouts_.empty());
-
-    flush_dirty_cache();
+    ensure_all_cache_clean();
 
     if (handler.epoch != 0) {
       if (get_remote_epoch(handler.rank) < handler.epoch) {
@@ -210,10 +231,17 @@ public:
   }
 
   void poll() {
+    if (n_dirty_cache_blocks_ >= max_dirty_cache_blocks_) {
+      auto ev = logger::template record<logger_kind::FlushEarly>();
+      flush_dirty_cache();
+    }
+
     if (rm_.remote->request > rm_.remote->epoch) {
       auto ev = logger::template record<logger_kind::ReleaseLazy>();
       PCAS_CHECK(rm_.remote->request == rm_.remote->epoch + 1);
-      flush_dirty_cache();
+
+      ensure_all_cache_clean();
+
       PCAS_CHECK(rm_.remote->request == rm_.remote->epoch);
     }
   }
@@ -280,6 +308,8 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm) : cache_(cache_si
 
   rm_.remote->request = 1;
   rm_.remote->epoch = 1;
+
+  max_dirty_cache_blocks_ = get_env("PCAS_MAX_DIRTY_CACHE_BLOCKS", 4, rank_);
 
   barrier();
 }
@@ -615,6 +645,13 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       if (!hit) {
         filled_cache_entries.push_back(std::make_tuple(prev_cae, cae, vm_offset));
       }
+      if (cae->flushing && Mode != access_mode::read) {
+        // MPI_Put has been already started on this cache block.
+        // As overlapping MPI_Put calls for the same location will cause undefined behaviour,
+        // we need to insert MPI_Win_flush between overlapping MPI_Put calls here.
+        auto ev2 = logger::template record<logger_kind::FlushConflicted>();
+        complete_flush();
+      }
       // Suppose that a cache block is represented as [a1, a2].
       // If a1 is checked out with write-only access mode, then [a1, a2] is allocated a cache entry,
       // but fetch for a1 and a2 is skipped.  Later, if a2 is checked out with read access mode,
@@ -698,6 +735,7 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
     for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
       auto cae = obe.cache_entries[b];
       if (cae) {
+        n_dirty_cache_blocks_ += cae->dirty_sections.empty();
         uint64_t offset_in_block_b = (che.ptr.offset() > b * cache_t::block_size) ?
                                      che.ptr.offset() - b * cache_t::block_size : 0;
         uint64_t offset_in_block_e = (che.ptr.offset() + che.size < (b + 1) * cache_t::block_size) ?

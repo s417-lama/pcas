@@ -25,6 +25,7 @@ public:
   struct entry {
     bool        cached         = false;
     bool        fetched        = false;
+    bool        flushing       = false;
     int         checkout_count = 0;
     block_num_t block_num      = std::numeric_limits<block_num_t>::max();
     uint8_t*    vm_addr        = nullptr;
@@ -44,16 +45,13 @@ private:
   std::vector<entry*> cache_map_;
 
   bool is_evictable(entry_t e) {
-    return e && e->cached && e->checkout_count == 0 && e->dirty_sections.empty();
+    return e && e->cached && e->checkout_count == 0 && !e->flushing && e->dirty_sections.empty();
   }
 
   void evict(block_num_t b) {
     PCAS_CHECK(b < nblocks_);
     entry* e = cache_map_[b];
-    PCAS_CHECK(e);
-    PCAS_CHECK(e->cached);
-    PCAS_CHECK(e->checkout_count == 0);
-    PCAS_CHECK(e->dirty_sections.empty());
+    PCAS_CHECK(is_evictable(e));
     e->cached = false;
     e->fetched = false;
   }

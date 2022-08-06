@@ -16,6 +16,9 @@ public:
     ReleaseLazy,
     Acquire,
 
+    FlushEarly,
+    FlushConflicted,
+
     _NKinds,
   };
 
@@ -67,15 +70,18 @@ public:
 
   constexpr const char* str() const {
     switch (val_) {
-      case value::Init:          return "";
+      case value::Init:            return "";
 
-      case value::Checkout:      return "checkout";
-      case value::Checkin:       return "checkin";
-      case value::Release:       return "release";
-      case value::ReleaseLazy:   return "release_lazy";
-      case value::Acquire:       return "acquire";
+      case value::Checkout:        return "checkout";
+      case value::Checkin:         return "checkin";
+      case value::Release:         return "release";
+      case value::ReleaseLazy:     return "release_lazy";
+      case value::Acquire:         return "acquire";
 
-      default:                   return "other";
+      case value::FlushEarly:      return "flush_early";
+      case value::FlushConflicted: return "flush_conflicted";
+
+      default:                     return "other";
     }
   }
 
