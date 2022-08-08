@@ -31,7 +31,7 @@ struct obj_entry {
   uint64_t                      effective_size;
   dist_policy                   dpolicy;
   uint64_t                      block_size;
-  physical_mem                  home_pm;
+  std::vector<physical_mem>     pms;
   virtual_mem                   vm;
   std::vector<cache_t::entry_t> cache_entries;
   MPI_Win                       win;
@@ -81,11 +81,22 @@ using pcas = pcas_if<policy_default>;
 
 template <typename P>
 class pcas_if {
-  int      rank_;
-  int      nproc_;
-  MPI_Comm comm_;
+  int      global_rank_  = -1;
+  int      global_nproc_ = -1;
+  MPI_Comm global_comm_;
 
-  obj_id_t obj_id_count_ = 0; // TODO: better management of used IDs
+  int      intra_rank_  = -1;
+  int      intra_nproc_ = -1;
+  MPI_Comm intra_comm_;
+
+  int      inter_rank_  = -1;
+  int      inter_nproc_ = -1;
+  MPI_Comm inter_comm_;
+
+  std::vector<std::pair<int, int>> process_map_; // pair: (intra, inter rank)
+  std::vector<int> intra2global_rank_;
+
+  obj_id_t obj_id_count_ = 1; // TODO: better management of used IDs
   std::unordered_map<obj_id_t, obj_entry> objs_;
 
   std::unordered_map<void*, checkout_entry> checkouts_;
@@ -100,6 +111,49 @@ class pcas_if {
   uint64_t n_dirty_cache_blocks_ = 0;
   uint64_t max_dirty_cache_blocks_;
 
+  std::vector<std::pair<int, int>> init_process_map(MPI_Comm comm) {
+    int mpi_initialized = 0;
+    MPI_Initialized(&mpi_initialized);
+    if (!mpi_initialized) {
+      die("MPI_Init() must be called before initializing PCAS.");
+    }
+
+    global_comm_ = comm;
+    MPI_Comm_rank(global_comm_, &global_rank_);
+    MPI_Comm_size(global_comm_, &global_nproc_);
+
+    MPI_Comm_split_type(global_comm_, MPI_COMM_TYPE_SHARED, global_rank_, MPI_INFO_NULL, &intra_comm_);
+    MPI_Comm_rank(intra_comm_, &intra_rank_);
+    MPI_Comm_size(intra_comm_, &intra_nproc_);
+
+    MPI_Comm_split(global_comm_, intra_rank_, global_rank_, &inter_comm_);
+    MPI_Comm_rank(inter_comm_, &inter_rank_);
+    MPI_Comm_size(inter_comm_, &inter_nproc_);
+
+    std::pair<int, int> myranks {intra_rank_, inter_rank_};
+    std::pair<int, int>* buf = new std::pair<int, int>[global_nproc_];
+    MPI_Allgather(&myranks,
+                  sizeof(std::pair<int, int>),
+                  MPI_BYTE,
+                  buf,
+                  sizeof(std::pair<int, int>),
+                  MPI_BYTE,
+                  global_comm_);
+
+    return std::vector(buf, buf + global_nproc_);
+  }
+
+  std::vector<int> init_intra2global_rank() {
+    std::vector<int> ret;
+    for (int i = 0; i < global_nproc_; i++) {
+      if (process_map_[i].second == inter_rank_) {
+        ret.push_back(i);
+      }
+    }
+    PCAS_CHECK(ret.size() == (size_t)intra_nproc_);
+    return ret;
+  }
+
 public:
   using logger = typename logger::template logger_if<logger::policy<P>>;
   using logger_kind = typename P::logger_kind_t::value;
@@ -107,8 +161,8 @@ public:
   pcas_if(uint64_t cache_size = 1024 * min_block_size, MPI_Comm comm = MPI_COMM_WORLD);
   ~pcas_if();
 
-  int rank() const { return rank_; }
-  int nproc() const { return nproc_; }
+  int rank() const { return global_rank_; }
+  int nproc() const { return global_nproc_; }
 
   void flush_dirty_cache() {
     if (cache_dirty_) {
@@ -120,7 +174,7 @@ public:
           void* cache_block_ptr = cache_.pm().anon_vm_addr();
           uint64_t vm_offset = cae->vm_addr - (uint8_t*)obe.vm.addr();
           auto [owner, _idx_b, _idx_e] =
-            block_index_info(vm_offset, obe.effective_size, nproc_);
+            block_index_info(vm_offset, obe.effective_size, global_nproc_);
 
           for (auto [offset_in_block_b, offset_in_block_e] : cae->dirty_sections) {
             MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
@@ -174,7 +228,7 @@ public:
     PCAS_CHECK(checkouts_.empty());
 
     epoch_t next_epoch = cache_dirty_ ? rm_.remote->epoch + 1 : 0; // 0 means clean
-    *handler = {.rank = rank_, .epoch = next_epoch};
+    *handler = {.rank = global_rank_, .epoch = next_epoch};
   }
 
   epoch_t get_remote_epoch(int target_rank) {
@@ -226,7 +280,7 @@ public:
 
   void barrier() {
     release();
-    MPI_Barrier(comm_);
+    MPI_Barrier(global_comm_);
     acquire();
   }
 
@@ -278,30 +332,22 @@ public:
   template <typename T>
   void* get_physical_mem(global_ptr<T> ptr) {
     obj_entry& obe = objs_[ptr.id()];
-    return obe.home_pm.anon_vm_addr();
+    return obe.pms[intra_rank_].anon_vm_addr();
   }
 
 };
 
 template <typename P>
-inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm) : cache_(cache_size) {
-  int mpi_initialized = 0;
-  MPI_Initialized(&mpi_initialized);
-  if (!mpi_initialized) {
-    die("MPI_Init() must be called before initializing PCAS.");
-  }
-
-  comm_ = comm;
-
-  MPI_Comm_rank(comm_, &rank_);
-  MPI_Comm_size(comm_, &nproc_);
-
-  logger::init(rank_, nproc_);
+inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
+  : process_map_(init_process_map(comm)),
+    intra2global_rank_(init_intra2global_rank()),
+    cache_(cache_size, intra_rank_) {
+  logger::init(global_rank_, global_nproc_);
 
   MPI_Win_allocate(sizeof(release_remote_region),
                    1,
                    MPI_INFO_NULL,
-                   comm_,
+                   global_comm_,
                    &rm_.remote,
                    &rm_.win);
   MPI_Win_lock_all(0, rm_.win);
@@ -309,13 +355,17 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm) : cache_(cache_si
   rm_.remote->request = 1;
   rm_.remote->epoch = 1;
 
-  max_dirty_cache_blocks_ = get_env("PCAS_MAX_DIRTY_CACHE_BLOCKS", 4, rank_);
+  max_dirty_cache_blocks_ = get_env("PCAS_MAX_DIRTY_CACHE_BLOCKS", 4, global_rank_);
 
   barrier();
 }
 
 template <typename P>
 inline pcas_if<P>::~pcas_if() {
+  // TODO: calling MPI_Comm_free caused segfault on wisteria-o
+  /* MPI_Comm_free(&intra_comm_); */
+  /* MPI_Comm_free(&inter_comm_); */
+
   /* barrier(); */
 }
 
@@ -334,32 +384,44 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
     die("nelems cannot be 0");
   }
 
+  obj_id_t obj_id = obj_id_count_++;
+
   switch (dpolicy) {
     case dist_policy::block: {
       uint64_t size = nelems * sizeof(T);
-      uint64_t local_size = local_block_size(size, nproc_);
-      uint64_t effective_size = local_size * nproc_;
+      uint64_t local_size = local_block_size(size, global_nproc_);
+      uint64_t effective_size = local_size * global_nproc_;
 
       virtual_mem vm(nullptr, effective_size);
-      physical_mem pm(local_size);
-      void* vm_local_addr = vm.map_physical_mem(rank_ * local_size, 0, local_size, pm);
+      physical_mem pm_local(local_size, obj_id, intra_rank_, true, true);
+      void* vm_local_addr = vm.map_physical_mem(global_rank_ * local_size, 0, local_size, pm_local);
 
       MPI_Win win = MPI_WIN_NULL;
       MPI_Win_create(vm_local_addr,
                      local_size,
                      1,
                      MPI_INFO_NULL,
-                     comm_,
+                     global_comm_,
                      &win);
       MPI_Win_lock_all(0, win);
 
-      obj_id_t obj_id = obj_id_count_++;
+      std::vector<physical_mem> pms;
+      for (int i = 0; i < intra_nproc_; i++) {
+        if (i == intra_rank_) {
+          pms.push_back(std::move(pm_local));
+        } else {
+          int target_rank = intra2global_rank_[i];
+          physical_mem pm(local_size, obj_id, i, false, false);
+          vm.map_physical_mem(target_rank * local_size, 0, local_size, pm);
+          pms.push_back(std::move(pm));
+        }
+      }
 
       std::vector<cache_t::entry_t> cache_entries;
       for (uint64_t b = 0; b < effective_size / cache_t::block_size; b++) {
         auto [owner, _idx_b, _idx_e] =
-          block_index_info(b * cache_t::block_size, effective_size, nproc_);
-        if (owner == rank_) {
+          block_index_info(b * cache_t::block_size, effective_size, global_nproc_);
+        if (process_map_[owner].second == inter_rank_) {
           cache_entries.push_back(nullptr);
         } else {
           cache_entries.push_back(cache_.alloc_entry(obj_id));
@@ -370,7 +432,7 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
         .owner = -1, .id = obj_id,
         .size = size, .effective_size = effective_size,
         .dpolicy = dpolicy, .block_size = local_size,
-        .home_pm = std::move(pm), .vm = std::move(vm),
+        .pms = std::move(pms), .vm = std::move(vm),
         .cache_entries = std::move(cache_entries), .win = win,
       };
 
@@ -445,7 +507,7 @@ inline void pcas_if<P>::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func 
   PCAS_CHECK(offset_max <= obe.size);
 
   while (offset < offset_max) {
-    auto [owner, idx_b, idx_e] = block_index_info(offset, obe.effective_size, nproc_);
+    auto [owner, idx_b, idx_e] = block_index_info(offset, obe.effective_size, global_nproc_);
     uint64_t ib = std::max(idx_b, offset_min);
     uint64_t ie = std::min(idx_e, offset_max);
 
@@ -661,7 +723,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       if (Mode != access_mode::write && !cae->fetched) {
         // TODO: fix the assumption cache_t::block_size == min_block_size
         auto [owner, _idx_b, _idx_e] =
-          block_index_info(b * cache_t::block_size, obe.effective_size, nproc_);
+          block_index_info(b * cache_t::block_size, obe.effective_size, global_nproc_);
 
         void* cache_block_ptr = cache_.pm().anon_vm_addr();
 

@@ -93,10 +93,10 @@ private:
   }
 
 public:
-  cache_system(uint64_t size) : size_(size) {
+  cache_system(uint64_t size, int intra_rank) : size_(size) {
     PCAS_CHECK(size % BlockSize == 0);
     nblocks_ = size / BlockSize;
-    pm_ = physical_mem(size);
+    pm_ = physical_mem(size, 0, intra_rank, true, true);
     cache_map_ = std::vector<entry*>(nblocks_, nullptr);
   }
 
@@ -178,7 +178,7 @@ public:
 PCAS_TEST_CASE("[pcas::cache] testing cache system") {
   int nblk = 100;
   using cache_t = cache_system<min_block_size>;
-  cache_t cs(nblk * min_block_size);
+  cache_t cs(nblk * min_block_size, -1);
 
   std::vector<cache_t::entry_t> cache_entries;
   int nent = 1000;

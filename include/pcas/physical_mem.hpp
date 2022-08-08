@@ -10,66 +10,60 @@
 
 #include "pcas/util.hpp"
 
-#define USE_MEMFD_CREATE ((__GLIBC__ > 2) || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 27))
-
-#if !USE_MEMFD_CREATE
-// for getting MPI rank
-#include <mpi.h>
-#endif
-
 namespace pcas {
 
 class physical_mem {
   int      fd_           = -1;
   uint64_t size_         = 0;
   void*    anon_vm_addr_ = nullptr;
-#if !USE_MEMFD_CREATE
+  bool     own_;
+  bool     map_anon_;
   char     shm_name_[256];
-#endif
 
 public:
   physical_mem() {}
-  physical_mem(uint64_t size) : size_(size) {
-#if USE_MEMFD_CREATE
-    fd_ = memfd_create("PCAS", 0);
-    if (fd_ == -1) {
-      perror("memfd_create");
-      die("[pcas::physical_mem] memfd_create() failed");
+  physical_mem(uint64_t size, obj_id_t id, int intra_rank, bool own, bool map_anon)
+    : size_(size), own_(own), map_anon_(map_anon) {
+    if (intra_rank == -1) {
+      intra_rank = getpid(); // for testing
     }
-#else
-    // FIXME: rank retrieval
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    snprintf(shm_name_, 255, "/pcas_%ld_%d", id, intra_rank);
 
-    static int counter = 0;
-    snprintf(shm_name_, 255, "/pcas_%d_%d", rank, counter++);
-    fd_ = shm_open(shm_name_, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    int oflag = O_RDWR;
+    if (own) oflag |= O_CREAT | O_TRUNC;
+
+    fd_ = shm_open(shm_name_, oflag, S_IRUSR | S_IWUSR);
     if (fd_ == -1) {
       perror("shm_open");
       die("[pcas::physical_mem] shm_open() failed");
     }
-#endif
 
-    if (ftruncate(fd_, size) == -1) {
+    if (own && ftruncate(fd_, size) == -1) {
       perror("ftruncate");
       die("[pcas::physical_mem] ftruncate(%d, %lu) failed", fd_, size);
     }
 
-    anon_vm_addr_ = map(nullptr, 0, size);
+    if (map_anon) {
+      anon_vm_addr_ = map(nullptr, 0, size);
+    }
   }
 
   physical_mem(const physical_mem&) = delete;
 
-  physical_mem(physical_mem&& pm) :
-    fd_(pm.fd_), size_(pm.size_), anon_vm_addr_(pm.anon_vm_addr_) { pm.fd_ = -1; };
+  physical_mem(physical_mem&& pm)
+    : fd_(pm.fd_), size_(pm.size_), anon_vm_addr_(pm.anon_vm_addr_), own_(pm.own_), map_anon_(pm.map_anon_) {
+    pm.fd_ = -1;
+  }
 
   ~physical_mem() {
     if (fd_ != -1) {
-      unmap(anon_vm_addr_, size_);
+      if (map_anon_) {
+        unmap(anon_vm_addr_, size_);
+      }
       close(fd_);
-#if !USE_MEMFD_CREATE
-      shm_unlink(shm_name_);
-#endif
+      if (own_) {
+        shm_unlink(shm_name_);
+      }
     }
   }
 
@@ -80,6 +74,8 @@ public:
     fd_ = pm.fd_;
     size_ = pm.size_;
     anon_vm_addr_ = pm.anon_vm_addr_;
+    own_ = pm.own_;
+    map_anon_ = pm.map_anon_;
     pm.fd_ = -1;
     return *this;
   }
@@ -110,7 +106,7 @@ public:
 PCAS_TEST_CASE("[pcas::physical_mem] map two virtual addresses to the same physical address") {
   uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
 
-  physical_mem pm(16 * pagesize);
+  physical_mem pm(16 * pagesize, 0, -1, true, true);
   int* b1 = nullptr;
   int* b2 = nullptr;
 
