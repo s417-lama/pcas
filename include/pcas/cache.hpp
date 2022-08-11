@@ -31,6 +31,7 @@ public:
     uint8_t*    vm_addr        = nullptr;
     obj_id_t    obj_id;
     sections    dirty_sections;
+    typename std::list<entry*>::iterator lru_it;
   };
 
   using entry_t = entry*;
@@ -39,16 +40,17 @@ public:
   static constexpr uint64_t block_size = BlockSize;
 
 private:
-  physical_mem        pm_;
-  uint64_t            size_;
-  block_num_t         nblocks_;
-  std::vector<entry*> cache_map_;
+  physical_mem         pm_;
+  uint64_t             size_;
+  block_num_t          nblocks_;
+  std::vector<entry_t> cache_map_;
+  std::list<entry_t>   lru_;
 
   bool is_evictable(entry_t e) {
     return e && e->cached && e->checkout_count == 0 && !e->flushing && e->dirty_sections.empty();
   }
 
-  void evict(block_num_t b) {
+  void invalidate(block_num_t b) {
     PCAS_CHECK(b < nblocks_);
     entry* e = cache_map_[b];
     PCAS_CHECK(is_evictable(e));
@@ -57,29 +59,14 @@ private:
   }
 
   block_num_t evict_one() {
-    // TODO: implement more smart eviction (e.g., LRU)
-    // randomly select a victim first
-    uint64_t max_trial = nblocks_ * 10;
-    static std::mt19937 engine(0);
-    std::uniform_int_distribution<> dist(0, nblocks_ - 1);
-    for (uint64_t i = 0; i < max_trial; i++) {
-      block_num_t b = dist(engine);
-      entry* e = cache_map_[b];
-      if (is_evictable(e)) {
-        evict(b);
-        return b;
-      }
+    if (lru_.empty()) {
+      die("cache is exhausted (too many objects are being checked out)");
     }
-    // check sequentially
-    for (block_num_t b = 0; b < nblocks_; b++) {
-      entry* e = cache_map_[b];
-      if (is_evictable(e)) {
-        evict(b);
-        return b;
-      }
-    }
-    die("cache is exhausted (too many objects are being checked out)");
-    return 0;
+    entry_t e = lru_.back();
+    lru_.pop_back();
+    e->lru_it = lru_.end();
+    invalidate(e->block_num);
+    return e->block_num;
   }
 
   block_num_t get_empty_block() {
@@ -111,6 +98,7 @@ public:
   entry_t alloc_entry(obj_id_t obj_id) {
     entry* e = new entry();
     e->obj_id = obj_id;
+    e->lru_it = lru_.end();
     return e;
   }
 
@@ -122,6 +110,9 @@ public:
       PCAS_CHECK(e->checkout_count == 0);
       virtual_mem::unmap(e->vm_addr, BlockSize);
       cache_map_[b] = nullptr;
+    }
+    if (e->lru_it != lru_.end()) {
+      lru_.erase(e->lru_it);
     }
     delete e;
   }
@@ -137,6 +128,10 @@ public:
       // the entry has been invalidated but remains in the cache
       PCAS_CHECK(e->dirty_sections.empty());
       e->cached = true;
+      if (e->lru_it != lru_.end()) {
+        lru_.erase(e->lru_it);
+        e->lru_it = lru_.end();
+      }
       return std::make_tuple(false, nullptr);
     } else {
       // the entry needs a new cache block
@@ -154,13 +149,21 @@ public:
     PCAS_CHECK(e->checkout_count > 0);
     PCAS_CHECK(e->cached);
     e->checkout_count--;
+    if (is_evictable(e)) {
+      if (e->lru_it != lru_.end()) {
+        lru_.erase(e->lru_it);
+        e->lru_it = lru_.end();
+      }
+      lru_.push_front(e);
+      e->lru_it = lru_.begin();
+    }
   }
 
-  void evict_all() {
+  void invalidate_all() {
     for (block_num_t b = 0; b < nblocks_; b++) {
       entry* e = cache_map_[b];
       if (e && e->cached) {
-        evict(b);
+        invalidate(b);
       }
     }
   }
@@ -193,7 +196,7 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
       cs.checkin(cache_entries[i]);
     }
 
-    cs.evict_all();
+    cs.invalidate_all();
 
     for (int i = 0; i < nblk; i++) {
       auto [hit, _prev_e] = cs.checkout(cache_entries[i]);
@@ -236,7 +239,7 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
     PCAS_CHECK(cache_entries[0]->checkout_count == 0);
   }
 
-  cs.evict_all();
+  cs.invalidate_all();
 
   for (auto e : cache_entries) {
     cs.free_entry(e);

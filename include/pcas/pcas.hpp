@@ -275,7 +275,7 @@ public:
       }
     }
 
-    cache_.evict_all();
+    cache_.invalidate_all();
   }
 
   void barrier() {
