@@ -111,6 +111,8 @@ class pcas_if {
   uint64_t n_dirty_cache_blocks_ = 0;
   uint64_t max_dirty_cache_blocks_;
 
+  int enable_shared_memory_;
+
   std::vector<std::pair<int, int>> init_process_map(MPI_Comm comm) {
     int mpi_initialized = 0;
     MPI_Initialized(&mpi_initialized);
@@ -332,7 +334,8 @@ public:
   template <typename T>
   void* get_physical_mem(global_ptr<T> ptr) {
     obj_entry& obe = objs_[ptr.id()];
-    return obe.pms[intra_rank_].anon_vm_addr();
+    size_t idx = enable_shared_memory_ ? intra_rank_ : 0;
+    return obe.pms[idx].anon_vm_addr();
   }
 
 };
@@ -356,6 +359,7 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
   rm_.remote->epoch = 1;
 
   max_dirty_cache_blocks_ = get_env("PCAS_MAX_DIRTY_CACHE_BLOCKS", 4, global_rank_);
+  enable_shared_memory_ = get_env("PCAS_ENABLE_SHARED_MEMORY", 1, global_rank_);
 
   barrier();
 }
@@ -409,7 +413,7 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
       for (int i = 0; i < intra_nproc_; i++) {
         if (i == intra_rank_) {
           pms.push_back(std::move(pm_local));
-        } else {
+        } else if (enable_shared_memory_) {
           int target_rank = intra2global_rank_[i];
           physical_mem pm(local_size, obj_id, i, false, false);
           vm.map_physical_mem(target_rank * local_size, 0, local_size, pm);
@@ -421,7 +425,8 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
       for (uint64_t b = 0; b < effective_size / cache_t::block_size; b++) {
         auto [owner, _idx_b, _idx_e] =
           block_index_info(b * cache_t::block_size, effective_size, global_nproc_);
-        if (process_map_[owner].second == inter_rank_) {
+        if (owner == global_rank_ ||
+            (enable_shared_memory_ && process_map_[owner].second == inter_rank_)) {
           cache_entries.push_back(nullptr);
         } else {
           cache_entries.push_back(cache_.alloc_entry(obj_id));
