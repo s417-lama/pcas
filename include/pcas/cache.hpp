@@ -9,6 +9,8 @@
 #include <random>
 #include <limits>
 
+#include <mpi.h>
+
 #include "pcas/util.hpp"
 #include "pcas/physical_mem.hpp"
 #include "pcas/virtual_mem.hpp"
@@ -22,13 +24,22 @@ class cache_system {
 public:
   using block_num_t = uint64_t;
 
+  enum class state_t {
+    evicted,  // this entry is not in the cache
+    invalid,  // this entry is in the cache, but the data is not up-to-date
+    fetching, // communication (read) is in-progress
+    valid,    // the data is up-to-date
+  };
+
   struct entry {
-    bool        cached         = false;
-    bool        fetched        = false;
+    state_t     state          = state_t::evicted;
+    bool        partial        = false; // If true, only a part of the block is vaild (for write-only update)
     bool        flushing       = false;
     int         checkout_count = 0;
     block_num_t block_num      = std::numeric_limits<block_num_t>::max();
     uint8_t*    vm_addr        = nullptr;
+    entry*      prev_entry     = nullptr;
+    MPI_Request req            = MPI_REQUEST_NULL;
     obj_id_t    obj_id;
     sections    dirty_sections;
     typename std::list<entry*>::iterator lru_it;
@@ -44,18 +55,18 @@ private:
   uint64_t             size_;
   block_num_t          nblocks_;
   std::vector<entry_t> cache_map_;
-  std::list<entry_t>   lru_;
+  std::list<entry_t>   lru_; // contains only evictable entries
 
   bool is_evictable(entry_t e) {
-    return e && e->cached && e->checkout_count == 0 && !e->flushing && e->dirty_sections.empty();
+    return e && e->checkout_count == 0 && !e->flushing && e->dirty_sections.empty();
   }
 
   void invalidate(block_num_t b) {
     PCAS_CHECK(b < nblocks_);
     entry* e = cache_map_[b];
     PCAS_CHECK(is_evictable(e));
-    e->cached = false;
-    e->fetched = false;
+    e->state = state_t::invalid;
+    e->partial = false;
   }
 
   block_num_t evict_one() {
@@ -66,13 +77,23 @@ private:
     lru_.pop_back();
     e->lru_it = lru_.end();
     invalidate(e->block_num);
+    e->state = state_t::evicted;
     return e->block_num;
   }
 
   block_num_t get_empty_block() {
+    // FIXME: inefficient; merge with LRU data structure
     for (block_num_t b = 0; b < nblocks_; b++) {
       entry_t e = cache_map_[b];
-      if (!e || !e->cached) {
+      if (!e) {
+        return b;
+      }
+      if (e->state == state_t::invalid) {
+        e->state = state_t::evicted;
+        if (e->lru_it != lru_.end()) {
+          lru_.erase(e->lru_it);
+          e->lru_it = lru_.end();
+        }
         return b;
       }
     }
@@ -117,43 +138,48 @@ public:
     delete e;
   }
 
-  // return (hit, prev_entry)
-  std::tuple<bool, entry_t> checkout(entry_t e) {
+  bool checkout(entry_t e) {
     PCAS_CHECK(e);
     e->checkout_count++;
-    if (e->cached) {
-      // cache hit
-      return std::make_tuple(true, nullptr);
-    } else if (e->block_num < nblocks_ && cache_map_[e->block_num] == e) {
-      // the entry has been invalidated but remains in the cache
-      PCAS_CHECK(e->dirty_sections.empty());
-      e->cached = true;
-      if (e->lru_it != lru_.end()) {
-        lru_.erase(e->lru_it);
-        e->lru_it = lru_.end();
+    switch (e->state) {
+      case state_t::evicted: {
+        // the entry needs a new cache block
+        block_num_t b = get_empty_block();
+        e->block_num = b;
+        e->prev_entry = cache_map_[b];
+        cache_map_[b] = e;
+        PCAS_CHECK(e->lru_it == lru_.end());
+        return false;
       }
-      return std::make_tuple(false, nullptr);
-    } else {
-      // the entry needs a new cache block
-      block_num_t b = get_empty_block();
-      e->block_num = b;
-      e->cached = true;
-      entry_t prev_e = cache_map_[b];
-      cache_map_[b] = e;
-      return std::make_tuple(false, prev_e);
+      case state_t::invalid: {
+        // the entry has been invalidated but remains in the cache
+        PCAS_CHECK(e->block_num < nblocks_);
+        PCAS_CHECK(cache_map_[e->block_num] == e);
+        PCAS_CHECK(e->dirty_sections.empty());
+        if (e->lru_it != lru_.end()) {
+          lru_.erase(e->lru_it);
+          e->lru_it = lru_.end();
+        }
+        return false;
+      }
+      default: {
+        // cache hit
+        if (e->lru_it != lru_.end()) {
+          lru_.erase(e->lru_it);
+          e->lru_it = lru_.end();
+        }
+        return true;
+      }
     }
   }
 
   void checkin(entry_t e) {
     PCAS_CHECK(e);
     PCAS_CHECK(e->checkout_count > 0);
-    PCAS_CHECK(e->cached);
+    PCAS_CHECK(e->state == state_t::valid);
     e->checkout_count--;
     if (is_evictable(e)) {
-      if (e->lru_it != lru_.end()) {
-        lru_.erase(e->lru_it);
-        e->lru_it = lru_.end();
-      }
+      PCAS_CHECK(e->lru_it == lru_.end());
       lru_.push_front(e);
       e->lru_it = lru_.begin();
     }
@@ -162,8 +188,13 @@ public:
   void invalidate_all() {
     for (block_num_t b = 0; b < nblocks_; b++) {
       entry* e = cache_map_[b];
-      if (e && e->cached) {
-        invalidate(b);
+      if (e) {
+        if (e->state == state_t::valid) {
+          invalidate(b);
+        } else if (e->state == state_t::fetching) {
+          // FIXME: cancel communication?
+          invalidate(b);
+        }
       }
     }
   }
@@ -191,7 +222,8 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
 
   PCAS_SUBCASE("basic test") {
     for (int i = 0; i < nent; i++) {
-      auto [hit, _prev_e] = cs.checkout(cache_entries[i]);
+      auto hit = cs.checkout(cache_entries[i]);
+      cache_entries[i]->state = cache_t::state_t::valid;
       PCAS_CHECK_MESSAGE(!hit, "should not be cached at the beginning");
       cs.checkin(cache_entries[i]);
     }
@@ -199,14 +231,16 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
     cs.invalidate_all();
 
     for (int i = 0; i < nblk; i++) {
-      auto [hit, _prev_e] = cs.checkout(cache_entries[i]);
+      auto hit = cs.checkout(cache_entries[i]);
+      cache_entries[i]->state = cache_t::state_t::valid;
       PCAS_CHECK_MESSAGE(!hit, "should not be cached after evicting all cache");
       cs.checkin(cache_entries[i]);
     }
 
     for (int it = 0; it < 3; it++) {
       for (int i = 0; i < nblk; i++) {
-        auto [hit, _prev_e] = cs.checkout(cache_entries[i]);
+        auto hit = cs.checkout(cache_entries[i]);
+        cache_entries[i]->state = cache_t::state_t::valid;
         PCAS_CHECK_MESSAGE(hit, "should be cached when the working set fits into the cache");
         cs.checkin(cache_entries[i]);
       }
@@ -215,10 +249,12 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
 
   PCAS_SUBCASE("cache entry being checking out should not be evicted") {
     cs.checkout(cache_entries[0]);
+    cache_entries[0]->state = cache_t::state_t::valid;
 
     for (int it = 0; it < 3; it++) {
       for (int i = 1; i < nent; i++) {
         cs.checkout(cache_entries[i]);
+        cache_entries[i]->state = cache_t::state_t::valid;
         PCAS_CHECK(cache_entries[i]->block_num != cache_entries[0]->block_num);
         cs.checkin(cache_entries[i]);
       }
@@ -229,8 +265,10 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
 
   PCAS_SUBCASE("a block can be checkout out for many times") {
     cs.checkout(cache_entries[0]);
+    cache_entries[0]->state = cache_t::state_t::valid;
     PCAS_CHECK(cache_entries[0]->checkout_count == 1);
     cs.checkout(cache_entries[0]);
+    cache_entries[0]->state = cache_t::state_t::valid;
     PCAS_CHECK(cache_entries[0]->checkout_count == 2);
 
     cs.checkin(cache_entries[0]);

@@ -693,8 +693,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   obj_entry& obe = objs_[ptr.id()];
 
   // tuple(prev_entry, new_entry, block_num)
-  std::vector<std::tuple<cache_t::entry_t, cache_t::entry_t, cache_t::block_num_t>> filled_cache_entries;
-  std::vector<MPI_Request> reqs;
+  std::vector<cache_t::entry_t> remapped_entries;
 
   uint64_t cache_entry_b = ptr.offset() / cache_t::block_size;
   uint64_t cache_entry_e =
@@ -703,10 +702,13 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     auto cae = obe.cache_entries[b];
     if (cae) {
       uint64_t vm_offset = b * cache_t::block_size;
-      auto [hit, prev_cae] = cache_.checkout(cae);
+      auto hit = cache_.checkout(cae);
+
       if (!hit) {
-        filled_cache_entries.push_back(std::make_tuple(prev_cae, cae, vm_offset));
+        cae->vm_addr = (uint8_t*)obe.vm.addr() + vm_offset;
+        remapped_entries.push_back(cae);
       }
+
       if (cae->flushing && Mode != access_mode::read) {
         // MPI_Put has been already started on this cache block.
         // As overlapping MPI_Put calls for the same location will cause undefined behaviour,
@@ -714,13 +716,25 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         auto ev2 = logger::template record<logger_kind::FlushConflicted>();
         complete_flush();
       }
+
+      // If only a part of the block is written (partial=true), we need to fetch the block
+      // when this block is checked out again with read access mode.
+      if (Mode == access_mode::write &&
+          (cae->state == cache_t::state_t::evicted || cae->state == cache_t::state_t::invalid) &&
+          !(ptr.offset() <= b * cache_t::block_size &&
+            (b + 1) * cache_t::block_size <= ptr.offset() + nelems * sizeof(T))) {
+        cae->partial = true;
+      }
+
       // Suppose that a cache block is represented as [a1, a2].
       // If a1 is checked out with write-only access mode, then [a1, a2] is allocated a cache entry,
       // but fetch for a1 and a2 is skipped.  Later, if a2 is checked out with read access mode,
       // the data for a2 would not be fetched because it is already in the cache.
-      // Thus, we allocate a `fetched` flag to each cache entry to indicate if the entire cache block
+      // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
       // has been already fetched or not.
-      if (Mode != access_mode::write && !cae->fetched) {
+      if (Mode != access_mode::write &&
+          (cae->state == cache_t::state_t::evicted || cae->state == cache_t::state_t::invalid ||
+           cae->partial)) {
         // TODO: fix the assumption cache_t::block_size == min_block_size
         auto [owner, _idx_b, _idx_e] =
           block_index_info(b * cache_t::block_size, obe.effective_size, global_nproc_);
@@ -734,7 +748,6 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         // fetch only nondirty sections
         for (auto [offset_in_block_b, offset_in_block_e] :
              sections_inverse(cae->dirty_sections, {0, cache_t::block_size})) {
-          MPI_Request req;
           MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
                    offset_in_block_e - offset_in_block_b,
                    MPI_UINT8_T,
@@ -743,24 +756,40 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
                    offset_in_block_e - offset_in_block_b,
                    MPI_UINT8_T,
                    obe.win,
-                   &req);
-          reqs.push_back(req);
+                   &cae->req);
+          cae->state = cache_t::state_t::fetching;
         }
+      }
 
-        cae->fetched = true;
+      // cache with write-only mode is always valid
+      if (Mode == access_mode::write) {
+        cae->state = cache_t::state_t::valid;
       }
     }
   }
 
   // Overlap communication and memory remapping
-  for (auto [prev_cae, new_cae, vm_offset] : filled_cache_entries) {
+  for (auto cae : remapped_entries) {
+    auto prev_cae = cae->prev_entry;
     if (prev_cae) {
-      PCAS_CHECK(prev_cae->vm_addr);
+      cae->prev_entry = nullptr;
       virtual_mem::mmap_no_physical_mem(prev_cae->vm_addr, cache_t::block_size);
     }
-    physical_mem& cache_pm = cache_.pm();
-    obe.vm.map_physical_mem(vm_offset, new_cae->block_num * cache_t::block_size, cache_t::block_size, cache_pm);
-    new_cae->vm_addr = (uint8_t*)obe.vm.addr() + vm_offset;
+    cache_.pm().map(cae->vm_addr, cae->block_num * cache_t::block_size, cache_t::block_size);
+  }
+
+  std::vector<MPI_Request> reqs;
+  for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
+    auto cae = obe.cache_entries[b];
+    if (cae) {
+      if (cae->state == cache_t::state_t::fetching) {
+        PCAS_CHECK(cae->req != MPI_REQUEST_NULL);
+        reqs.push_back(cae->req);
+        cae->req = MPI_REQUEST_NULL;
+        cae->partial = false; // the entire cache block is now fetched
+      }
+      cae->state = cache_t::state_t::valid;
+    }
   }
 
   MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
@@ -812,14 +841,6 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
     auto cae = obe.cache_entries[b];
     if (cae) {
       cache_.checkin(cae);
-      // If the entire cache block is written, we consider that it is already fetched.
-      // If only a part of the block is written, we need to fetch the block when this block
-      // is checked out with read access mode.
-      if (che.mode == access_mode::write &&
-          che.ptr.offset() <= b * cache_t::block_size &&
-          (b + 1) * cache_t::block_size <= che.ptr.offset() + che.size) {
-        cae->fetched = true;
-      }
     }
   }
 
