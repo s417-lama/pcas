@@ -76,6 +76,14 @@ private:
     entry_t e = lru_.back();
     lru_.pop_back();
     e->lru_it = lru_.end();
+    if (e->state == state_t::fetching) {
+      PCAS_CHECK(e->req != MPI_REQUEST_NULL);
+      // FIXME: MPI_Cancel causes segfault
+      /* MPI_Cancel(&e->req); */
+      /* MPI_Request_free(&e->req); */
+      MPI_Wait(&e->req, MPI_STATUS_IGNORE);
+      PCAS_CHECK(e->req == MPI_REQUEST_NULL);
+    }
     invalidate(e->block_num);
     e->state = state_t::evicted;
     return e->block_num;
@@ -138,9 +146,12 @@ public:
     delete e;
   }
 
-  bool checkout(entry_t e) {
+  bool checkout(entry_t e, bool prefetch = false) {
     PCAS_CHECK(e);
-    e->checkout_count++;
+    if (!prefetch) {
+      e->checkout_count++;
+    }
+    bool hit;
     switch (e->state) {
       case state_t::evicted: {
         // the entry needs a new cache block
@@ -149,7 +160,8 @@ public:
         e->prev_entry = cache_map_[b];
         cache_map_[b] = e;
         PCAS_CHECK(e->lru_it == lru_.end());
-        return false;
+        hit = false;
+        break;
       }
       case state_t::invalid: {
         // the entry has been invalidated but remains in the cache
@@ -160,7 +172,8 @@ public:
           lru_.erase(e->lru_it);
           e->lru_it = lru_.end();
         }
-        return false;
+        hit = false;
+        break;
       }
       default: {
         // cache hit
@@ -168,9 +181,16 @@ public:
           lru_.erase(e->lru_it);
           e->lru_it = lru_.end();
         }
-        return true;
+        hit = true;
+        break;
       }
     }
+    if (prefetch && is_evictable(e)) {
+      PCAS_CHECK(e->lru_it == lru_.end());
+      lru_.push_front(e);
+      e->lru_it = lru_.begin();
+    }
+    return hit;
   }
 
   void checkin(entry_t e) {
@@ -192,7 +212,12 @@ public:
         if (e->state == state_t::valid) {
           invalidate(b);
         } else if (e->state == state_t::fetching) {
-          // FIXME: cancel communication?
+          PCAS_CHECK(e->req != MPI_REQUEST_NULL);
+          // FIXME: MPI_Cancel causes segfault
+          /* MPI_Cancel(&e->req); */
+          /* MPI_Request_free(&e->req); */
+          MPI_Wait(&e->req, MPI_STATUS_IGNORE);
+          PCAS_CHECK(e->req == MPI_REQUEST_NULL);
           invalidate(b);
         }
       }

@@ -113,6 +113,8 @@ class pcas_if {
 
   int enable_shared_memory_;
 
+  int n_prefetch_;
+
   std::vector<std::pair<int, int>> init_process_map(MPI_Comm comm) {
     int mpi_initialized = 0;
     MPI_Initialized(&mpi_initialized);
@@ -154,6 +156,34 @@ class pcas_if {
     }
     PCAS_CHECK(ret.size() == (size_t)intra_nproc_);
     return ret;
+  }
+
+  void fetch_begin(cache_t::entry_t cae, obj_entry& obe, int owner, size_t owner_disp) {
+    void* cache_block_ptr = cache_.pm().anon_vm_addr();
+    int count = 0;
+    // fetch only nondirty sections
+    for (auto [offset_in_block_b, offset_in_block_e] :
+         sections_inverse(cae->dirty_sections, {0, cache_t::block_size})) {
+      MPI_Request req;
+      MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
+               offset_in_block_e - offset_in_block_b,
+               MPI_UINT8_T,
+               owner,
+               owner_disp + offset_in_block_b,
+               offset_in_block_e - offset_in_block_b,
+               MPI_UINT8_T,
+               obe.win,
+               &req);
+      cae->state = cache_t::state_t::fetching;
+      // FIXME
+      if (count == 0) {
+        PCAS_CHECK(cae->req == MPI_REQUEST_NULL);
+        cae->req = req;
+      } else {
+        MPI_Wait(&req, MPI_STATUS_IGNORE);
+      }
+      count++;
+    }
   }
 
 public:
@@ -360,6 +390,7 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
 
   max_dirty_cache_blocks_ = get_env("PCAS_MAX_DIRTY_CACHE_BLOCKS", 4, global_rank_);
   enable_shared_memory_ = get_env("PCAS_ENABLE_SHARED_MEMORY", 1, global_rank_);
+  n_prefetch_ = get_env("PCAS_PREFETCH_BLOCKS", 0, global_rank_);
 
   barrier();
 }
@@ -697,19 +728,28 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
   obj_entry& obe = objs_[ptr.id()];
 
-  // tuple(prev_entry, new_entry, block_num)
   std::vector<cache_t::entry_t> remapped_entries;
 
   uint64_t cache_entry_b = ptr.offset() / cache_t::block_size;
   uint64_t cache_entry_e =
     (ptr.offset() + nelems * sizeof(T) + cache_t::block_size - 1) / cache_t::block_size;
-  for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
+
+  int n_prefetch = Mode == access_mode::write ? 0 : n_prefetch_;
+  uint64_t cmax = obe.effective_size / cache_t::block_size;
+
+  for (uint64_t b = cache_entry_b; b < std::min(cache_entry_e + n_prefetch, cmax); b++) {
     auto cae = obe.cache_entries[b];
     if (cae) {
-      uint64_t vm_offset = b * cache_t::block_size;
-      auto hit = cache_.checkout(cae);
+      if (b >= cache_entry_e && cae->partial) {
+        // do not prefetch a block that was previously accessed with write-only mode
+        // FIXME: I did not seriously consider this case; it may be better handled
+        continue;
+      }
 
-      if (!hit) {
+      uint64_t vm_offset = b * cache_t::block_size;
+      cache_.checkout(cae, b >= cache_entry_e);
+
+      if (cae->state == cache_t::state_t::evicted) {
         cae->vm_addr = (uint8_t*)obe.vm.addr() + vm_offset;
         remapped_entries.push_back(cae);
       }
@@ -744,30 +784,18 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         auto [owner, _idx_b, _idx_e] =
           block_index_info(b * cache_t::block_size, obe.effective_size, global_nproc_);
 
-        void* cache_block_ptr = cache_.pm().anon_vm_addr();
-
         auto& owner_ = owner; // structured bindings cannot be captured by lambda until C++20
         PCAS_CHECK(vm_offset >= owner_ * obe.block_size);
         PCAS_CHECK(vm_offset - owner_ * obe.block_size + cache_t::block_size <= obe.block_size);
 
-        // fetch only nondirty sections
-        for (auto [offset_in_block_b, offset_in_block_e] :
-             sections_inverse(cae->dirty_sections, {0, cache_t::block_size})) {
-          MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
-                   offset_in_block_e - offset_in_block_b,
-                   MPI_UINT8_T,
-                   owner,
-                   vm_offset - owner * obe.block_size + offset_in_block_b,
-                   offset_in_block_e - offset_in_block_b,
-                   MPI_UINT8_T,
-                   obe.win,
-                   &cae->req);
-          cae->state = cache_t::state_t::fetching;
-        }
+        fetch_begin(cae, obe, owner, vm_offset - owner * obe.block_size);
+
+        cae->partial = false; // the entire cache block is now fetched
       }
 
       // cache with write-only mode is always valid
-      if (Mode == access_mode::write) {
+      if (Mode == access_mode::write &&
+          cae->state != cache_t::state_t::fetching) {
         cae->state = cache_t::state_t::valid;
       }
     }
@@ -776,7 +804,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   // Overlap communication and memory remapping
   for (auto cae : remapped_entries) {
     auto prev_cae = cae->prev_entry;
-    if (prev_cae) {
+    if (prev_cae && prev_cae->state == cache_t::state_t::evicted) {
       cae->prev_entry = nullptr;
       virtual_mem::mmap_no_physical_mem(prev_cae->vm_addr, cache_t::block_size);
     }
@@ -791,7 +819,6 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         PCAS_CHECK(cae->req != MPI_REQUEST_NULL);
         reqs.push_back(cae->req);
         cae->req = MPI_REQUEST_NULL;
-        cae->partial = false; // the entire cache block is now fetched
       }
       cae->state = cache_t::state_t::valid;
     }
