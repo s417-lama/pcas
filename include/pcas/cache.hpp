@@ -33,7 +33,6 @@ public:
 
   struct entry {
     state_t     state          = state_t::evicted;
-    bool        partial        = false; // If true, only a part of the block is vaild (for write-only update)
     bool        flushing       = false;
     int         checkout_count = 0;
     block_num_t block_num      = std::numeric_limits<block_num_t>::max();
@@ -42,6 +41,7 @@ public:
     MPI_Request req            = MPI_REQUEST_NULL;
     obj_id_t    obj_id;
     sections    dirty_sections;
+    sections    partial_sections; // for write-only update
     typename std::list<entry*>::iterator lru_it;
   };
 
@@ -66,7 +66,7 @@ private:
     entry* e = cache_map_[b];
     PCAS_CHECK(is_evictable(e));
     e->state = state_t::invalid;
-    e->partial = false;
+    e->partial_sections.clear();
   }
 
   block_num_t evict_one() {

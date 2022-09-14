@@ -229,6 +229,8 @@ PCAS_TEST_CASE("[pcas::util] sections inverse") {
   PCAS_CHECK(sections_inverse(ss, {60, 90}) == (sections{}));
   PCAS_CHECK(sections_inverse(ss, {2, 5}) == (sections{}));
   PCAS_CHECK(sections_inverse(ss, {2, 6}) == (sections{{5, 6}}));
+  sections ss_empty{};
+  PCAS_CHECK(sections_inverse(ss_empty, {0, 100}) == (sections{{0, 100}}));
 }
 
 }

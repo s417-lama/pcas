@@ -163,7 +163,7 @@ class pcas_if {
     int count = 0;
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
-         sections_inverse(cae->dirty_sections, {0, cache_t::block_size})) {
+         sections_inverse(cae->partial_sections, {0, cache_t::block_size})) {
       MPI_Request req;
       MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
                offset_in_block_e - offset_in_block_b,
@@ -199,7 +199,7 @@ public:
   void flush_dirty_cache() {
     if (cache_dirty_) {
       cache_.for_each_block([&](cache_t::entry_t cae) {
-        if (cae && !cae->dirty_sections.empty() && cae->checkout_count == 0) {
+        if (cae && !cae->dirty_sections.empty()) {
           PCAS_CHECK(!cae->flushing);
 
           obj_entry& obe = objs_[cae->obj_id];
@@ -737,10 +737,12 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   int n_prefetch = Mode == access_mode::write ? 0 : n_prefetch_;
   uint64_t cmax = obe.effective_size / cache_t::block_size;
 
+  section block_section{0, cache_t::block_size};
+
   for (uint64_t b = cache_entry_b; b < std::min(cache_entry_e + n_prefetch, cmax); b++) {
     auto cae = obe.cache_entries[b];
     if (cae) {
-      if (b >= cache_entry_e && cae->partial) {
+      if (b >= cache_entry_e && cae->partial_sections.front() != block_section) {
         // do not prefetch a block that was previously accessed with write-only mode
         // FIXME: I did not seriously consider this case; it may be better handled
         continue;
@@ -762,13 +764,14 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         complete_flush();
       }
 
-      // If only a part of the block is written (partial=true), we need to fetch the block
+      // If only a part of the block is written, we need to fetch the block
       // when this block is checked out again with read access mode.
-      if (Mode == access_mode::write &&
-          (cae->state == cache_t::state_t::evicted || cae->state == cache_t::state_t::invalid) &&
-          !(ptr.offset() <= b * cache_t::block_size &&
-            (b + 1) * cache_t::block_size <= ptr.offset() + nelems * sizeof(T))) {
-        cae->partial = true;
+      if (Mode == access_mode::write) {
+        uint64_t offset_in_block_b = (ptr.offset() > b * cache_t::block_size) ?
+                                     ptr.offset() - b * cache_t::block_size : 0;
+        uint64_t offset_in_block_e = (ptr.offset() + nelems * sizeof(T) < (b + 1) * cache_t::block_size) ?
+                                     ptr.offset() + nelems * sizeof(T) - b * cache_t::block_size : cache_t::block_size;
+        sections_insert(cae->partial_sections, {offset_in_block_b, offset_in_block_e});
       }
 
       // Suppose that a cache block is represented as [a1, a2].
@@ -777,9 +780,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       // the data for a2 would not be fetched because it is already in the cache.
       // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
       // has been already fetched or not.
-      if (Mode != access_mode::write &&
-          (cae->state == cache_t::state_t::evicted || cae->state == cache_t::state_t::invalid ||
-           cae->partial)) {
+      if (Mode != access_mode::write) {
         // TODO: fix the assumption cache_t::block_size == min_block_size
         auto [owner, _idx_b, _idx_e] =
           block_index_info(b * cache_t::block_size, obe.effective_size, global_nproc_);
@@ -790,7 +791,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
         fetch_begin(cae, obe, owner, vm_offset - owner * obe.block_size);
 
-        cae->partial = false; // the entire cache block is now fetched
+        sections_insert(cae->partial_sections, block_section); // the entire cache block is now fetched
       }
 
       // cache with write-only mode is always valid
