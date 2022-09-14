@@ -742,12 +742,6 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   for (uint64_t b = cache_entry_b; b < std::min(cache_entry_e + n_prefetch, cmax); b++) {
     auto cae = obe.cache_entries[b];
     if (cae) {
-      if (b >= cache_entry_e && cae->partial_sections.front() != block_section) {
-        // do not prefetch a block that was previously accessed with write-only mode
-        // FIXME: I did not seriously consider this case; it may be better handled
-        continue;
-      }
-
       uint64_t vm_offset = b * cache_t::block_size;
       cache_.checkout(cae, b >= cache_entry_e);
 
