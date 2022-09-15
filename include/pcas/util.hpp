@@ -66,47 +66,6 @@ inline void die(const char* fmt, ...) {
 
 constexpr uint64_t min_block_size = 65536;
 
-inline uint64_t local_block_size(uint64_t size, int nproc) {
-  uint64_t nblock_g = (size + min_block_size - 1) / min_block_size;
-  uint64_t nblock_l = (nblock_g + nproc - 1) / nproc;
-  return nblock_l * min_block_size;
-}
-
-PCAS_TEST_CASE("[pcas::util] calculate local block size") {
-  PCAS_CHECK(local_block_size(min_block_size * 4     , 4) == min_block_size    );
-  PCAS_CHECK(local_block_size(min_block_size * 12    , 4) == min_block_size * 3);
-  PCAS_CHECK(local_block_size(min_block_size * 13    , 4) == min_block_size * 4);
-  PCAS_CHECK(local_block_size(min_block_size * 12 + 1, 4) == min_block_size * 4);
-  PCAS_CHECK(local_block_size(min_block_size * 12 - 1, 4) == min_block_size * 3);
-  PCAS_CHECK(local_block_size(1                      , 4) == min_block_size    );
-  PCAS_CHECK(local_block_size(1                      , 1) == min_block_size    );
-  PCAS_CHECK(local_block_size(min_block_size * 3     , 1) == min_block_size * 3);
-}
-
-inline auto block_index_info(uint64_t index,
-                             uint64_t size,
-                             int      nproc) {
-  PCAS_CHECK(index < size);
-  uint64_t size_l = local_block_size(size, nproc);
-  int      owner  = index / size_l;
-  uint64_t idx_b  = owner * size_l;
-  uint64_t idx_e  = std::min((owner + 1) * size_l, size);
-  return std::make_tuple(owner, idx_b, idx_e);
-}
-
-PCAS_TEST_CASE("[pcas::util] get block information at specified index") {
-  int mb = min_block_size;
-  PCAS_CHECK(block_index_info(0         , mb * 4     , 4) == std::make_tuple(0, 0     , mb         ));
-  PCAS_CHECK(block_index_info(mb        , mb * 4     , 4) == std::make_tuple(1, mb    , mb * 2     ));
-  PCAS_CHECK(block_index_info(mb * 2    , mb * 4     , 4) == std::make_tuple(2, mb * 2, mb * 3     ));
-  PCAS_CHECK(block_index_info(mb * 3    , mb * 4     , 4) == std::make_tuple(3, mb * 3, mb * 4     ));
-  PCAS_CHECK(block_index_info(mb * 4 - 1, mb * 4     , 4) == std::make_tuple(3, mb * 3, mb * 4     ));
-  PCAS_CHECK(block_index_info(0         , mb * 12    , 4) == std::make_tuple(0, 0     , mb * 3     ));
-  PCAS_CHECK(block_index_info(mb        , mb * 12    , 4) == std::make_tuple(0, 0     , mb * 3     ));
-  PCAS_CHECK(block_index_info(mb * 3    , mb * 12    , 4) == std::make_tuple(1, mb * 3, mb * 6     ));
-  PCAS_CHECK(block_index_info(mb * 11   , mb * 12 - 1, 4) == std::make_tuple(3, mb * 9, mb * 12 - 1));
-}
-
 template <typename T>
 inline T get_env_(const char* env_var, T default_val) {
   if (const char* val_str = std::getenv(env_var)) {

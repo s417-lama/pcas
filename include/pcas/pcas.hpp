@@ -3,6 +3,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <memory>
 
 #include <mpi.h>
 
@@ -13,28 +14,23 @@
 #include "pcas/cache.hpp"
 #include "pcas/wallclock.hpp"
 #include "pcas/logger/logger.hpp"
+#include "pcas/mem_mapper.hpp"
 
 namespace pcas {
-
-enum class dist_policy {
-  local,
-  block,
-  block_cyclic,
-};
 
 using cache_t = cache_system<min_block_size>;
 
 struct obj_entry {
-  int                           owner;
-  obj_id_t                      id;
-  uint64_t                      size;
-  uint64_t                      effective_size;
-  dist_policy                   dpolicy;
-  uint64_t                      block_size;
-  std::vector<physical_mem>     pms;
-  virtual_mem                   vm;
-  std::vector<cache_t::entry_t> cache_entries;
-  MPI_Win                       win;
+  int                                   owner;
+  obj_id_t                              id;
+  uint64_t                              size;
+  uint64_t                              effective_size;
+  uint64_t                              block_size;
+  std::unique_ptr<mem_mapper::base>     mmapper;
+  std::unordered_map<int, physical_mem> pms;
+  virtual_mem                           vm;
+  std::vector<cache_t::entry_t>         cache_entries;
+  MPI_Win                               win;
 };
 
 enum class access_mode {
@@ -205,8 +201,7 @@ public:
           obj_entry& obe = objs_[cae->obj_id];
           void* cache_block_ptr = cache_.pm().anon_vm_addr();
           uint64_t vm_offset = cae->vm_addr - (uint8_t*)obe.vm.addr();
-          auto [owner, _idx_b, _idx_e] =
-            block_index_info(vm_offset, obe.effective_size, global_nproc_);
+          int owner = obe.mmapper->get_block_info(vm_offset).owner;
 
           for (auto [offset_in_block_b, offset_in_block_e] : cae->dirty_sections) {
             MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
@@ -332,10 +327,9 @@ public:
     }
   }
 
-  template <typename T>
-  global_ptr<T> malloc(uint64_t    nelems,
-                       dist_policy dpolicy    = dist_policy::block,
-                       uint64_t    block_size = 0);
+  template <typename T, typename MemMapper = mem_mapper::block, typename... MemMapperArgs>
+  inline global_ptr<T> malloc(uint64_t         nelems,
+                              MemMapperArgs... mmargs);
 
   template <typename T>
   void free(global_ptr<T> ptr);
@@ -364,8 +358,7 @@ public:
   template <typename T>
   void* get_physical_mem(global_ptr<T> ptr) {
     obj_entry& obe = objs_[ptr.id()];
-    size_t idx = enable_shared_memory_ ? intra_rank_ : 0;
-    return obe.pms[idx].anon_vm_addr();
+    return obe.pms[global_rank_].anon_vm_addr();
   }
 
 };
@@ -411,78 +404,71 @@ PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
 }
 
 template <typename P>
-template <typename T>
-inline global_ptr<T> pcas_if<P>::malloc(uint64_t    nelems,
-                                        dist_policy dpolicy,
-                                        uint64_t    block_size [[maybe_unused]]) {
+template <typename T, typename MemMapper, typename... MemMapperArgs>
+inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
+                                        MemMapperArgs... mmargs) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
 
+  uint64_t size = nelems * sizeof(T);
+
+  std::unique_ptr<MemMapper> mmapper(new MemMapper(size, global_nproc_, mmargs...));
+
+  uint64_t local_size = mmapper->get_local_size(global_rank_);
+  uint64_t effective_size = mmapper->get_effective_size();
+
   obj_id_t obj_id = obj_id_count_++;
 
-  switch (dpolicy) {
-    case dist_policy::block: {
-      uint64_t size = nelems * sizeof(T);
-      uint64_t local_size = local_block_size(size, global_nproc_);
-      uint64_t effective_size = local_size * global_nproc_;
+  virtual_mem vm(nullptr, effective_size);
+  physical_mem pm_local(local_size, obj_id, intra_rank_, true, true);
 
-      virtual_mem vm(nullptr, effective_size);
-      physical_mem pm_local(local_size, obj_id, intra_rank_, true, true);
-      void* vm_local_addr = vm.map_physical_mem(global_rank_ * local_size, 0, local_size, pm_local);
+  MPI_Win win = MPI_WIN_NULL;
+  MPI_Win_create(pm_local.anon_vm_addr(),
+                 local_size,
+                 1,
+                 MPI_INFO_NULL,
+                 global_comm_,
+                 &win);
+  MPI_Win_lock_all(0, win);
 
-      MPI_Win win = MPI_WIN_NULL;
-      MPI_Win_create(vm_local_addr,
-                     local_size,
-                     1,
-                     MPI_INFO_NULL,
-                     global_comm_,
-                     &win);
-      MPI_Win_lock_all(0, win);
-
-      std::vector<physical_mem> pms;
-      for (int i = 0; i < intra_nproc_; i++) {
-        if (i == intra_rank_) {
-          pms.push_back(std::move(pm_local));
-        } else if (enable_shared_memory_) {
-          int target_rank = intra2global_rank_[i];
-          physical_mem pm(local_size, obj_id, i, false, false);
-          vm.map_physical_mem(target_rank * local_size, 0, local_size, pm);
-          pms.push_back(std::move(pm));
-        }
-      }
-
-      std::vector<cache_t::entry_t> cache_entries;
-      for (uint64_t b = 0; b < effective_size / cache_t::block_size; b++) {
-        auto [owner, _idx_b, _idx_e] =
-          block_index_info(b * cache_t::block_size, effective_size, global_nproc_);
-        if (owner == global_rank_ ||
-            (enable_shared_memory_ && process_map_[owner].second == inter_rank_)) {
-          cache_entries.push_back(nullptr);
-        } else {
-          cache_entries.push_back(cache_.alloc_entry(obj_id));
-        }
-      }
-
-      obj_entry obe {
-        .owner = -1, .id = obj_id,
-        .size = size, .effective_size = effective_size,
-        .dpolicy = dpolicy, .block_size = local_size,
-        .pms = std::move(pms), .vm = std::move(vm),
-        .cache_entries = std::move(cache_entries), .win = win,
-      };
-
-      auto ret = global_ptr<T>(obe.owner, obe.id, 0);
-
-      objs_[obe.id] = std::move(obe);
-
-      return ret;
-    }
-    default: {
-      die("unimplemented");
-      return global_ptr<T>();
+  std::unordered_map<int, physical_mem> pms;
+  for (int i = 0; i < intra_nproc_; i++) {
+    if (i == intra_rank_) {
+      pms[global_rank_] = std::move(pm_local);
+    } else if (enable_shared_memory_) {
+      int target_rank = intra2global_rank_[i];
+      int target_local_size = mmapper->get_local_size(target_rank);
+      physical_mem pm(target_local_size, obj_id, i, false, false);
+      pms[target_rank] = std::move(pm);
     }
   }
+
+  std::vector<cache_t::entry_t> cache_entries;
+  for (uint64_t b = 0; b < effective_size / cache_t::block_size; b++) {
+    auto bi = mmapper->get_block_info(b * cache_t::block_size);
+    if (bi.owner == global_rank_ ||
+        (enable_shared_memory_ && process_map_[bi.owner].second == inter_rank_)) {
+      vm.map_physical_mem(b * cache_t::block_size, bi.pm_offset, cache_t::block_size, pms[bi.owner]);
+      cache_entries.push_back(nullptr);
+    } else {
+      cache_entries.push_back(cache_.alloc_entry(obj_id));
+    }
+  }
+
+  obj_entry obe {
+    .owner = -1, .id = obj_id,
+    .size = size, .effective_size = effective_size,
+    .block_size = local_size, .mmapper = std::move(mmapper),
+    .pms = std::move(pms), .vm = std::move(vm),
+    .cache_entries = std::move(cache_entries), .win = win,
+  };
+
+  auto ret = global_ptr<T>(obe.owner, obe.id, 0);
+
+  objs_[obe.id] = std::move(obe);
+
+  return ret;
 }
 
 template <typename P>
@@ -492,22 +478,13 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
     die("null pointer was passed to pcas::free()");
   }
   obj_entry& obe = objs_[ptr.id()];
-  switch (obe.dpolicy) {
-    case dist_policy::block: {
-      for (auto& cae : obe.cache_entries) {
-        if (cae) {
-          cache_.free_entry(cae);
-        }
-      }
-      MPI_Win_unlock_all(obe.win);
-      MPI_Win_free(&obe.win);
-      break;
-    }
-    default: {
-      die("unimplemented");
-      break;
+  for (auto& cae : obe.cache_entries) {
+    if (cae) {
+      cache_.free_entry(cae);
     }
   }
+  MPI_Win_unlock_all(obe.win);
+  MPI_Win_free(&obe.win);
   objs_.erase(ptr.id());
 }
 
@@ -543,13 +520,13 @@ inline void pcas_if<P>::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func 
   PCAS_CHECK(offset_max <= obe.size);
 
   while (offset < offset_max) {
-    auto [owner, idx_b, idx_e] = block_index_info(offset, obe.effective_size, global_nproc_);
-    uint64_t ib = std::max(idx_b, offset_min);
-    uint64_t ie = std::min(idx_e, offset_max);
+    auto bi = obe.mmapper->get_block_info(offset);
+    uint64_t offset_b = std::max(bi.offset_b, offset_min);
+    uint64_t offset_e = std::min(bi.offset_e, offset_max);
 
-    fn(owner, ib, ie);
+    fn(bi.owner, offset_b, offset_e);
 
-    offset = idx_e;
+    offset = bi.offset_e;
   }
 }
 
@@ -579,8 +556,9 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
     int e = n / 5 * 4;
     int s = e - b;
 
-    auto [o1, _ib1, _ie1] = block_index_info(b * sizeof(int), n * sizeof(int), nproc);
-    auto [o2, _ib2, _ie2] = block_index_info(e * sizeof(int), n * sizeof(int), nproc);
+    mem_mapper::block mmapper{n * sizeof(int), nproc};
+    int o1 = mmapper.get_block_info(b * sizeof(int)).owner;
+    int o2 = mmapper.get_block_info(e * sizeof(int)).owner;
 
     int prev_owner = o1 - 1;
     uint64_t prev_ie = b * sizeof(int);
@@ -720,6 +698,7 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
   pc.free(p);
 }
 
+
 template <typename P>
 template <access_mode Mode, typename T>
 inline std::conditional_t<Mode == access_mode::read, const T*, T*>
@@ -776,12 +755,10 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       // has been already fetched or not.
       if (Mode != access_mode::write) {
         // TODO: fix the assumption cache_t::block_size == min_block_size
-        auto [owner, _idx_b, _idx_e] =
-          block_index_info(b * cache_t::block_size, obe.effective_size, global_nproc_);
+        int owner = obe.mmapper->get_block_info(b * cache_t::block_size).owner;
 
-        auto& owner_ = owner; // structured bindings cannot be captured by lambda until C++20
-        PCAS_CHECK(vm_offset >= owner_ * obe.block_size);
-        PCAS_CHECK(vm_offset - owner_ * obe.block_size + cache_t::block_size <= obe.block_size);
+        PCAS_CHECK(vm_offset >= owner * obe.block_size);
+        PCAS_CHECK(vm_offset - owner * obe.block_size + cache_t::block_size <= obe.block_size);
 
         fetch_begin(cae, obe, owner, vm_offset - owner * obe.block_size);
 
