@@ -25,7 +25,6 @@ struct obj_entry {
   obj_id_t                              id;
   uint64_t                              size;
   uint64_t                              effective_size;
-  uint64_t                              block_size;
   std::unique_ptr<mem_mapper::base>     mmapper;
   std::unordered_map<int, physical_mem> pms;
   virtual_mem                           vm;
@@ -201,14 +200,14 @@ public:
           obj_entry& obe = objs_[cae->obj_id];
           void* cache_block_ptr = cache_.pm().anon_vm_addr();
           uint64_t vm_offset = cae->vm_addr - (uint8_t*)obe.vm.addr();
-          int owner = obe.mmapper->get_block_info(vm_offset).owner;
+          auto bi = obe.mmapper->get_block_info(vm_offset);
 
           for (auto [offset_in_block_b, offset_in_block_e] : cae->dirty_sections) {
             MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
                     offset_in_block_e - offset_in_block_b,
                     MPI_UINT8_T,
-                    owner,
-                    vm_offset - owner * obe.block_size + offset_in_block_b,
+                    bi.owner,
+                    bi.pm_offset + offset_in_block_b,
                     offset_in_block_e - offset_in_block_b,
                     MPI_UINT8_T,
                     obe.win);
@@ -459,7 +458,7 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
   obj_entry obe {
     .owner = -1, .id = obj_id,
     .size = size, .effective_size = effective_size,
-    .block_size = local_size, .mmapper = std::move(mmapper),
+    .mmapper = std::move(mmapper),
     .pms = std::move(pms), .vm = std::move(vm),
     .cache_entries = std::move(cache_entries), .win = win,
   };
@@ -508,6 +507,26 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
   }
 }
 
+PCAS_TEST_CASE("[pcas::pcas] malloc and free with cyclic policy") {
+  pcas pc;
+  int n = 10;
+  PCAS_SUBCASE("free immediately") {
+    for (int i = 1; i < n; i++) {
+      auto p = pc.malloc<int, mem_mapper::cyclic>(i * 123456, min_block_size);
+      pc.free(p);
+    }
+  }
+  PCAS_SUBCASE("free after accumulation") {
+    global_ptr<int> ptrs[n];
+    for (int i = 1; i < n; i++) {
+      ptrs[i] = pc.malloc<int, mem_mapper::cyclic>(i * 27438, min_block_size * i);
+    }
+    for (int i = 1; i < n; i++) {
+      pc.free(ptrs[i]);
+    }
+  }
+}
+
 template <typename P>
 template <typename T, typename Func>
 inline void pcas_if<P>::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
@@ -521,10 +540,10 @@ inline void pcas_if<P>::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func 
 
   while (offset < offset_max) {
     auto bi = obe.mmapper->get_block_info(offset);
-    uint64_t offset_b = std::max(bi.offset_b, offset_min);
-    uint64_t offset_e = std::min(bi.offset_e, offset_max);
+    uint64_t offset_b  = std::max(bi.offset_b, offset_min);
+    uint64_t offset_e  = std::min(bi.offset_e, offset_max);
 
-    fn(bi.owner, offset_b, offset_e);
+    fn(bi.owner, offset_b, offset_e, bi.pm_offset);
 
     offset = bi.offset_e;
   }
@@ -540,15 +559,18 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
 
   PCAS_SUBCASE("loop over the entire array") {
     int prev_owner = -1;
-    uint64_t prev_ie = 0;
-    pc.for_each_block(p, n, [&](int owner, uint64_t ib, uint64_t ie) {
+    uint64_t prev_offset_e = 0;
+    pc.for_each_block(p, n, [&](int      owner,
+                                uint64_t offset_b,
+                                uint64_t offset_e,
+                                uint64_t pm_offset [[maybe_unused]]) {
       PCAS_CHECK(owner == prev_owner + 1);
-      PCAS_CHECK(ib == prev_ie);
+      PCAS_CHECK(offset_b == prev_offset_e);
       prev_owner = owner;
-      prev_ie = ie;
+      prev_offset_e = offset_e;
     });
     PCAS_CHECK(prev_owner == nproc - 1);
-    PCAS_CHECK(prev_ie == n * sizeof(int));
+    PCAS_CHECK(prev_offset_e == n * sizeof(int));
   }
 
   PCAS_SUBCASE("loop over the partial array") {
@@ -561,16 +583,19 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
     int o2 = mmapper.get_block_info(e * sizeof(int)).owner;
 
     int prev_owner = o1 - 1;
-    uint64_t prev_ie = b * sizeof(int);
-    pc.for_each_block(p + b, s, [&](int owner, uint64_t ib, uint64_t ie) {
+    uint64_t prev_offset_e = b * sizeof(int);
+    pc.for_each_block(p + b, s, [&](int      owner,
+                                    uint64_t offset_b,
+                                    uint64_t offset_e,
+                                    uint64_t pm_offset [[maybe_unused]]) {
       PCAS_CHECK(owner == prev_owner + 1);
-      PCAS_CHECK(ib == prev_ie);
+      PCAS_CHECK(offset_b == prev_offset_e);
       prev_owner = owner;
-      prev_ie = ie;
+      prev_offset_e = offset_e;
     });
     auto& o2_ = o2; // structured bindings cannot be captured by lambda until C++20
     PCAS_CHECK(prev_owner == o2_);
-    PCAS_CHECK(prev_ie == e * sizeof(int));
+    PCAS_CHECK(prev_offset_e == e * sizeof(int));
   }
 
   pc.free(p);
@@ -584,14 +609,17 @@ inline void pcas_if<P>::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) 
     uint64_t offset = from_ptr.offset();
     std::vector<MPI_Request> reqs;
 
-    for_each_block(from_ptr, nelems, [&](int owner, uint64_t idx_b, uint64_t idx_e) {
+    for_each_block(from_ptr, nelems, [&](int      owner,
+                                         uint64_t offset_b,
+                                         uint64_t offset_e,
+                                         uint64_t pm_offset) {
       MPI_Request req;
-      MPI_Rget((uint8_t*)to_ptr - offset + idx_b,
-               idx_e - idx_b,
+      MPI_Rget((uint8_t*)to_ptr - offset + offset_b,
+               offset_e - offset_b,
                MPI_UINT8_T,
                owner,
-               idx_b - owner * obe.block_size,
-               idx_e - idx_b,
+               pm_offset,
+               offset_e - offset_b,
                MPI_UINT8_T,
                obe.win,
                &req);
@@ -610,23 +638,20 @@ inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t ne
   if (to_ptr.owner() == -1) {
     obj_entry& obe = objs_[to_ptr.id()];
     uint64_t offset = to_ptr.offset();
-    std::vector<MPI_Request> reqs;
 
-    for_each_block(to_ptr, nelems, [&](int owner, uint64_t idx_b, uint64_t idx_e) {
-      MPI_Request req;
-      MPI_Rput((uint8_t*)from_ptr - offset + idx_b,
-               idx_e - idx_b,
-               MPI_UINT8_T,
-               owner,
-               idx_b - owner * obe.block_size,
-               idx_e - idx_b,
-               MPI_UINT8_T,
-               obe.win,
-               &req);
-      reqs.push_back(req);
+    for_each_block(to_ptr, nelems, [&](int      owner,
+                                       uint64_t offset_b,
+                                       uint64_t offset_e,
+                                       uint64_t pm_offset) {
+      MPI_Put((uint8_t*)from_ptr - offset + offset_b,
+              offset_e - offset_b,
+              MPI_UINT8_T,
+              owner,
+              pm_offset,
+              offset_e - offset_b,
+              MPI_UINT8_T,
+              obe.win);
     });
-
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
 
     // ensure remote completion
     MPI_Win_flush_all(obe.win);
@@ -640,62 +665,70 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
 
   int rank = pc.rank();
 
-  int n = 100000;
-  auto p = pc.malloc<int>(n);
+  int n = 1000000;
+
+  global_ptr<int> ps[2];
+  ps[0] = pc.malloc<int>(n);
+  ps[1] = pc.malloc<int, mem_mapper::cyclic>(n, min_block_size);
 
   int* buf = new int[n + 2];
 
-  if (rank == 0) {
-    for (int i = 0; i < n; i++) {
-      buf[i] = i;
+  for (auto p : ps) {
+    if (rank == 0) {
+      for (int i = 0; i < n; i++) {
+        buf[i] = i;
+      }
+      pc.put(buf, p, n);
     }
-    pc.put(buf, p, n);
-  }
 
-  pc.barrier();
+    pc.barrier();
 
-  PCAS_SUBCASE("get the entire array") {
-    int special = 417;
-    buf[0] = buf[n + 1] = special;
-
-    pc.get(p, buf + 1, n);
-
-    for (int i = 0; i < n; i++) {
-      PCAS_CHECK(buf[i + 1] == i);
-    }
-    PCAS_CHECK(buf[0]     == special);
-    PCAS_CHECK(buf[n + 1] == special);
-  }
-
-  PCAS_SUBCASE("get the partial array") {
-    int ib = n / 5 * 2;
-    int ie = n / 5 * 4;
-    int s = ie - ib;
-
-    int special = 417;
-    buf[0] = buf[s + 1] = special;
-
-    pc.get(p + ib, buf + 1, s);
-
-    for (int i = 0; i < s; i++) {
-      PCAS_CHECK(buf[i + 1] == i + ib);
-    }
-    PCAS_CHECK(buf[0]     == special);
-    PCAS_CHECK(buf[s + 1] == special);
-  }
-
-  PCAS_SUBCASE("get each element") {
-    for (int i = 0; i < n; i++) {
+    PCAS_SUBCASE("get the entire array") {
       int special = 417;
-      buf[0] = buf[2] = special;
-      pc.get(p + i, &buf[1], 1);
-      PCAS_CHECK(buf[0] == special);
-      PCAS_CHECK(buf[1] == i);
-      PCAS_CHECK(buf[2] == special);
+      buf[0] = buf[n + 1] = special;
+
+      pc.get(p, buf + 1, n);
+
+      for (int i = 0; i < n; i++) {
+        PCAS_CHECK(buf[i + 1] == i);
+      }
+      PCAS_CHECK(buf[0]     == special);
+      PCAS_CHECK(buf[n + 1] == special);
+    }
+
+    PCAS_SUBCASE("get the partial array") {
+      int ib = n / 5 * 2;
+      int ie = n / 5 * 4;
+      int s = ie - ib;
+
+      int special = 417;
+      buf[0] = buf[s + 1] = special;
+
+      pc.get(p + ib, buf + 1, s);
+
+      for (int i = 0; i < s; i++) {
+        PCAS_CHECK(buf[i + 1] == i + ib);
+      }
+      PCAS_CHECK(buf[0]     == special);
+      PCAS_CHECK(buf[s + 1] == special);
+    }
+
+    PCAS_SUBCASE("get each element") {
+      for (int i = 0; i < n; i++) {
+        int special = 417;
+        buf[0] = buf[2] = special;
+        pc.get(p + i, &buf[1], 1);
+        PCAS_CHECK(buf[0] == special);
+        PCAS_CHECK(buf[1] == i);
+        PCAS_CHECK(buf[2] == special);
+      }
     }
   }
 
-  pc.free(p);
+  delete[] buf;
+
+  pc.free(ps[0]);
+  pc.free(ps[1]);
 }
 
 
@@ -755,12 +788,9 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       // has been already fetched or not.
       if (Mode != access_mode::write) {
         // TODO: fix the assumption cache_t::block_size == min_block_size
-        int owner = obe.mmapper->get_block_info(b * cache_t::block_size).owner;
+        auto bi = obe.mmapper->get_block_info(b * cache_t::block_size);
 
-        PCAS_CHECK(vm_offset >= owner * obe.block_size);
-        PCAS_CHECK(vm_offset - owner * obe.block_size + cache_t::block_size <= obe.block_size);
-
-        fetch_begin(cae, obe, owner, vm_offset - owner * obe.block_size);
+        fetch_begin(cae, obe, bi.owner, bi.pm_offset);
 
         sections_insert(cae->partial_sections, block_section); // the entire cache block is now fetched
       }
@@ -864,58 +894,63 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
   int nproc = pc.nproc();
 
   int n = min_block_size * nproc;
-  auto p = pc.malloc<uint8_t>(n);
+  global_ptr<uint8_t> ps[2];
+  ps[0] = pc.malloc<uint8_t>(n);
+  ps[1] = pc.malloc<uint8_t, mem_mapper::cyclic>(n, min_block_size);
 
-  uint8_t* home_ptr = (uint8_t*)pc.get_physical_mem(p);
-  for (uint64_t i = 0; i < min_block_size; i++) {
-    home_ptr[i] = rank;
-  }
-
-  pc.barrier();
-
-  PCAS_SUBCASE("read the entire array") {
-    const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
-    for (int i = 0; i < n; i++) {
-      PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size, "rank: ", rank, ", i: ", i);
+  for (auto p : ps) {
+    uint8_t* home_ptr = (uint8_t*)pc.get_physical_mem(p);
+    for (uint64_t i = 0; i < min_block_size; i++) {
+      home_ptr[i] = rank;
     }
-    pc.checkin(rp);
-  }
 
-  PCAS_SUBCASE("read and write the entire array") {
-    for (int it = 0; it < nproc; it++) {
-      if (it == rank) {
-        uint8_t* rp = pc.checkout<access_mode::read_write>(p, n);
-        for (int i = 0; i < n; i++) {
-          PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it, "it: ", it, ", rank: ", rank, ", i: ", i);
-          rp[i]++;
-        }
-        pc.checkin(rp);
-      }
-      pc.barrier();
+    pc.barrier();
 
+    PCAS_SUBCASE("read the entire array") {
       const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
       for (int i = 0; i < n; i++) {
-        PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it + 1, "it: ", it, ", rank: ", rank, ", i: ", i);
+        PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size, "rank: ", rank, ", i: ", i);
       }
       pc.checkin(rp);
+    }
 
-      pc.barrier();
+    PCAS_SUBCASE("read and write the entire array") {
+      for (int it = 0; it < nproc; it++) {
+        if (it == rank) {
+          uint8_t* rp = pc.checkout<access_mode::read_write>(p, n);
+          for (int i = 0; i < n; i++) {
+            PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it, "it: ", it, ", rank: ", rank, ", i: ", i);
+            rp[i]++;
+          }
+          pc.checkin(rp);
+        }
+        pc.barrier();
+
+        const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
+        for (int i = 0; i < n; i++) {
+          PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it + 1, "it: ", it, ", rank: ", rank, ", i: ", i);
+        }
+        pc.checkin(rp);
+
+        pc.barrier();
+      }
+    }
+
+    PCAS_SUBCASE("read the partial array") {
+      int ib = n / 5 * 2;
+      int ie = n / 5 * 4;
+      int s = ie - ib;
+
+      const uint8_t* rp = pc.checkout<access_mode::read>(p + ib, s);
+      for (int i = 0; i < s; i++) {
+        PCAS_CHECK_MESSAGE(rp[i] == (i + ib) / min_block_size, "rank: ", rank, ", i: ", i);
+      }
+      pc.checkin(rp);
     }
   }
 
-  PCAS_SUBCASE("read the partial array") {
-    int ib = n / 5 * 2;
-    int ie = n / 5 * 4;
-    int s = ie - ib;
-
-    const uint8_t* rp = pc.checkout<access_mode::read>(p + ib, s);
-    for (int i = 0; i < s; i++) {
-      PCAS_CHECK_MESSAGE(rp[i] == (i + ib) / min_block_size, "rank: ", rank, ", i: ", i);
-    }
-    pc.checkin(rp);
-  }
-
-  pc.free(p);
+  pc.free(ps[0]);
+  pc.free(ps[1]);
 }
 
 PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
@@ -925,75 +960,81 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
   int nproc = pc.nproc();
 
   int n = 100000;
-  auto p = pc.malloc<int>(n);
+
+  global_ptr<int> ps[2];
+  ps[0] = pc.malloc<int>(n);
+  ps[1] = pc.malloc<int, mem_mapper::cyclic>(n, min_block_size);
 
   int max_checkout_size = (16 - 2) * min_block_size / sizeof(int);
 
-  if (rank == 0) {
-    for (int i = 0; i < n; i += max_checkout_size) {
-      int m = std::min(max_checkout_size, n - i);
-      int* rp = pc.checkout<access_mode::write>(p + i, m);
-      for (int j = 0; j < m; j++) {
-        rp[j] = i + j;
+  for (auto p : ps) {
+    if (rank == 0) {
+      for (int i = 0; i < n; i += max_checkout_size) {
+        int m = std::min(max_checkout_size, n - i);
+        int* rp = pc.checkout<access_mode::write>(p + i, m);
+        for (int j = 0; j < m; j++) {
+          rp[j] = i + j;
+        }
+        pc.checkin(rp);
       }
-      pc.checkin(rp);
-    }
-  }
-
-  pc.barrier();
-
-  PCAS_SUBCASE("read the entire array") {
-    for (int i = 0; i < n; i += max_checkout_size) {
-      int m = std::min(max_checkout_size, n - i);
-      const int* rp = pc.checkout<access_mode::read>(p + i, m);
-      for (int j = 0; j < m; j++) {
-        PCAS_CHECK(rp[j] == i + j);
-      }
-      pc.checkin(rp);
-    }
-  }
-
-  PCAS_SUBCASE("read the partial array") {
-    int ib = n / 5 * 2;
-    int ie = n / 5 * 4;
-    int s = ie - ib;
-
-    for (int i = 0; i < s; i += max_checkout_size) {
-      int m = std::min(max_checkout_size, s - i);
-      const int* rp = pc.checkout<access_mode::read>(p + ib + i, m);
-      for (int j = 0; j < m; j++) {
-        PCAS_CHECK(rp[j] == i + ib + j);
-      }
-      pc.checkin(rp);
-    }
-  }
-
-  PCAS_SUBCASE("read and write the partial array") {
-    int stride = 48;
-    PCAS_REQUIRE(stride <= max_checkout_size);
-    for (int i = rank * stride; i < n; i += nproc * stride) {
-      int s = std::min(stride, n - i);
-      int* rp = pc.checkout<access_mode::read_write>(p + i, s);
-      for (int j = 0; j < s; j++) {
-        PCAS_CHECK(rp[j] == j + i);
-        rp[j] *= 2;
-      }
-      pc.checkin(rp);
     }
 
     pc.barrier();
 
-    for (int i = 0; i < n; i += max_checkout_size) {
-      int m = std::min(max_checkout_size, n - i);
-      const int* rp = pc.checkout<access_mode::read>(p + i, m);
-      for (int j = 0; j < m; j++) {
-        PCAS_CHECK(rp[j] == (i + j) * 2);
+    PCAS_SUBCASE("read the entire array") {
+      for (int i = 0; i < n; i += max_checkout_size) {
+        int m = std::min(max_checkout_size, n - i);
+        const int* rp = pc.checkout<access_mode::read>(p + i, m);
+        for (int j = 0; j < m; j++) {
+          PCAS_CHECK(rp[j] == i + j);
+        }
+        pc.checkin(rp);
       }
-      pc.checkin(rp);
+    }
+
+    PCAS_SUBCASE("read the partial array") {
+      int ib = n / 5 * 2;
+      int ie = n / 5 * 4;
+      int s = ie - ib;
+
+      for (int i = 0; i < s; i += max_checkout_size) {
+        int m = std::min(max_checkout_size, s - i);
+        const int* rp = pc.checkout<access_mode::read>(p + ib + i, m);
+        for (int j = 0; j < m; j++) {
+          PCAS_CHECK(rp[j] == i + ib + j);
+        }
+        pc.checkin(rp);
+      }
+    }
+
+    PCAS_SUBCASE("read and write the partial array") {
+      int stride = 48;
+      PCAS_REQUIRE(stride <= max_checkout_size);
+      for (int i = rank * stride; i < n; i += nproc * stride) {
+        int s = std::min(stride, n - i);
+        int* rp = pc.checkout<access_mode::read_write>(p + i, s);
+        for (int j = 0; j < s; j++) {
+          PCAS_CHECK(rp[j] == j + i);
+          rp[j] *= 2;
+        }
+        pc.checkin(rp);
+      }
+
+      pc.barrier();
+
+      for (int i = 0; i < n; i += max_checkout_size) {
+        int m = std::min(max_checkout_size, n - i);
+        const int* rp = pc.checkout<access_mode::read>(p + i, m);
+        for (int j = 0; j < m; j++) {
+          PCAS_CHECK(rp[j] == (i + j) * 2);
+        }
+        pc.checkin(rp);
+      }
     }
   }
 
-  pc.free(p);
+  pc.free(ps[0]);
+  pc.free(ps[1]);
 }
 
 }

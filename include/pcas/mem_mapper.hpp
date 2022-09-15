@@ -94,5 +94,68 @@ PCAS_TEST_CASE("[pcas::mem_mapper::block] get block information at specified off
   PCAS_CHECK(block_index_info(mb * 11   , mb * 12 - 1, 4) == (block_info{3, mb * 9, mb * 12 - 1, mb * 2}));
 }
 
+class cyclic : public base {
+  size_t block_size_;
+
+public:
+  cyclic(uint64_t size, int nproc, size_t block_size) : base(size, nproc), block_size_(block_size) {
+    PCAS_CHECK(block_size >= min_block_size);
+    PCAS_CHECK(block_size % min_block_size == 0);
+  }
+
+  uint64_t get_local_size(int rank [[maybe_unused]]) {
+    uint64_t nblock_g = (size_ + block_size_ - 1) / block_size_;
+    uint64_t nblock_l = (nblock_g + nproc_ - 1) / nproc_;
+    return nblock_l * block_size_;
+  }
+
+  uint64_t get_effective_size() {
+    return get_local_size(0) * nproc_;
+  }
+
+  block_info get_block_info(uint64_t offset) {
+    PCAS_CHECK(offset < get_effective_size());
+    uint64_t block_num_g = offset / block_size_;
+    uint64_t block_num_l = block_num_g / nproc_;
+    int      owner       = block_num_g % nproc_;
+    uint64_t offset_b    = block_num_g * block_size_;
+    uint64_t offset_e    = std::min((block_num_g + 1) * block_size_, size_);
+    uint64_t pm_offset   = block_num_l * block_size_ + offset % block_size_;
+    return block_info{owner, offset_b, offset_e, pm_offset};
+  }
+};
+
+PCAS_TEST_CASE("[pcas::mem_mapper::cyclic] calculate local block size") {
+  uint64_t mb = min_block_size * 2;
+  auto local_block_size = [=](uint64_t size, int nproc) -> uint64_t {
+    return cyclic(size, nproc, mb).get_local_size(0);
+  };
+  PCAS_CHECK(local_block_size(mb * 4     , 4) == mb    );
+  PCAS_CHECK(local_block_size(mb * 12    , 4) == mb * 3);
+  PCAS_CHECK(local_block_size(mb * 13    , 4) == mb * 4);
+  PCAS_CHECK(local_block_size(mb * 12 + 1, 4) == mb * 4);
+  PCAS_CHECK(local_block_size(mb * 12 - 1, 4) == mb * 3);
+  PCAS_CHECK(local_block_size(1          , 4) == mb    );
+  PCAS_CHECK(local_block_size(1          , 1) == mb    );
+  PCAS_CHECK(local_block_size(mb * 3     , 1) == mb * 3);
+}
+
+PCAS_TEST_CASE("[pcas::mem_mapper::cyclic] get block information at specified offset") {
+  uint64_t mb = min_block_size * 2;
+  auto block_index_info = [=](uint64_t offset, uint64_t size, int nproc) -> block_info {
+    return cyclic(size, nproc, mb).get_block_info(offset);
+  };
+  PCAS_CHECK(block_index_info(0         , mb * 4     , 4) == (block_info{0, 0      , mb         , 0     }));
+  PCAS_CHECK(block_index_info(mb        , mb * 4     , 4) == (block_info{1, mb     , mb * 2     , 0     }));
+  PCAS_CHECK(block_index_info(mb * 2    , mb * 4     , 4) == (block_info{2, mb * 2 , mb * 3     , 0     }));
+  PCAS_CHECK(block_index_info(mb * 3    , mb * 4     , 4) == (block_info{3, mb * 3 , mb * 4     , 0     }));
+  PCAS_CHECK(block_index_info(mb * 4 - 1, mb * 4     , 4) == (block_info{3, mb * 3 , mb * 4     , mb - 1}));
+  PCAS_CHECK(block_index_info(0         , mb * 12    , 4) == (block_info{0, 0      , mb         , 0     }));
+  PCAS_CHECK(block_index_info(mb        , mb * 12    , 4) == (block_info{1, mb     , mb * 2     , 0     }));
+  PCAS_CHECK(block_index_info(mb * 3    , mb * 12    , 4) == (block_info{3, mb * 3 , mb * 4     , 0     }));
+  PCAS_CHECK(block_index_info(mb * 5 + 2, mb * 12    , 4) == (block_info{1, mb * 5 , mb * 6     , mb + 2}));
+  PCAS_CHECK(block_index_info(mb * 11   , mb * 12 - 1, 4) == (block_info{3, mb * 11, mb * 12 - 1, mb * 2}));
+}
+
 }
 }
