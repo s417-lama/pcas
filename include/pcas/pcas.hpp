@@ -230,7 +230,12 @@ public:
       flushing_wins_.clear();
 
       cache_.for_each_block([&](cache_t::entry_t cae) {
-        if (cae && cae->flushing) cae->flushing = false;
+        if (cae && cae->flushing) {
+          cae->flushing = false;
+          if (cache_.is_evictable(cae)) {
+            cache_.set_evictable(cae);
+          }
+        }
       });
     }
   }
@@ -755,7 +760,18 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     auto cae = obe.cache_entries[b];
     if (cae) {
       uint64_t vm_offset = b * cache_t::block_size;
-      cache_.checkout(cae, b >= cache_entry_e);
+      try {
+        cache_.checkout(cae, b >= cache_entry_e);
+      } catch (cache_full_exception& e) {
+        complete_flush();
+        flush_dirty_cache();
+        complete_flush();
+        try {
+          cache_.checkout(cae, b >= cache_entry_e);
+        } catch (cache_full_exception& e) {
+          die("cache is exhausted (too many objects are being checked out)");
+        }
+      }
 
       if (cae->state == cache_t::state_t::evicted) {
         cae->vm_addr = (uint8_t*)obe.vm.addr() + vm_offset;
@@ -959,7 +975,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
   int rank = pc.rank();
   int nproc = pc.nproc();
 
-  int n = 100000;
+  int n = 10000000;
 
   global_ptr<int> ps[2];
   ps[0] = pc.malloc<int>(n);

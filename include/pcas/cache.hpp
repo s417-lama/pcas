@@ -17,6 +17,8 @@
 
 namespace pcas {
 
+class cache_full_exception : public std::exception {};
+
 template <uint64_t BlockSize>
 class cache_system {
   static_assert(BlockSize % min_block_size == 0);
@@ -50,16 +52,30 @@ public:
   // FIXME: not used inside this class
   static constexpr uint64_t block_size = BlockSize;
 
+  bool is_evictable(entry_t e) {
+    return e && e->checkout_count == 0 && !e->flushing && e->dirty_sections.empty();
+  }
+
+  void set_evictable(entry_t e) {
+    PCAS_CHECK(is_evictable(e));
+    PCAS_CHECK(e->lru_it == lru_.end());
+    lru_.push_front(e);
+    e->lru_it = lru_.begin();
+  }
+
+  void unset_evictable(entry_t e) {
+    if (e->lru_it != lru_.end()) {
+      lru_.erase(e->lru_it);
+      e->lru_it = lru_.end();
+    }
+  }
+
 private:
   physical_mem         pm_;
   uint64_t             size_;
   block_num_t          nblocks_;
   std::vector<entry_t> cache_map_;
   std::list<entry_t>   lru_; // contains only evictable entries
-
-  bool is_evictable(entry_t e) {
-    return e && e->checkout_count == 0 && !e->flushing && e->dirty_sections.empty();
-  }
 
   void invalidate(block_num_t b) {
     PCAS_CHECK(b < nblocks_);
@@ -71,7 +87,7 @@ private:
 
   block_num_t evict_one() {
     if (lru_.empty()) {
-      die("cache is exhausted (too many objects are being checked out)");
+      throw cache_full_exception{};
     }
     entry_t e = lru_.back();
     lru_.pop_back();
@@ -98,10 +114,7 @@ private:
       }
       if (e->state == state_t::invalid) {
         e->state = state_t::evicted;
-        if (e->lru_it != lru_.end()) {
-          lru_.erase(e->lru_it);
-          e->lru_it = lru_.end();
-        }
+        unset_evictable(e);
         return b;
       }
     }
@@ -133,24 +146,19 @@ public:
 
   void free_entry(entry_t e) {
     PCAS_CHECK(e);
+    PCAS_CHECK(e->checkout_count == 0);
     PCAS_CHECK(e->dirty_sections.empty());
     block_num_t b = e->block_num;
     if (b < nblocks_ && cache_map_[b] == e) {
-      PCAS_CHECK(e->checkout_count == 0);
       virtual_mem::unmap(e->vm_addr, BlockSize);
       cache_map_[b] = nullptr;
     }
-    if (e->lru_it != lru_.end()) {
-      lru_.erase(e->lru_it);
-    }
+    unset_evictable(e);
     delete e;
   }
 
   bool checkout(entry_t e, bool prefetch = false) {
     PCAS_CHECK(e);
-    if (!prefetch) {
-      e->checkout_count++;
-    }
     bool hit;
     switch (e->state) {
       case state_t::evicted: {
@@ -168,27 +176,22 @@ public:
         PCAS_CHECK(e->block_num < nblocks_);
         PCAS_CHECK(cache_map_[e->block_num] == e);
         PCAS_CHECK(e->dirty_sections.empty());
-        if (e->lru_it != lru_.end()) {
-          lru_.erase(e->lru_it);
-          e->lru_it = lru_.end();
-        }
+        unset_evictable(e);
         hit = false;
         break;
       }
       default: {
         // cache hit
-        if (e->lru_it != lru_.end()) {
-          lru_.erase(e->lru_it);
-          e->lru_it = lru_.end();
-        }
+        unset_evictable(e);
         hit = true;
         break;
       }
     }
+    if (!prefetch) {
+      e->checkout_count++;
+    }
     if (prefetch && is_evictable(e)) {
-      PCAS_CHECK(e->lru_it == lru_.end());
-      lru_.push_front(e);
-      e->lru_it = lru_.begin();
+      set_evictable(e);
     }
     return hit;
   }
@@ -199,9 +202,7 @@ public:
     PCAS_CHECK(e->state == state_t::valid);
     e->checkout_count--;
     if (is_evictable(e)) {
-      PCAS_CHECK(e->lru_it == lru_.end());
-      lru_.push_front(e);
-      e->lru_it = lru_.begin();
+      set_evictable(e);
     }
   }
 
