@@ -64,8 +64,6 @@ inline void die(const char* fmt, ...) {
   exit(1);
 }
 
-constexpr uint64_t min_block_size = 65536;
-
 template <typename T>
 inline T get_env_(const char* env_var, T default_val) {
   if (const char* val_str = std::getenv(env_var)) {

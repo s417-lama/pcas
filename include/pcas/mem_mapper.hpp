@@ -39,14 +39,15 @@ public:
   virtual block_info get_block_info(uint64_t offset) = 0;
 };
 
+template <uint64_t BlockSize>
 class block : public base {
 public:
   using base::base;
 
   uint64_t get_local_size(int rank [[maybe_unused]]) {
-    uint64_t nblock_g = (size_ + min_block_size - 1) / min_block_size;
+    uint64_t nblock_g = (size_ + BlockSize - 1) / BlockSize;
     uint64_t nblock_l = (nblock_g + nproc_ - 1) / nproc_;
-    return nblock_l * min_block_size;
+    return nblock_l * BlockSize;
   }
 
   uint64_t get_effective_size() {
@@ -65,42 +66,44 @@ public:
 };
 
 PCAS_TEST_CASE("[pcas::mem_mapper::block] calculate local block size") {
+  constexpr uint64_t bs = 65536;
   auto local_block_size = [](uint64_t size, int nproc) -> uint64_t {
-    return block(size, nproc).get_local_size(0);
+    return block<bs>(size, nproc).get_local_size(0);
   };
-  PCAS_CHECK(local_block_size(min_block_size * 4     , 4) == min_block_size    );
-  PCAS_CHECK(local_block_size(min_block_size * 12    , 4) == min_block_size * 3);
-  PCAS_CHECK(local_block_size(min_block_size * 13    , 4) == min_block_size * 4);
-  PCAS_CHECK(local_block_size(min_block_size * 12 + 1, 4) == min_block_size * 4);
-  PCAS_CHECK(local_block_size(min_block_size * 12 - 1, 4) == min_block_size * 3);
-  PCAS_CHECK(local_block_size(1                      , 4) == min_block_size    );
-  PCAS_CHECK(local_block_size(1                      , 1) == min_block_size    );
-  PCAS_CHECK(local_block_size(min_block_size * 3     , 1) == min_block_size * 3);
+  PCAS_CHECK(local_block_size(bs * 4     , 4) == bs    );
+  PCAS_CHECK(local_block_size(bs * 12    , 4) == bs * 3);
+  PCAS_CHECK(local_block_size(bs * 13    , 4) == bs * 4);
+  PCAS_CHECK(local_block_size(bs * 12 + 1, 4) == bs * 4);
+  PCAS_CHECK(local_block_size(bs * 12 - 1, 4) == bs * 3);
+  PCAS_CHECK(local_block_size(1          , 4) == bs    );
+  PCAS_CHECK(local_block_size(1          , 1) == bs    );
+  PCAS_CHECK(local_block_size(bs * 3     , 1) == bs * 3);
 }
 
 PCAS_TEST_CASE("[pcas::mem_mapper::block] get block information at specified offset") {
+  constexpr uint64_t bs = 65536;
   auto block_index_info = [](uint64_t offset, uint64_t size, int nproc) -> block_info {
-    return block(size, nproc).get_block_info(offset);
+    return block<bs>(size, nproc).get_block_info(offset);
   };
-  uint64_t mb = min_block_size;
-  PCAS_CHECK(block_index_info(0         , mb * 4     , 4) == (block_info{0, 0     , mb         , 0     }));
-  PCAS_CHECK(block_index_info(mb        , mb * 4     , 4) == (block_info{1, mb    , mb * 2     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 2    , mb * 4     , 4) == (block_info{2, mb * 2, mb * 3     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 3    , mb * 4     , 4) == (block_info{3, mb * 3, mb * 4     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 4 - 1, mb * 4     , 4) == (block_info{3, mb * 3, mb * 4     , mb - 1}));
-  PCAS_CHECK(block_index_info(0         , mb * 12    , 4) == (block_info{0, 0     , mb * 3     , 0     }));
-  PCAS_CHECK(block_index_info(mb        , mb * 12    , 4) == (block_info{0, 0     , mb * 3     , mb    }));
-  PCAS_CHECK(block_index_info(mb * 3    , mb * 12    , 4) == (block_info{1, mb * 3, mb * 6     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 11   , mb * 12 - 1, 4) == (block_info{3, mb * 9, mb * 12 - 1, mb * 2}));
+  PCAS_CHECK(block_index_info(0         , bs * 4     , 4) == (block_info{0, 0     , bs         , 0     }));
+  PCAS_CHECK(block_index_info(bs        , bs * 4     , 4) == (block_info{1, bs    , bs * 2     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 2    , bs * 4     , 4) == (block_info{2, bs * 2, bs * 3     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 3    , bs * 4     , 4) == (block_info{3, bs * 3, bs * 4     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 4 - 1, bs * 4     , 4) == (block_info{3, bs * 3, bs * 4     , bs - 1}));
+  PCAS_CHECK(block_index_info(0         , bs * 12    , 4) == (block_info{0, 0     , bs * 3     , 0     }));
+  PCAS_CHECK(block_index_info(bs        , bs * 12    , 4) == (block_info{0, 0     , bs * 3     , bs    }));
+  PCAS_CHECK(block_index_info(bs * 3    , bs * 12    , 4) == (block_info{1, bs * 3, bs * 6     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 11   , bs * 12 - 1, 4) == (block_info{3, bs * 9, bs * 12 - 1, bs * 2}));
 }
 
+template <uint64_t BlockSize>
 class cyclic : public base {
   size_t block_size_;
 
 public:
-  cyclic(uint64_t size, int nproc, size_t block_size) : base(size, nproc), block_size_(block_size) {
-    PCAS_CHECK(block_size >= min_block_size);
-    PCAS_CHECK(block_size % min_block_size == 0);
+  cyclic(uint64_t size, int nproc, size_t block_size = BlockSize) : base(size, nproc), block_size_(block_size) {
+    PCAS_CHECK(block_size >= BlockSize);
+    PCAS_CHECK(block_size % BlockSize == 0);
   }
 
   uint64_t get_local_size(int rank [[maybe_unused]]) {
@@ -126,35 +129,37 @@ public:
 };
 
 PCAS_TEST_CASE("[pcas::mem_mapper::cyclic] calculate local block size") {
-  uint64_t mb = min_block_size * 2;
+  constexpr uint64_t mb = 65536;
+  uint64_t bs = mb * 2;
   auto local_block_size = [=](uint64_t size, int nproc) -> uint64_t {
-    return cyclic(size, nproc, mb).get_local_size(0);
+    return cyclic<mb>(size, nproc, bs).get_local_size(0);
   };
-  PCAS_CHECK(local_block_size(mb * 4     , 4) == mb    );
-  PCAS_CHECK(local_block_size(mb * 12    , 4) == mb * 3);
-  PCAS_CHECK(local_block_size(mb * 13    , 4) == mb * 4);
-  PCAS_CHECK(local_block_size(mb * 12 + 1, 4) == mb * 4);
-  PCAS_CHECK(local_block_size(mb * 12 - 1, 4) == mb * 3);
-  PCAS_CHECK(local_block_size(1          , 4) == mb    );
-  PCAS_CHECK(local_block_size(1          , 1) == mb    );
-  PCAS_CHECK(local_block_size(mb * 3     , 1) == mb * 3);
+  PCAS_CHECK(local_block_size(bs * 4     , 4) == bs    );
+  PCAS_CHECK(local_block_size(bs * 12    , 4) == bs * 3);
+  PCAS_CHECK(local_block_size(bs * 13    , 4) == bs * 4);
+  PCAS_CHECK(local_block_size(bs * 12 + 1, 4) == bs * 4);
+  PCAS_CHECK(local_block_size(bs * 12 - 1, 4) == bs * 3);
+  PCAS_CHECK(local_block_size(1          , 4) == bs    );
+  PCAS_CHECK(local_block_size(1          , 1) == bs    );
+  PCAS_CHECK(local_block_size(bs * 3     , 1) == bs * 3);
 }
 
 PCAS_TEST_CASE("[pcas::mem_mapper::cyclic] get block information at specified offset") {
-  uint64_t mb = min_block_size * 2;
+  constexpr uint64_t mb = 65536;
+  uint64_t bs = mb * 2;
   auto block_index_info = [=](uint64_t offset, uint64_t size, int nproc) -> block_info {
-    return cyclic(size, nproc, mb).get_block_info(offset);
+    return cyclic<mb>(size, nproc, bs).get_block_info(offset);
   };
-  PCAS_CHECK(block_index_info(0         , mb * 4     , 4) == (block_info{0, 0      , mb         , 0     }));
-  PCAS_CHECK(block_index_info(mb        , mb * 4     , 4) == (block_info{1, mb     , mb * 2     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 2    , mb * 4     , 4) == (block_info{2, mb * 2 , mb * 3     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 3    , mb * 4     , 4) == (block_info{3, mb * 3 , mb * 4     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 4 - 1, mb * 4     , 4) == (block_info{3, mb * 3 , mb * 4     , mb - 1}));
-  PCAS_CHECK(block_index_info(0         , mb * 12    , 4) == (block_info{0, 0      , mb         , 0     }));
-  PCAS_CHECK(block_index_info(mb        , mb * 12    , 4) == (block_info{1, mb     , mb * 2     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 3    , mb * 12    , 4) == (block_info{3, mb * 3 , mb * 4     , 0     }));
-  PCAS_CHECK(block_index_info(mb * 5 + 2, mb * 12    , 4) == (block_info{1, mb * 5 , mb * 6     , mb + 2}));
-  PCAS_CHECK(block_index_info(mb * 11   , mb * 12 - 1, 4) == (block_info{3, mb * 11, mb * 12 - 1, mb * 2}));
+  PCAS_CHECK(block_index_info(0         , bs * 4     , 4) == (block_info{0, 0      , bs         , 0     }));
+  PCAS_CHECK(block_index_info(bs        , bs * 4     , 4) == (block_info{1, bs     , bs * 2     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 2    , bs * 4     , 4) == (block_info{2, bs * 2 , bs * 3     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 3    , bs * 4     , 4) == (block_info{3, bs * 3 , bs * 4     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 4 - 1, bs * 4     , 4) == (block_info{3, bs * 3 , bs * 4     , bs - 1}));
+  PCAS_CHECK(block_index_info(0         , bs * 12    , 4) == (block_info{0, 0      , bs         , 0     }));
+  PCAS_CHECK(block_index_info(bs        , bs * 12    , 4) == (block_info{1, bs     , bs * 2     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 3    , bs * 12    , 4) == (block_info{3, bs * 3 , bs * 4     , 0     }));
+  PCAS_CHECK(block_index_info(bs * 5 + 2, bs * 12    , 4) == (block_info{1, bs * 5 , bs * 6     , bs + 2}));
+  PCAS_CHECK(block_index_info(bs * 11   , bs * 12 - 1, 4) == (block_info{3, bs * 11, bs * 12 - 1, bs * 2}));
 }
 
 }

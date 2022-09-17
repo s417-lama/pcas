@@ -19,43 +19,13 @@
 
 namespace pcas {
 
-using cache_t = cache_system<min_block_size>;
-
-struct obj_entry {
-  int                                   owner;
-  obj_id_t                              id;
-  uint64_t                              size;
-  uint64_t                              effective_size;
-  std::unique_ptr<mem_mapper::base>     mmapper;
-  std::unordered_map<int, physical_mem> pms;
-  virtual_mem                           vm;
-  std::vector<cache_t::entry_t>         cache_entries;
-  MPI_Win                               win;
-};
-
 enum class access_mode {
   read,
   write,
   read_write,
 };
 
-struct checkout_entry {
-  global_ptr<uint8_t> ptr;
-  access_mode         mode;
-  uint64_t            count;
-};
-
 using epoch_t = uint64_t;
-
-struct release_remote_region {
-  epoch_t request; // requested epoch from remote
-  epoch_t epoch; // current epoch of the owner
-};
-
-struct release_manager {
-  release_remote_region* remote;
-  MPI_Win win;
-};
 
 struct release_handler {
   int rank;
@@ -67,6 +37,7 @@ struct policy_default {
   using logger_kind_t = logger::kind;
   template <typename P>
   using logger_impl_t = logger::impl_dummy<P>;
+  constexpr static uint64_t block_size = 65536;
 };
 
 template <typename P>
@@ -76,6 +47,37 @@ using pcas = pcas_if<policy_default>;
 
 template <typename P>
 class pcas_if {
+  using cache_t = cache_system<P::block_size>;
+  using cache_entry_t = typename cache_t::entry_t;
+
+  struct obj_entry {
+    int                                   owner;
+    obj_id_t                              id;
+    uint64_t                              size;
+    uint64_t                              effective_size;
+    std::unique_ptr<mem_mapper::base>     mmapper;
+    std::unordered_map<int, physical_mem> pms;
+    virtual_mem                           vm;
+    std::vector<cache_entry_t>            cache_entries;
+    MPI_Win                               win;
+  };
+
+  struct checkout_entry {
+    global_ptr<uint8_t> ptr;
+    access_mode         mode;
+    uint64_t            count;
+  };
+
+  struct release_remote_region {
+    epoch_t request; // requested epoch from remote
+    epoch_t epoch; // current epoch of the owner
+  };
+
+  struct release_manager {
+    release_remote_region* remote;
+    MPI_Win win;
+  };
+
   int      global_rank_  = -1;
   int      global_nproc_ = -1;
   MPI_Comm global_comm_;
@@ -154,14 +156,14 @@ class pcas_if {
     return ret;
   }
 
-  void fetch_begin(cache_t::entry_t cae, obj_entry& obe, int owner, size_t owner_disp) {
+  void fetch_begin(cache_entry_t cae, obj_entry& obe, int owner, size_t owner_disp) {
     void* cache_block_ptr = cache_.pm().anon_vm_addr();
     int count = 0;
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
-         sections_inverse(cae->partial_sections, {0, cache_t::block_size})) {
+         sections_inverse(cae->partial_sections, {0, block_size})) {
       MPI_Request req;
-      MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
+      MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * block_size + offset_in_block_b,
                offset_in_block_e - offset_in_block_b,
                MPI_UINT8_T,
                owner,
@@ -186,7 +188,9 @@ public:
   using logger = typename logger::template logger_if<logger::policy<P>>;
   using logger_kind = typename P::logger_kind_t::value;
 
-  pcas_if(uint64_t cache_size = 1024 * min_block_size, MPI_Comm comm = MPI_COMM_WORLD);
+  constexpr static uint64_t block_size = P::block_size;
+
+  pcas_if(uint64_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
   ~pcas_if();
 
   int rank() const { return global_rank_; }
@@ -194,7 +198,7 @@ public:
 
   void flush_dirty_cache() {
     if (cache_dirty_) {
-      cache_.for_each_block([&](cache_t::entry_t cae) {
+      cache_.for_each_block([&](cache_entry_t cae) {
         if (cae && !cae->dirty_sections.empty()) {
           PCAS_CHECK(!cae->flushing);
 
@@ -204,7 +208,7 @@ public:
           auto bi = obe.mmapper->get_block_info(vm_offset);
 
           for (auto [offset_in_block_b, offset_in_block_e] : cae->dirty_sections) {
-            MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * cache_t::block_size + offset_in_block_b,
+            MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * block_size + offset_in_block_b,
                     offset_in_block_e - offset_in_block_b,
                     MPI_UINT8_T,
                     bi.owner,
@@ -230,7 +234,7 @@ public:
       }
       flushing_wins_.clear();
 
-      cache_.for_each_block([&](cache_t::entry_t cae) {
+      cache_.for_each_block([&](cache_entry_t cae) {
         if (cae && cae->flushing) {
           cae->flushing = false;
           if (cache_.is_evictable(cae)) {
@@ -332,7 +336,7 @@ public:
     }
   }
 
-  template <typename T, typename MemMapper = mem_mapper::block, typename... MemMapperArgs>
+  template <typename T, template<uint64_t> typename MemMapper = mem_mapper::cyclic, typename... MemMapperArgs>
   inline global_ptr<T> malloc(uint64_t         nelems,
                               MemMapperArgs... mmargs);
 
@@ -406,7 +410,7 @@ PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
 }
 
 template <typename P>
-template <typename T, typename MemMapper, typename... MemMapperArgs>
+template <typename T, template<uint64_t> typename MemMapper, typename... MemMapperArgs>
 inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
                                         MemMapperArgs... mmargs) {
   if (nelems == 0) {
@@ -415,7 +419,8 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
 
   uint64_t size = nelems * sizeof(T);
 
-  std::unique_ptr<MemMapper> mmapper(new MemMapper(size, global_nproc_, mmargs...));
+  std::unique_ptr<MemMapper<block_size>> mmapper(
+    new MemMapper<block_size>(size, global_nproc_, mmargs...));
 
   uint64_t local_size = mmapper->get_local_size(global_rank_);
   uint64_t effective_size = mmapper->get_effective_size();
@@ -446,12 +451,12 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
     }
   }
 
-  std::vector<cache_t::entry_t> cache_entries;
-  for (uint64_t b = 0; b < effective_size / cache_t::block_size; b++) {
-    auto bi = mmapper->get_block_info(b * cache_t::block_size);
+  std::vector<cache_entry_t> cache_entries;
+  for (uint64_t b = 0; b < effective_size / block_size; b++) {
+    auto bi = mmapper->get_block_info(b * block_size);
     if (bi.owner == global_rank_ ||
         (enable_shared_memory_ && process_map_[bi.owner].second == inter_rank_)) {
-      vm.map_physical_mem(b * cache_t::block_size, bi.pm_offset, cache_t::block_size, pms[bi.owner]);
+      vm.map_physical_mem(b * block_size, bi.pm_offset, block_size, pms[bi.owner]);
       cache_entries.push_back(nullptr);
     } else {
       cache_entries.push_back(cache_.alloc_entry(obj_id));
@@ -495,14 +500,14 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
   int n = 10;
   PCAS_SUBCASE("free immediately") {
     for (int i = 1; i < n; i++) {
-      auto p = pc.malloc<int>(i * 1234);
+      auto p = pc.malloc<int, mem_mapper::block>(i * 1234);
       pc.free(p);
     }
   }
   PCAS_SUBCASE("free after accumulation") {
     global_ptr<int> ptrs[n];
     for (int i = 1; i < n; i++) {
-      ptrs[i] = pc.malloc<int>(i * 2743);
+      ptrs[i] = pc.malloc<int, mem_mapper::block>(i * 2743);
     }
     for (int i = 1; i < n; i++) {
       pc.free(ptrs[i]);
@@ -515,14 +520,14 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with cyclic policy") {
   int n = 10;
   PCAS_SUBCASE("free immediately") {
     for (int i = 1; i < n; i++) {
-      auto p = pc.malloc<int, mem_mapper::cyclic>(i * 123456, min_block_size);
+      auto p = pc.malloc<int, mem_mapper::cyclic>(i * 123456);
       pc.free(p);
     }
   }
   PCAS_SUBCASE("free after accumulation") {
     global_ptr<int> ptrs[n];
     for (int i = 1; i < n; i++) {
-      ptrs[i] = pc.malloc<int, mem_mapper::cyclic>(i * 27438, min_block_size * i);
+      ptrs[i] = pc.malloc<int, mem_mapper::cyclic>(i * 27438, pcas::block_size * i);
     }
     for (int i = 1; i < n; i++) {
       pc.free(ptrs[i]);
@@ -558,7 +563,7 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
   int nproc = pc.nproc();
 
   int n = 100000;
-  auto p = pc.malloc<int>(n);
+  auto p = pc.malloc<int, mem_mapper::block>(n);
 
   PCAS_SUBCASE("loop over the entire array") {
     int prev_owner = -1;
@@ -581,7 +586,7 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
     int e = n / 5 * 4;
     int s = e - b;
 
-    mem_mapper::block mmapper{n * sizeof(int), nproc};
+    mem_mapper::block<pcas::block_size> mmapper{n * sizeof(int), nproc};
     int o1 = mmapper.get_block_info(b * sizeof(int)).owner;
     int o2 = mmapper.get_block_info(e * sizeof(int)).owner;
 
@@ -671,8 +676,8 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
   int n = 1000000;
 
   global_ptr<int> ps[2];
-  ps[0] = pc.malloc<int>(n);
-  ps[1] = pc.malloc<int, mem_mapper::cyclic>(n, min_block_size);
+  ps[0] = pc.malloc<int, mem_mapper::block >(n);
+  ps[1] = pc.malloc<int, mem_mapper::cyclic>(n);
 
   int* buf = new int[n + 2];
 
@@ -744,21 +749,20 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
   obj_entry& obe = objs_[ptr.id()];
 
-  std::vector<cache_t::entry_t> remapped_entries;
+  std::vector<cache_entry_t> remapped_entries;
 
-  uint64_t cache_entry_b = ptr.offset() / cache_t::block_size;
-  uint64_t cache_entry_e =
-    (ptr.offset() + size + cache_t::block_size - 1) / cache_t::block_size;
+  uint64_t cache_entry_b = ptr.offset() / block_size;
+  uint64_t cache_entry_e = (ptr.offset() + size + block_size - 1) / block_size;
 
   int n_prefetch = Mode == access_mode::write ? 0 : n_prefetch_;
-  uint64_t cmax = obe.effective_size / cache_t::block_size;
+  uint64_t cmax = obe.effective_size / block_size;
 
-  section block_section{0, cache_t::block_size};
+  section block_section{0, block_size};
 
   for (uint64_t b = cache_entry_b; b < std::min(cache_entry_e + n_prefetch, cmax); b++) {
     auto cae = obe.cache_entries[b];
     if (cae) {
-      uint64_t vm_offset = b * cache_t::block_size;
+      uint64_t vm_offset = b * block_size;
       try {
         cache_.checkout(cae, b >= cache_entry_e);
       } catch (cache_full_exception& e) {
@@ -788,10 +792,10 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       // If only a part of the block is written, we need to fetch the block
       // when this block is checked out again with read access mode.
       if (Mode == access_mode::write) {
-        uint64_t offset_in_block_b = (ptr.offset() > b * cache_t::block_size) ?
-                                     ptr.offset() - b * cache_t::block_size : 0;
-        uint64_t offset_in_block_e = (ptr.offset() + size < (b + 1) * cache_t::block_size) ?
-                                     ptr.offset() + size - b * cache_t::block_size : cache_t::block_size;
+        uint64_t offset_in_block_b = (ptr.offset() > b * block_size) ?
+                                     ptr.offset() - b * block_size : 0;
+        uint64_t offset_in_block_e = (ptr.offset() + size < (b + 1) * block_size) ?
+                                     ptr.offset() + size - b * block_size : block_size;
         sections_insert(cae->partial_sections, {offset_in_block_b, offset_in_block_e});
       }
 
@@ -802,8 +806,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
       // has been already fetched or not.
       if (Mode != access_mode::write) {
-        // TODO: fix the assumption cache_t::block_size == min_block_size
-        auto bi = obe.mmapper->get_block_info(b * cache_t::block_size);
+        auto bi = obe.mmapper->get_block_info(b * block_size);
 
         fetch_begin(cae, obe, bi.owner, bi.pm_offset);
 
@@ -823,9 +826,9 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     auto prev_cae = cae->prev_entry;
     if (prev_cae && prev_cae->state == cache_t::state_t::evicted) {
       cae->prev_entry = nullptr;
-      virtual_mem::mmap_no_physical_mem(prev_cae->vm_addr, cache_t::block_size);
+      virtual_mem::mmap_no_physical_mem(prev_cae->vm_addr, block_size);
     }
-    cache_.pm().map(cae->vm_addr, cae->block_num * cache_t::block_size, cache_t::block_size);
+    cache_.pm().map(cae->vm_addr, cae->block_num * block_size, block_size);
   }
 
   std::vector<MPI_Request> reqs;
@@ -877,9 +880,8 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
   checkout_entry che = c->second;
   obj_entry& obe = objs_[che.ptr.id()];
 
-  uint64_t cache_entry_b = che.ptr.offset() / cache_t::block_size;
-  uint64_t cache_entry_e =
-    (che.ptr.offset() + size + cache_t::block_size - 1) / cache_t::block_size;
+  uint64_t cache_entry_b = che.ptr.offset() / block_size;
+  uint64_t cache_entry_e = (che.ptr.offset() + size + block_size - 1) / block_size;
 
   if (che.mode == access_mode::read_write ||
       che.mode == access_mode::write) {
@@ -887,10 +889,10 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
       auto cae = obe.cache_entries[b];
       if (cae) {
         n_dirty_cache_blocks_ += cae->dirty_sections.empty();
-        uint64_t offset_in_block_b = (che.ptr.offset() > b * cache_t::block_size) ?
-                                     che.ptr.offset() - b * cache_t::block_size : 0;
-        uint64_t offset_in_block_e = (che.ptr.offset() + size < (b + 1) * cache_t::block_size) ?
-                                     che.ptr.offset() + size - b * cache_t::block_size : cache_t::block_size;
+        uint64_t offset_in_block_b = (che.ptr.offset() > b * block_size) ?
+                                     che.ptr.offset() - b * block_size : 0;
+        uint64_t offset_in_block_e = (che.ptr.offset() + size < (b + 1) * block_size) ?
+                                     che.ptr.offset() + size - b * block_size : block_size;
         sections_insert(cae->dirty_sections, {offset_in_block_b, offset_in_block_e});
         cache_dirty_ = true;
       }
@@ -915,14 +917,14 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
   int rank = pc.rank();
   int nproc = pc.nproc();
 
-  int n = min_block_size * nproc;
+  int n = pcas::block_size * nproc;
   global_ptr<uint8_t> ps[2];
-  ps[0] = pc.malloc<uint8_t>(n);
-  ps[1] = pc.malloc<uint8_t, mem_mapper::cyclic>(n, min_block_size);
+  ps[0] = pc.malloc<uint8_t, mem_mapper::block >(n);
+  ps[1] = pc.malloc<uint8_t, mem_mapper::cyclic>(n);
 
   for (auto p : ps) {
     uint8_t* home_ptr = (uint8_t*)pc.get_physical_mem(p);
-    for (uint64_t i = 0; i < min_block_size; i++) {
+    for (uint64_t i = 0; i < pcas::block_size; i++) {
       home_ptr[i] = rank;
     }
 
@@ -931,7 +933,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
     PCAS_SUBCASE("read the entire array") {
       const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
       for (int i = 0; i < n; i++) {
-        PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size, "rank: ", rank, ", i: ", i);
+        PCAS_CHECK_MESSAGE(rp[i] == i / pcas::block_size, "rank: ", rank, ", i: ", i);
       }
       pc.checkin(rp, n);
     }
@@ -941,7 +943,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
         if (it == rank) {
           uint8_t* rp = pc.checkout<access_mode::read_write>(p, n);
           for (int i = 0; i < n; i++) {
-            PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it, "it: ", it, ", rank: ", rank, ", i: ", i);
+            PCAS_CHECK_MESSAGE(rp[i] == i / pcas::block_size + it, "it: ", it, ", rank: ", rank, ", i: ", i);
             rp[i]++;
           }
           pc.checkin(rp, n);
@@ -950,7 +952,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
 
         const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
         for (int i = 0; i < n; i++) {
-          PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it + 1, "it: ", it, ", rank: ", rank, ", i: ", i);
+          PCAS_CHECK_MESSAGE(rp[i] == i / pcas::block_size + it + 1, "it: ", it, ", rank: ", rank, ", i: ", i);
         }
         pc.checkin(rp, n);
 
@@ -965,7 +967,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
 
       const uint8_t* rp = pc.checkout<access_mode::read>(p + ib, s);
       for (int i = 0; i < s; i++) {
-        PCAS_CHECK_MESSAGE(rp[i] == (i + ib) / min_block_size, "rank: ", rank, ", i: ", i);
+        PCAS_CHECK_MESSAGE(rp[i] == (i + ib) / pcas::block_size, "rank: ", rank, ", i: ", i);
       }
       pc.checkin(rp, s);
     }
@@ -976,7 +978,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
 }
 
 PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
-  pcas pc(16 * min_block_size);
+  pcas pc(16 * pcas::block_size);
 
   int rank = pc.rank();
   int nproc = pc.nproc();
@@ -984,10 +986,10 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
   int n = 10000000;
 
   global_ptr<int> ps[2];
-  ps[0] = pc.malloc<int>(n);
-  ps[1] = pc.malloc<int, mem_mapper::cyclic>(n, min_block_size);
+  ps[0] = pc.malloc<int, mem_mapper::block >(n);
+  ps[1] = pc.malloc<int, mem_mapper::cyclic>(n);
 
-  int max_checkout_size = (16 - 2) * min_block_size / sizeof(int);
+  int max_checkout_size = (16 - 2) * pcas::block_size / sizeof(int);
 
   for (auto p : ps) {
     if (rank == 0) {

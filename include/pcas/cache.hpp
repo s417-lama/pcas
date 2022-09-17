@@ -21,8 +21,6 @@ class cache_full_exception : public std::exception {};
 
 template <uint64_t BlockSize>
 class cache_system {
-  static_assert(BlockSize % min_block_size == 0);
-
 public:
   using block_num_t = uint64_t;
 
@@ -48,9 +46,6 @@ public:
   };
 
   using entry_t = entry*;
-
-  // FIXME: not used inside this class
-  static constexpr uint64_t block_size = BlockSize;
 
   bool is_evictable(entry_t e) {
     return e && e->checkout_count == 0 && !e->flushing && e->dirty_sections.empty();
@@ -124,6 +119,12 @@ private:
 public:
   cache_system(uint64_t size, int intra_rank) : size_(size) {
     PCAS_CHECK(size % BlockSize == 0);
+
+    uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
+    if (BlockSize == 0 || BlockSize % pagesize != 0) {
+      die("The block size (specified: %ld) must be multiple of the page size (%ld).", BlockSize, pagesize);
+    }
+
     nblocks_ = size / BlockSize;
     pm_ = physical_mem(size, 0, intra_rank, true, true);
     cache_map_ = std::vector<entry*>(nblocks_, nullptr);
@@ -237,6 +238,7 @@ public:
 
 PCAS_TEST_CASE("[pcas::cache] testing cache system") {
   int nblk = 100;
+  constexpr uint64_t min_block_size = 65536;
   using cache_t = cache_system<min_block_size>;
   cache_t cs(nblk * min_block_size, -1);
 
