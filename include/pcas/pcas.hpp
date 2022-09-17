@@ -1,6 +1,7 @@
 #pragma once
 
 #include <type_traits>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
@@ -40,9 +41,8 @@ enum class access_mode {
 
 struct checkout_entry {
   global_ptr<uint8_t> ptr;
-  uint8_t*            raw_ptr;
-  uint64_t            size;
   access_mode         mode;
+  uint64_t            count;
 };
 
 using epoch_t = uint64_t;
@@ -94,7 +94,8 @@ class pcas_if {
   obj_id_t obj_id_count_ = 1; // TODO: better management of used IDs
   std::unordered_map<obj_id_t, obj_entry> objs_;
 
-  std::unordered_map<void*, checkout_entry> checkouts_;
+  // FIXME: using map instead of unordered_map because std::pair needs a user-defined hash function
+  std::map<std::pair<void*, uint64_t>, checkout_entry> checkouts_;
 
   cache_t cache_;
 
@@ -352,10 +353,7 @@ public:
   checkout(global_ptr<T> ptr, uint64_t nelems);
 
   template <typename T>
-  void checkin(T* raw_ptr);
-
-  template <typename T>
-  void checkin(const T* raw_ptr);
+  void checkin(T* raw_ptr, uint64_t nelems);
 
   /* unsafe APIs for debugging */
 
@@ -741,7 +739,8 @@ template <typename P>
 template <access_mode Mode, typename T>
 inline std::conditional_t<Mode == access_mode::read, const T*, T*>
 pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
-  auto ev = logger::template record<logger_kind::Checkout>(nelems * sizeof(T));
+  uint64_t size = nelems * sizeof(T);
+  auto ev = logger::template record<logger_kind::Checkout>(size);
 
   obj_entry& obe = objs_[ptr.id()];
 
@@ -749,7 +748,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
   uint64_t cache_entry_b = ptr.offset() / cache_t::block_size;
   uint64_t cache_entry_e =
-    (ptr.offset() + nelems * sizeof(T) + cache_t::block_size - 1) / cache_t::block_size;
+    (ptr.offset() + size + cache_t::block_size - 1) / cache_t::block_size;
 
   int n_prefetch = Mode == access_mode::write ? 0 : n_prefetch_;
   uint64_t cmax = obe.effective_size / cache_t::block_size;
@@ -791,8 +790,8 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       if (Mode == access_mode::write) {
         uint64_t offset_in_block_b = (ptr.offset() > b * cache_t::block_size) ?
                                      ptr.offset() - b * cache_t::block_size : 0;
-        uint64_t offset_in_block_e = (ptr.offset() + nelems * sizeof(T) < (b + 1) * cache_t::block_size) ?
-                                     ptr.offset() + nelems * sizeof(T) - b * cache_t::block_size : cache_t::block_size;
+        uint64_t offset_in_block_e = (ptr.offset() + size < (b + 1) * cache_t::block_size) ?
+                                     ptr.offset() + size - b * cache_t::block_size : cache_t::block_size;
         sections_insert(cae->partial_sections, {offset_in_block_b, offset_in_block_e});
       }
 
@@ -846,22 +845,33 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
   T* ret = (T*)((uint8_t*)obe.vm.addr() + ptr.offset());
 
-  checkouts_[(void*)ret] = (checkout_entry){
-    .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = (uint8_t*)ret,
-    .size = nelems * sizeof(T), .mode = Mode,
-  };
+  auto ckey = std::make_pair((void*)ret, size);
+  auto c = checkouts_.find(ckey);
+  if (c != checkouts_.end()) {
+    // Only read-only access is allowed for overlapped checkout
+    // TODO: dynamic check for conflicting access when the region is overlapped but not the same
+    PCAS_CHECK(c->second.mode == access_mode::read);
+    PCAS_CHECK(Mode == access_mode::read);
+    c->second.count++;
+  } else {
+    checkouts_[ckey] = (checkout_entry){
+      .ptr = static_cast<global_ptr<uint8_t>>(ptr), .mode = Mode, .count = 1,
+    };
+  }
 
   return ret;
 }
 
 template <typename P>
 template <typename T>
-inline void pcas_if<P>::checkin(T* raw_ptr) {
+inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
+  uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkin>();
 
-  auto c = checkouts_.find((void*)raw_ptr);
+  auto ckey = std::make_pair((void*)raw_ptr, size);
+  auto c = checkouts_.find(ckey);
   if (c == checkouts_.end()) {
-    die("The pointer %p passed to checkin() is not registered", raw_ptr);
+    die("The region [%p, %p) passed to checkin() is not registered", raw_ptr, raw_ptr + size);
   }
 
   checkout_entry che = c->second;
@@ -869,7 +879,7 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
 
   uint64_t cache_entry_b = che.ptr.offset() / cache_t::block_size;
   uint64_t cache_entry_e =
-    (che.ptr.offset() + che.size + cache_t::block_size - 1) / cache_t::block_size;
+    (che.ptr.offset() + size + cache_t::block_size - 1) / cache_t::block_size;
 
   if (che.mode == access_mode::read_write ||
       che.mode == access_mode::write) {
@@ -879,8 +889,8 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
         n_dirty_cache_blocks_ += cae->dirty_sections.empty();
         uint64_t offset_in_block_b = (che.ptr.offset() > b * cache_t::block_size) ?
                                      che.ptr.offset() - b * cache_t::block_size : 0;
-        uint64_t offset_in_block_e = (che.ptr.offset() + che.size < (b + 1) * cache_t::block_size) ?
-                                     che.ptr.offset() + che.size - b * cache_t::block_size : cache_t::block_size;
+        uint64_t offset_in_block_e = (che.ptr.offset() + size < (b + 1) * cache_t::block_size) ?
+                                     che.ptr.offset() + size - b * cache_t::block_size : cache_t::block_size;
         sections_insert(cae->dirty_sections, {offset_in_block_b, offset_in_block_e});
         cache_dirty_ = true;
       }
@@ -894,13 +904,9 @@ inline void pcas_if<P>::checkin(T* raw_ptr) {
     }
   }
 
-  checkouts_.erase((void*)raw_ptr);
-}
-
-template <typename P>
-template <typename T>
-inline void pcas_if<P>::checkin(const T* raw_ptr) {
-  checkin(const_cast<T*>(raw_ptr));
+  if (--c->second.count == 0) {
+    checkouts_.erase(ckey);
+  }
 }
 
 PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
@@ -927,7 +933,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
       for (int i = 0; i < n; i++) {
         PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size, "rank: ", rank, ", i: ", i);
       }
-      pc.checkin(rp);
+      pc.checkin(rp, n);
     }
 
     PCAS_SUBCASE("read and write the entire array") {
@@ -938,7 +944,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
             PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it, "it: ", it, ", rank: ", rank, ", i: ", i);
             rp[i]++;
           }
-          pc.checkin(rp);
+          pc.checkin(rp, n);
         }
         pc.barrier();
 
@@ -946,7 +952,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
         for (int i = 0; i < n; i++) {
           PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it + 1, "it: ", it, ", rank: ", rank, ", i: ", i);
         }
-        pc.checkin(rp);
+        pc.checkin(rp, n);
 
         pc.barrier();
       }
@@ -961,7 +967,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
       for (int i = 0; i < s; i++) {
         PCAS_CHECK_MESSAGE(rp[i] == (i + ib) / min_block_size, "rank: ", rank, ", i: ", i);
       }
-      pc.checkin(rp);
+      pc.checkin(rp, s);
     }
   }
 
@@ -991,7 +997,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
         for (int j = 0; j < m; j++) {
           rp[j] = i + j;
         }
-        pc.checkin(rp);
+        pc.checkin(rp, m);
       }
     }
 
@@ -1004,7 +1010,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
         for (int j = 0; j < m; j++) {
           PCAS_CHECK(rp[j] == i + j);
         }
-        pc.checkin(rp);
+        pc.checkin(rp, m);
       }
     }
 
@@ -1019,7 +1025,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
         for (int j = 0; j < m; j++) {
           PCAS_CHECK(rp[j] == i + ib + j);
         }
-        pc.checkin(rp);
+        pc.checkin(rp, m);
       }
     }
 
@@ -1033,7 +1039,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
           PCAS_CHECK(rp[j] == j + i);
           rp[j] *= 2;
         }
-        pc.checkin(rp);
+        pc.checkin(rp, s);
       }
 
       pc.barrier();
@@ -1044,7 +1050,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
         for (int j = 0; j < m; j++) {
           PCAS_CHECK(rp[j] == (i + j) * 2);
         }
-        pc.checkin(rp);
+        pc.checkin(rp, m);
       }
     }
   }
