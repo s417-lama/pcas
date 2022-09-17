@@ -9,7 +9,6 @@
 
 #include "pcas/util.hpp"
 #include "pcas/global_ptr.hpp"
-#include "pcas/local_ptr.hpp"
 #include "pcas/physical_mem.hpp"
 #include "pcas/virtual_mem.hpp"
 #include "pcas/cache.hpp"
@@ -95,8 +94,7 @@ class pcas_if {
   obj_id_t obj_id_count_ = 1; // TODO: better management of used IDs
   std::unordered_map<obj_id_t, obj_entry> objs_;
 
-  checkout_id_t checkout_count_ = 1; // TODO: better management of used IDs
-  std::unordered_map<checkout_id_t, checkout_entry> checkouts_;
+  std::unordered_map<void*, checkout_entry> checkouts_;
 
   cache_t cache_;
 
@@ -350,11 +348,14 @@ public:
   void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
 
   template <access_mode Mode, typename T>
-  std::conditional_t<Mode == access_mode::read, local_ptr<const T>, local_ptr<T>>
+  std::conditional_t<Mode == access_mode::read, const T*, T*>
   checkout(global_ptr<T> ptr, uint64_t nelems);
 
   template <typename T>
-  void checkin(local_ptr<T>&& l_ptr);
+  void checkin(T* raw_ptr);
+
+  template <typename T>
+  void checkin(const T* raw_ptr);
 
   /* unsafe APIs for debugging */
 
@@ -738,7 +739,7 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
 
 template <typename P>
 template <access_mode Mode, typename T>
-inline std::conditional_t<Mode == access_mode::read, local_ptr<const T>, local_ptr<T>>
+inline std::conditional_t<Mode == access_mode::read, const T*, T*>
 pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   auto ev = logger::template record<logger_kind::Checkout>(nelems * sizeof(T));
 
@@ -843,25 +844,24 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
   MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
 
-  checkout_id_t cid = checkout_count_++;
-  T* raw_ptr = (T*)((uint8_t*)obe.vm.addr() + ptr.offset());
+  T* ret = (T*)((uint8_t*)obe.vm.addr() + ptr.offset());
 
-  checkouts_[cid] = (checkout_entry){
-    .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = (uint8_t*)raw_ptr,
+  checkouts_[(void*)ret] = (checkout_entry){
+    .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = (uint8_t*)ret,
     .size = nelems * sizeof(T), .mode = Mode,
   };
 
-  return {cid, raw_ptr};
+  return ret;
 }
 
 template <typename P>
 template <typename T>
-inline void pcas_if<P>::checkin(local_ptr<T>&& l_ptr) {
+inline void pcas_if<P>::checkin(T* raw_ptr) {
   auto ev = logger::template record<logger_kind::Checkin>();
 
-  auto c = checkouts_.find(l_ptr.cid());
+  auto c = checkouts_.find((void*)raw_ptr);
   if (c == checkouts_.end()) {
-    die("The pointer (cid=%d; ptr=%p) passed to checkin() is not registered", l_ptr.cid(), l_ptr.get());
+    die("The pointer %p passed to checkin() is not registered", raw_ptr);
   }
 
   checkout_entry che = c->second;
@@ -894,7 +894,13 @@ inline void pcas_if<P>::checkin(local_ptr<T>&& l_ptr) {
     }
   }
 
-  checkouts_.erase(l_ptr.cid());
+  checkouts_.erase((void*)raw_ptr);
+}
+
+template <typename P>
+template <typename T>
+inline void pcas_if<P>::checkin(const T* raw_ptr) {
+  checkin(const_cast<T*>(raw_ptr));
 }
 
 PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
@@ -917,30 +923,30 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
     pc.barrier();
 
     PCAS_SUBCASE("read the entire array") {
-      local_ptr<const uint8_t> rp = pc.checkout<access_mode::read>(p, n);
+      const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
       for (int i = 0; i < n; i++) {
         PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size, "rank: ", rank, ", i: ", i);
       }
-      pc.checkin(std::move(rp));
+      pc.checkin(rp);
     }
 
     PCAS_SUBCASE("read and write the entire array") {
       for (int it = 0; it < nproc; it++) {
         if (it == rank) {
-          local_ptr<uint8_t> rp = pc.checkout<access_mode::read_write>(p, n);
+          uint8_t* rp = pc.checkout<access_mode::read_write>(p, n);
           for (int i = 0; i < n; i++) {
             PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it, "it: ", it, ", rank: ", rank, ", i: ", i);
             rp[i]++;
           }
-          pc.checkin(std::move(rp));
+          pc.checkin(rp);
         }
         pc.barrier();
 
-        local_ptr<const uint8_t> rp = pc.checkout<access_mode::read>(p, n);
+        const uint8_t* rp = pc.checkout<access_mode::read>(p, n);
         for (int i = 0; i < n; i++) {
           PCAS_CHECK_MESSAGE(rp[i] == i / min_block_size + it + 1, "it: ", it, ", rank: ", rank, ", i: ", i);
         }
-        pc.checkin(std::move(rp));
+        pc.checkin(rp);
 
         pc.barrier();
       }
@@ -951,11 +957,11 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
       int ie = n / 5 * 4;
       int s = ie - ib;
 
-      local_ptr<const uint8_t> rp = pc.checkout<access_mode::read>(p + ib, s);
+      const uint8_t* rp = pc.checkout<access_mode::read>(p + ib, s);
       for (int i = 0; i < s; i++) {
         PCAS_CHECK_MESSAGE(rp[i] == (i + ib) / min_block_size, "rank: ", rank, ", i: ", i);
       }
-      pc.checkin(std::move(rp));
+      pc.checkin(rp);
     }
   }
 
@@ -981,11 +987,11 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
     if (rank == 0) {
       for (int i = 0; i < n; i += max_checkout_size) {
         int m = std::min(max_checkout_size, n - i);
-        local_ptr<int> rp = pc.checkout<access_mode::write>(p + i, m);
+        int* rp = pc.checkout<access_mode::write>(p + i, m);
         for (int j = 0; j < m; j++) {
           rp[j] = i + j;
         }
-        pc.checkin(std::move(rp));
+        pc.checkin(rp);
       }
     }
 
@@ -994,11 +1000,11 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
     PCAS_SUBCASE("read the entire array") {
       for (int i = 0; i < n; i += max_checkout_size) {
         int m = std::min(max_checkout_size, n - i);
-        local_ptr<const int> rp = pc.checkout<access_mode::read>(p + i, m);
+        const int* rp = pc.checkout<access_mode::read>(p + i, m);
         for (int j = 0; j < m; j++) {
           PCAS_CHECK(rp[j] == i + j);
         }
-        pc.checkin(std::move(rp));
+        pc.checkin(rp);
       }
     }
 
@@ -1009,11 +1015,11 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
 
       for (int i = 0; i < s; i += max_checkout_size) {
         int m = std::min(max_checkout_size, s - i);
-        local_ptr<const int> rp = pc.checkout<access_mode::read>(p + ib + i, m);
+        const int* rp = pc.checkout<access_mode::read>(p + ib + i, m);
         for (int j = 0; j < m; j++) {
           PCAS_CHECK(rp[j] == i + ib + j);
         }
-        pc.checkin(std::move(rp));
+        pc.checkin(rp);
       }
     }
 
@@ -1022,23 +1028,23 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
       PCAS_REQUIRE(stride <= max_checkout_size);
       for (int i = rank * stride; i < n; i += nproc * stride) {
         int s = std::min(stride, n - i);
-        local_ptr<int> rp = pc.checkout<access_mode::read_write>(p + i, s);
+        int* rp = pc.checkout<access_mode::read_write>(p + i, s);
         for (int j = 0; j < s; j++) {
           PCAS_CHECK(rp[j] == j + i);
           rp[j] *= 2;
         }
-        pc.checkin(std::move(rp));
+        pc.checkin(rp);
       }
 
       pc.barrier();
 
       for (int i = 0; i < n; i += max_checkout_size) {
         int m = std::min(max_checkout_size, n - i);
-        local_ptr<const int> rp = pc.checkout<access_mode::read>(p + i, m);
+        const int* rp = pc.checkout<access_mode::read>(p + i, m);
         for (int j = 0; j < m; j++) {
           PCAS_CHECK(rp[j] == (i + j) * 2);
         }
-        pc.checkin(std::move(rp));
+        pc.checkin(rp);
       }
     }
   }

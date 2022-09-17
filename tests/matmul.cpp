@@ -14,7 +14,7 @@ auto checkout_stride(pcas::global_ptr<T> ptr,
                      uint64_t            blen,
                      uint64_t            bstride,
                      pcas::pcas&         pc) {
-  std::vector<std::conditional_t<Mode == pcas::access_mode::read, pcas::local_ptr<const T>, pcas::local_ptr<T>>> ret;
+  std::vector<std::conditional_t<Mode == pcas::access_mode::read, const T*, T*>> ret;
   for (uint64_t b = 0; b < bcount; b++) {
     ret.push_back(pc.checkout<Mode>(ptr + b * bstride, blen));
   }
@@ -22,15 +22,13 @@ auto checkout_stride(pcas::global_ptr<T> ptr,
 }
 
 template <typename T>
-void checkin_stride(std::vector<T>& vec, pcas::pcas& pc) {
-  for (auto& p : vec) {
-    pc.checkin(std::move(p));
+void checkin_stride(std::vector<T> vec, pcas::pcas& pc) {
+  for (auto p : vec) {
+    pc.checkin(p);
   }
 }
 
-void matmul_seq(pcas::local_ptr<const real_t>* A,
-                pcas::local_ptr<const real_t>* B,
-                pcas::local_ptr<real_t>* C, uint64_t n) {
+void matmul_seq(const real_t** A, const real_t** B, real_t** C, uint64_t n) {
   for (uint64_t i = 0; i < n; i++) {
     for (uint64_t j = 0; j < n; j++) {
       for (uint64_t k = 0; k < n; k++) {
@@ -86,9 +84,9 @@ void matmul_init(pcas::global_ptr<real_t> A,
       B_[j] = dist(engine);
       C_[j] = 0.0;
     }
-    pc.checkin(std::move(A_));
-    pc.checkin(std::move(B_));
-    pc.checkin(std::move(C_));
+    pc.checkin(A_);
+    pc.checkin(B_);
+    pc.checkin(C_);
   }
 }
 
@@ -113,7 +111,7 @@ void matmul_check(pcas::global_ptr<real_t> A,
       pc.get(B + k * n + j, &b, 1);
       c_ans += A_[k] * b;
     }
-    pc.checkin(std::move(A_));
+    pc.checkin(A_);
 
     real_t c_computed;
     pc.get(C + i * n + j, &c_computed, 1);
