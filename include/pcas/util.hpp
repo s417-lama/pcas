@@ -12,12 +12,13 @@
 
 #ifdef DOCTEST_LIBRARY_INCLUDED
 
-#define PCAS_TEST_CASE(name)            DOCTEST_TEST_CASE(name)
-#define PCAS_SUBCASE(name)              DOCTEST_SUBCASE(name)
-#define PCAS_CHECK(cond)                DOCTEST_CHECK(cond)
-#define PCAS_CHECK_MESSAGE(cond, ...)   DOCTEST_CHECK_MESSAGE(cond, __VA_ARGS__)
-#define PCAS_REQUIRE(cond)              DOCTEST_REQUIRE(cond)
-#define PCAS_REQUIRE_MESSAGE(cond, ...) DOCTEST_REQUIRE_MESSAGE(cond, __VA_ARGS__)
+#define PCAS_TEST_CASE(name)                 DOCTEST_TEST_CASE(name)
+#define PCAS_SUBCASE(name)                   DOCTEST_SUBCASE(name)
+#define PCAS_CHECK(cond)                     DOCTEST_CHECK(cond)
+#define PCAS_CHECK_MESSAGE(cond, ...)        DOCTEST_CHECK_MESSAGE(cond, __VA_ARGS__)
+#define PCAS_REQUIRE(cond)                   DOCTEST_REQUIRE(cond)
+#define PCAS_REQUIRE_MESSAGE(cond, ...)      DOCTEST_REQUIRE_MESSAGE(cond, __VA_ARGS__)
+#define PCAS_CHECK_THROWS_AS(exp, exception) DOCTEST_CHECK_THROWS_AS(exp, exception)
 
 #else
 
@@ -29,12 +30,13 @@
 #define PCAS_ANON_NAME(x) PCAS_CONCAT(x, __LINE__)
 #endif
 
-#define PCAS_TEST_CASE(name)            [[maybe_unused]] static inline void PCAS_ANON_NAME(__pcas_test_anon_fn)()
+#define PCAS_TEST_CASE(name)                 [[maybe_unused]] static inline void PCAS_ANON_NAME(__pcas_test_anon_fn)()
 #define PCAS_SUBCASE(name)
-#define PCAS_CHECK(cond)                PCAS_ASSERT(cond)
-#define PCAS_CHECK_MESSAGE(cond, ...)   PCAS_ASSERT(cond)
-#define PCAS_REQUIRE(cond)              PCAS_ASSERT(cond)
-#define PCAS_REQUIRE_MESSAGE(cond, ...) PCAS_ASSERT(cond)
+#define PCAS_CHECK(cond)                     PCAS_ASSERT(cond)
+#define PCAS_CHECK_MESSAGE(cond, ...)        PCAS_ASSERT(cond)
+#define PCAS_REQUIRE(cond)                   PCAS_ASSERT(cond)
+#define PCAS_REQUIRE_MESSAGE(cond, ...)      PCAS_ASSERT(cond)
+#define PCAS_CHECK_THROWS_AS(exp, exception) exp
 
 #endif
 

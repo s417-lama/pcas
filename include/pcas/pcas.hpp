@@ -47,10 +47,76 @@ using pcas = pcas_if<policy_default>;
 
 template <typename P>
 class pcas_if {
-  using cache_t = cache_system<P::block_size>;
-  using cache_entry_t = typename cache_t::entry_t;
+  using block_num_t = uint64_t;
 
-  struct obj_entry {
+  enum class cache_state {
+    evicted,    // this entry is not in the cache
+    transitive, // this entry is under processing (internal state)
+    invalid,    // this entry is in the cache, but the data is not up-to-date
+    fetching,   // communication (read) is in-progress
+    valid,      // the data is up-to-date
+  };
+
+  struct mem_block {
+    bool              is_home;
+    block_num_t       mem_block_num     = std::numeric_limits<block_num_t>::max();
+    cache_block_num_t cache_block_num   = std::numeric_limits<block_num_t>::max();
+    cache_state       cstate            = cache_state::evicted;
+    bool              flushing          = false;
+    int               checkout_count    = 0;
+    uint8_t*          vm_addr           = nullptr;
+    mem_block*        prev_cached_block = nullptr;
+    MPI_Request       req               = MPI_REQUEST_NULL;
+    obj_id_t          obj_id;
+    sections          dirty_sections;
+    sections          partial_sections; // for write-only update
+
+    void invalidate() {
+      if (cstate == cache_state::fetching) {
+        PCAS_CHECK(req != MPI_REQUEST_NULL);
+        // FIXME: MPI_Cancel causes segfault
+        /* MPI_Cancel(&req); */
+        /* MPI_Request_free(&req); */
+        MPI_Wait(&req, MPI_STATUS_IGNORE);
+        PCAS_CHECK(req == MPI_REQUEST_NULL);
+      }
+      partial_sections.clear();
+      cstate = cache_state::invalid;
+      PCAS_CHECK(is_evictable());
+    }
+
+    /* Callback functions for cache_system class */
+
+    bool is_evictable() const {
+      return checkout_count == 0 && cstate != cache_state::transitive &&
+             !flushing && dirty_sections.empty();
+    }
+
+    bool is_cached() const {
+      return cstate != cache_state::evicted;
+    }
+
+    cache_block_num_t get_cache_block_num() const {
+      return cache_block_num;
+    }
+
+    void on_cache_remap(cache_block_num_t b, mem_block* prev_block) {
+      cache_block_num = b;
+      prev_cached_block = prev_block;
+      cstate = cache_state::transitive;
+    }
+
+    void on_evict() {
+      PCAS_CHECK(is_evictable());
+      invalidate();
+      cache_block_num = std::numeric_limits<block_num_t>::max();
+      cstate = cache_state::evicted;
+    }
+  };
+
+  using cache_t = cache_system<mem_block*>;
+
+  struct mem_obj {
     int                                   owner;
     obj_id_t                              id;
     uint64_t                              size;
@@ -58,7 +124,7 @@ class pcas_if {
     std::unique_ptr<mem_mapper::base>     mmapper;
     std::unordered_map<int, physical_mem> pms;
     virtual_mem                           vm;
-    std::vector<cache_entry_t>            cache_entries;
+    std::vector<mem_block>                mem_blocks;
     MPI_Win                               win;
   };
 
@@ -94,12 +160,13 @@ class pcas_if {
   std::vector<int> intra2global_rank_;
 
   obj_id_t obj_id_count_ = 1; // TODO: better management of used IDs
-  std::unordered_map<obj_id_t, obj_entry> objs_;
+  std::unordered_map<obj_id_t, mem_obj> objs_;
 
   // FIXME: using map instead of unordered_map because std::pair needs a user-defined hash function
   std::map<std::pair<void*, uint64_t>, checkout_entry> checkouts_;
 
   cache_t cache_;
+  physical_mem cache_pm_;
 
   bool cache_dirty_ = false;
   release_manager rm_;
@@ -156,32 +223,39 @@ class pcas_if {
     return ret;
   }
 
-  void fetch_begin(cache_entry_t cae, obj_entry& obe, int owner, size_t owner_disp) {
-    void* cache_block_ptr = cache_.pm().anon_vm_addr();
+  void fetch_begin(mem_block& mb, int owner, size_t owner_disp) {
+    mem_obj& mo = objs_[mb.obj_id];
+    void* cache_block_ptr = cache_pm_.anon_vm_addr();
     int count = 0;
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
-         sections_inverse(cae->partial_sections, {0, block_size})) {
+         sections_inverse(mb.partial_sections, {0, block_size})) {
       MPI_Request req;
-      MPI_Rget((uint8_t*)cache_block_ptr + cae->block_num * block_size + offset_in_block_b,
+      MPI_Rget((uint8_t*)cache_block_ptr + mb.cache_block_num * block_size + offset_in_block_b,
                offset_in_block_e - offset_in_block_b,
                MPI_UINT8_T,
                owner,
                owner_disp + offset_in_block_b,
                offset_in_block_e - offset_in_block_b,
                MPI_UINT8_T,
-               obe.win,
+               mo.win,
                &req);
-      cae->state = cache_t::state_t::fetching;
+      mb.cstate = cache_state::fetching;
       // FIXME
       if (count == 0) {
-        PCAS_CHECK(cae->req == MPI_REQUEST_NULL);
-        cae->req = req;
+        PCAS_CHECK(mb.req == MPI_REQUEST_NULL);
+        mb.req = req;
       } else {
         MPI_Wait(&req, MPI_STATUS_IGNORE);
       }
       count++;
     }
+  }
+
+  void cache_invalidate_all() {
+    cache_.for_each_block([&](mem_block& mb) {
+      mb.invalidate();
+    });
   }
 
 public:
@@ -198,29 +272,29 @@ public:
 
   void flush_dirty_cache() {
     if (cache_dirty_) {
-      cache_.for_each_block([&](cache_entry_t cae) {
-        if (cae && !cae->dirty_sections.empty()) {
-          PCAS_CHECK(!cae->flushing);
+      cache_.for_each_block([&](mem_block& mb) {
+        if (!mb.dirty_sections.empty()) {
+          PCAS_CHECK(!mb.flushing);
 
-          obj_entry& obe = objs_[cae->obj_id];
-          void* cache_block_ptr = cache_.pm().anon_vm_addr();
-          uint64_t vm_offset = cae->vm_addr - (uint8_t*)obe.vm.addr();
-          auto bi = obe.mmapper->get_block_info(vm_offset);
+          mem_obj& mo = objs_[mb.obj_id];
+          void* cache_block_ptr = cache_pm_.anon_vm_addr();
+          uint64_t vm_offset = mb.vm_addr - (uint8_t*)mo.vm.addr();
+          auto bi = mo.mmapper->get_block_info(vm_offset);
 
-          for (auto [offset_in_block_b, offset_in_block_e] : cae->dirty_sections) {
-            MPI_Put((uint8_t*)cache_block_ptr + cae->block_num * block_size + offset_in_block_b,
+          for (auto [offset_in_block_b, offset_in_block_e] : mb.dirty_sections) {
+            MPI_Put((uint8_t*)cache_block_ptr + mb.cache_block_num * block_size + offset_in_block_b,
                     offset_in_block_e - offset_in_block_b,
                     MPI_UINT8_T,
                     bi.owner,
                     bi.pm_offset + offset_in_block_b,
                     offset_in_block_e - offset_in_block_b,
                     MPI_UINT8_T,
-                    obe.win);
+                    mo.win);
           }
-          cae->dirty_sections.clear();
-          cae->flushing = true;
+          mb.dirty_sections.clear();
+          mb.flushing = true;
 
-          flushing_wins_.insert(obe.win);
+          flushing_wins_.insert(mo.win);
           n_dirty_cache_blocks_--;
         }
       });
@@ -234,13 +308,8 @@ public:
       }
       flushing_wins_.clear();
 
-      cache_.for_each_block([&](cache_entry_t cae) {
-        if (cae && cae->flushing) {
-          cae->flushing = false;
-          if (cache_.is_evictable(cae)) {
-            cache_.set_evictable(cae);
-          }
-        }
+      cache_.for_each_block([&](mem_block& mb) {
+        mb.flushing = false;
       });
     }
   }
@@ -311,7 +380,7 @@ public:
       }
     }
 
-    cache_.invalidate_all();
+    cache_invalidate_all();
   }
 
   void barrier() {
@@ -363,8 +432,8 @@ public:
 
   template <typename T>
   void* get_physical_mem(global_ptr<T> ptr) {
-    obj_entry& obe = objs_[ptr.id()];
-    return obe.pms[global_rank_].anon_vm_addr();
+    mem_obj& mo = objs_[ptr.id()];
+    return mo.pms[global_rank_].anon_vm_addr();
   }
 
 };
@@ -373,7 +442,17 @@ template <typename P>
 inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
   : process_map_(init_process_map(comm)),
     intra2global_rank_(init_intra2global_rank()),
-    cache_(cache_size, intra_rank_) {
+    cache_(cache_size / block_size) {
+
+  PCAS_CHECK(cache_size % block_size == 0);
+
+  uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
+  if (block_size == 0 || block_size % pagesize != 0) {
+    die("The block size (specified: %ld) must be multiple of the page size (%ld).", block_size, pagesize);
+  }
+
+  cache_pm_ = physical_mem(cache_size, 0, intra_rank_, true, true);
+
   logger::init(global_rank_, global_nproc_);
 
   MPI_Win_allocate(sizeof(release_remote_region),
@@ -451,29 +530,33 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
     }
   }
 
-  std::vector<cache_entry_t> cache_entries;
-  for (uint64_t b = 0; b < effective_size / block_size; b++) {
+  std::vector<mem_block> mem_blocks;
+  for (block_num_t b = 0; b < effective_size / block_size; b++) {
     auto bi = mmapper->get_block_info(b * block_size);
-    if (bi.owner == global_rank_ ||
-        (enable_shared_memory_ && process_map_[bi.owner].second == inter_rank_)) {
+    mem_block mb;
+    mb.obj_id = obj_id;
+    mb.mem_block_num = b;
+    mb.vm_addr = (uint8_t*)vm.addr() + b * block_size;
+    mb.is_home =
+      bi.owner == global_rank_ ||
+      (enable_shared_memory_ && process_map_[bi.owner].second == inter_rank_);
+    if (mb.is_home) {
       vm.map_physical_mem(b * block_size, bi.pm_offset, block_size, pms[bi.owner]);
-      cache_entries.push_back(nullptr);
-    } else {
-      cache_entries.push_back(cache_.alloc_entry(obj_id));
     }
+    mem_blocks.push_back(std::move(mb));
   }
 
-  obj_entry obe {
+  mem_obj mo {
     .owner = -1, .id = obj_id,
     .size = size, .effective_size = effective_size,
     .mmapper = std::move(mmapper),
     .pms = std::move(pms), .vm = std::move(vm),
-    .cache_entries = std::move(cache_entries), .win = win,
+    .mem_blocks = std::move(mem_blocks), .win = win,
   };
 
-  auto ret = global_ptr<T>(obe.owner, obe.id, 0);
+  auto ret = global_ptr<T>(mo.owner, mo.id, 0);
 
-  objs_[obe.id] = std::move(obe);
+  objs_[mo.id] = std::move(mo);
 
   return ret;
 }
@@ -484,14 +567,14 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
   if (ptr == global_ptr<T>()) {
     die("null pointer was passed to pcas::free()");
   }
-  obj_entry& obe = objs_[ptr.id()];
-  for (auto& cae : obe.cache_entries) {
-    if (cae) {
-      cache_.free_entry(cae);
+  mem_obj& mo = objs_[ptr.id()];
+  for (auto&& mb : mo.mem_blocks) {
+    if (!mb.is_home) {
+      cache_.ensure_evicted(&mb);
     }
   }
-  MPI_Win_unlock_all(obe.win);
-  MPI_Win_free(&obe.win);
+  MPI_Win_unlock_all(mo.win);
+  MPI_Win_free(&mo.win);
   objs_.erase(ptr.id());
 }
 
@@ -538,16 +621,16 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with cyclic policy") {
 template <typename P>
 template <typename T, typename Func>
 inline void pcas_if<P>::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
-  obj_entry& obe = objs_[ptr.id()];
+  mem_obj& mo = objs_[ptr.id()];
 
   uint64_t offset_min = ptr.offset();
   uint64_t offset_max = offset_min + nelems * sizeof(T);
   uint64_t offset     = offset_min;
 
-  PCAS_CHECK(offset_max <= obe.size);
+  PCAS_CHECK(offset_max <= mo.size);
 
   while (offset < offset_max) {
-    auto bi = obe.mmapper->get_block_info(offset);
+    auto bi = mo.mmapper->get_block_info(offset);
     uint64_t offset_b  = std::max(bi.offset_b, offset_min);
     uint64_t offset_e  = std::min(bi.offset_e, offset_max);
 
@@ -613,7 +696,7 @@ template <typename P>
 template <typename T>
 inline void pcas_if<P>::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
   if (from_ptr.owner() == -1) {
-    obj_entry& obe = objs_[from_ptr.id()];
+    mem_obj& mo = objs_[from_ptr.id()];
     uint64_t offset = from_ptr.offset();
     std::vector<MPI_Request> reqs;
 
@@ -629,7 +712,7 @@ inline void pcas_if<P>::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) 
                pm_offset,
                offset_e - offset_b,
                MPI_UINT8_T,
-               obe.win,
+               mo.win,
                &req);
       reqs.push_back(req);
     });
@@ -644,7 +727,7 @@ template <typename P>
 template <typename T>
 inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
   if (to_ptr.owner() == -1) {
-    obj_entry& obe = objs_[to_ptr.id()];
+    mem_obj& mo = objs_[to_ptr.id()];
     uint64_t offset = to_ptr.offset();
 
     for_each_block(to_ptr, nelems, [&](int      owner,
@@ -658,11 +741,11 @@ inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t ne
               pm_offset,
               offset_e - offset_b,
               MPI_UINT8_T,
-              obe.win);
+              mo.win);
     });
 
     // ensure remote completion
-    MPI_Win_flush_all(obe.win);
+    MPI_Win_flush_all(mo.win);
   } else {
     die("unimplemented");
   }
@@ -747,41 +830,47 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkout>(size);
 
-  obj_entry& obe = objs_[ptr.id()];
+  mem_obj& mo = objs_[ptr.id()];
 
-  std::vector<cache_entry_t> remapped_entries;
+  std::vector<block_num_t> remapped_block_nums;
 
-  uint64_t cache_entry_b = ptr.offset() / block_size;
-  uint64_t cache_entry_e = (ptr.offset() + size + block_size - 1) / block_size;
+  block_num_t block_num_b = ptr.offset() / block_size;
+  block_num_t block_num_e = (ptr.offset() + size + block_size - 1) / block_size;
 
   int n_prefetch = Mode == access_mode::write ? 0 : n_prefetch_;
-  uint64_t cmax = obe.effective_size / block_size;
+  uint64_t bmax = mo.effective_size / block_size;
 
   section block_section{0, block_size};
 
-  for (uint64_t b = cache_entry_b; b < std::min(cache_entry_e + n_prefetch, cmax); b++) {
-    auto cae = obe.cache_entries[b];
-    if (cae) {
-      uint64_t vm_offset = b * block_size;
+  // get cache blocks first, otherwise the same cache block may be assigned to multiple mem blocks
+  for (block_num_t b = block_num_b; b < std::min(block_num_e + n_prefetch, bmax); b++) {
+    auto& mb = mo.mem_blocks[b];
+    if (!mb.is_home) {
+      cache_state prev_cstate = mb.cstate;
+
       try {
-        cache_.checkout(cae, b >= cache_entry_e);
+        cache_.ensure_cached(&mb);
       } catch (cache_full_exception& e) {
         complete_flush();
         flush_dirty_cache();
         complete_flush();
         try {
-          cache_.checkout(cae, b >= cache_entry_e);
+          cache_.ensure_cached(&mb);
         } catch (cache_full_exception& e) {
           die("cache is exhausted (too many objects are being checked out)");
         }
       }
 
-      if (cae->state == cache_t::state_t::evicted) {
-        cae->vm_addr = (uint8_t*)obe.vm.addr() + vm_offset;
-        remapped_entries.push_back(cae);
+      if (prev_cstate == cache_state::evicted) {
+        remapped_block_nums.push_back(b);
       }
+    }
+  }
 
-      if (cae->flushing && Mode != access_mode::read) {
+  for (block_num_t b = block_num_b; b < std::min(block_num_e + n_prefetch, bmax); b++) {
+    auto& mb = mo.mem_blocks[b];
+    if (!mb.is_home) {
+      if (mb.flushing && Mode != access_mode::read) {
         // MPI_Put has been already started on this cache block.
         // As overlapping MPI_Put calls for the same location will cause undefined behaviour,
         // we need to insert MPI_Win_flush between overlapping MPI_Put calls here.
@@ -796,7 +885,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
                                      ptr.offset() - b * block_size : 0;
         uint64_t offset_in_block_e = (ptr.offset() + size < (b + 1) * block_size) ?
                                      ptr.offset() + size - b * block_size : block_size;
-        sections_insert(cae->partial_sections, {offset_in_block_b, offset_in_block_e});
+        sections_insert(mb.partial_sections, {offset_in_block_b, offset_in_block_e});
       }
 
       // Suppose that a cache block is represented as [a1, a2].
@@ -806,47 +895,52 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
       // has been already fetched or not.
       if (Mode != access_mode::write) {
-        auto bi = obe.mmapper->get_block_info(b * block_size);
+        auto bi = mo.mmapper->get_block_info(b * block_size);
 
-        fetch_begin(cae, obe, bi.owner, bi.pm_offset);
+        fetch_begin(mb, bi.owner, bi.pm_offset);
 
-        sections_insert(cae->partial_sections, block_section); // the entire cache block is now fetched
+        sections_insert(mb.partial_sections, block_section); // the entire cache block is now fetched
       }
 
       // cache with write-only mode is always valid
       if (Mode == access_mode::write &&
-          cae->state != cache_t::state_t::fetching) {
-        cae->state = cache_t::state_t::valid;
+          mb.cstate != cache_state::fetching) {
+        mb.cstate = cache_state::valid;
       }
     }
   }
 
   // Overlap communication and memory remapping
-  for (auto cae : remapped_entries) {
-    auto prev_cae = cae->prev_entry;
-    if (prev_cae && prev_cae->state == cache_t::state_t::evicted) {
-      cae->prev_entry = nullptr;
-      virtual_mem::mmap_no_physical_mem(prev_cae->vm_addr, block_size);
+  for (block_num_t b : remapped_block_nums) {
+    mem_block& mb = mo.mem_blocks[b];
+    mem_block* prev_mb = mb.prev_cached_block;
+    if (prev_mb) {
+      mb.prev_cached_block = nullptr;
+      if (prev_mb->cstate == cache_state::evicted) {
+        virtual_mem::mmap_no_physical_mem(prev_mb->vm_addr, block_size);
+      }
     }
-    cache_.pm().map(cae->vm_addr, cae->block_num * block_size, block_size);
+    cache_pm_.map(mb.vm_addr, mb.cache_block_num * block_size, block_size);
   }
 
   std::vector<MPI_Request> reqs;
-  for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
-    auto cae = obe.cache_entries[b];
-    if (cae) {
-      if (cae->state == cache_t::state_t::fetching) {
-        PCAS_CHECK(cae->req != MPI_REQUEST_NULL);
-        reqs.push_back(cae->req);
-        cae->req = MPI_REQUEST_NULL;
+  for (uint64_t b = block_num_b; b < block_num_e; b++) {
+    auto& mb = mo.mem_blocks[b];
+    if (!mb.is_home) {
+      if (mb.cstate == cache_state::fetching) {
+        PCAS_CHECK(mb.req != MPI_REQUEST_NULL);
+        reqs.push_back(mb.req);
+        mb.req = MPI_REQUEST_NULL;
       }
-      cae->state = cache_t::state_t::valid;
+      mb.cstate = cache_state::valid;
+      /* cache_.use(&mb); */
     }
+    mb.checkout_count++;
   }
 
   MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
 
-  T* ret = (T*)((uint8_t*)obe.vm.addr() + ptr.offset());
+  T* ret = (T*)((uint8_t*)mo.vm.addr() + ptr.offset());
 
   auto ckey = std::make_pair((void*)ret, size);
   auto c = checkouts_.find(ckey);
@@ -878,32 +972,23 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
   }
 
   checkout_entry che = c->second;
-  obj_entry& obe = objs_[che.ptr.id()];
+  mem_obj& mo = objs_[che.ptr.id()];
 
   uint64_t cache_entry_b = che.ptr.offset() / block_size;
   uint64_t cache_entry_e = (che.ptr.offset() + size + block_size - 1) / block_size;
 
-  if (che.mode == access_mode::read_write ||
-      che.mode == access_mode::write) {
-    for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
-      auto cae = obe.cache_entries[b];
-      if (cae) {
-        n_dirty_cache_blocks_ += cae->dirty_sections.empty();
-        uint64_t offset_in_block_b = (che.ptr.offset() > b * block_size) ?
-                                     che.ptr.offset() - b * block_size : 0;
-        uint64_t offset_in_block_e = (che.ptr.offset() + size < (b + 1) * block_size) ?
-                                     che.ptr.offset() + size - b * block_size : block_size;
-        sections_insert(cae->dirty_sections, {offset_in_block_b, offset_in_block_e});
-        cache_dirty_ = true;
-      }
-    }
-  }
-
   for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
-    auto cae = obe.cache_entries[b];
-    if (cae) {
-      cache_.checkin(cae);
+    auto& mb = mo.mem_blocks[b];
+    if (che.mode != access_mode::read && !mb.is_home) {
+      n_dirty_cache_blocks_ += mb.dirty_sections.empty();
+      uint64_t offset_in_block_b = (che.ptr.offset() > b * block_size) ?
+                                   che.ptr.offset() - b * block_size : 0;
+      uint64_t offset_in_block_e = (che.ptr.offset() + size < (b + 1) * block_size) ?
+                                   che.ptr.offset() + size - b * block_size : block_size;
+      sections_insert(mb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+      cache_dirty_ = true;
     }
+    mb.checkout_count--;
   }
 
   if (--c->second.count == 0) {
