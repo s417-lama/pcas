@@ -253,24 +253,6 @@ class pcas_if {
     }
   }
 
-  void cache_invalidate_all() {
-    cache_.for_each_block([&](mem_block& mb) {
-      mb.invalidate();
-    });
-  }
-
-public:
-  using logger = typename logger::template logger_if<logger::policy<P>>;
-  using logger_kind = typename P::logger_kind_t::value;
-
-  constexpr static uint64_t block_size = P::block_size;
-
-  pcas_if(uint64_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
-  ~pcas_if();
-
-  int rank() const { return global_rank_; }
-  int nproc() const { return global_nproc_; }
-
   void flush_dirty_cache() {
     if (cache_dirty_) {
       cache_.for_each_block([&](mem_block& mb) {
@@ -325,16 +307,10 @@ public:
     rm_.remote->epoch++;
   }
 
-  void release() {
-    auto ev = logger::template record<logger_kind::Release>();
-    ensure_all_cache_clean();
-  }
-
-  void release_lazy(release_handler* handler) {
-    PCAS_CHECK(checkouts_.empty());
-
-    epoch_t next_epoch = cache_dirty_ ? rm_.remote->epoch + 1 : 0; // 0 means clean
-    *handler = {.rank = global_rank_, .epoch = next_epoch};
+  void cache_invalidate_all() {
+    cache_.for_each_block([&](mem_block& mb) {
+      mb.invalidate();
+    });
   }
 
   epoch_t get_remote_epoch(int target_rank) {
@@ -367,48 +343,20 @@ public:
     MPI_Win_flush(target_rank, rm_.win);
   }
 
-  void acquire(release_handler handler = {.rank = 0, .epoch = 0}) {
-    auto ev = logger::template record<logger_kind::Acquire>();
-    ensure_all_cache_clean();
+public:
+  using logger = typename logger::template logger_if<logger::policy<P>>;
+  using logger_kind = typename P::logger_kind_t::value;
 
-    if (handler.epoch != 0) {
-      if (get_remote_epoch(handler.rank) < handler.epoch) {
-        send_release_request(handler.rank, handler.epoch);
-        // need to wait for the execution of a release by the remote worker
-        while (get_remote_epoch(handler.rank) < handler.epoch) {
-          usleep(10); // TODO: better interval?
-        };
-      }
-    }
+  constexpr static uint64_t block_size = P::block_size;
 
-    cache_invalidate_all();
-  }
+  pcas_if(uint64_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
+  ~pcas_if();
 
-  void barrier() {
-    release();
-    MPI_Barrier(global_comm_);
-    acquire();
-  }
-
-  void poll() {
-    if (n_dirty_cache_blocks_ >= max_dirty_cache_blocks_) {
-      auto ev = logger::template record<logger_kind::FlushEarly>();
-      flush_dirty_cache();
-    }
-
-    if (rm_.remote->request > rm_.remote->epoch) {
-      auto ev = logger::template record<logger_kind::ReleaseLazy>();
-      PCAS_CHECK(rm_.remote->request == rm_.remote->epoch + 1);
-
-      ensure_all_cache_clean();
-
-      PCAS_CHECK(rm_.remote->request == rm_.remote->epoch);
-    }
-  }
+  int rank() const { return global_rank_; }
+  int nproc() const { return global_nproc_; }
 
   template <typename T, template<uint64_t> typename MemMapper = mem_mapper::cyclic, typename... MemMapperArgs>
-  inline global_ptr<T> malloc(uint64_t         nelems,
-                              MemMapperArgs... mmargs);
+  global_ptr<T> malloc(uint64_t nelems, MemMapperArgs... mmargs);
 
   template <typename T>
   void free(global_ptr<T> ptr);
@@ -428,6 +376,16 @@ public:
 
   template <typename T>
   void checkin(T* raw_ptr, uint64_t nelems);
+
+  void release();
+
+  void release_lazy(release_handler* handler);
+
+  void acquire(release_handler handler = {.rank = 0, .epoch = 0});
+
+  void barrier();
+
+  void poll();
 
   /* unsafe APIs for debugging */
 
@@ -491,8 +449,7 @@ PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
 
 template <typename P>
 template <typename T, template<uint64_t> typename MemMapper, typename... MemMapperArgs>
-inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
-                                        MemMapperArgs... mmargs) {
+inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
@@ -986,10 +943,10 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
   checkout_entry che = c->second;
   mem_obj& mo = objs_[che.ptr.id()];
 
-  uint64_t cache_entry_b = che.ptr.offset() / block_size;
-  uint64_t cache_entry_e = (che.ptr.offset() + size + block_size - 1) / block_size;
+  block_num_t block_num_b = che.ptr.offset() / block_size;
+  block_num_t block_num_e = (che.ptr.offset() + size + block_size - 1) / block_size;
 
-  for (uint64_t b = cache_entry_b; b < cache_entry_e; b++) {
+  for (block_num_t b = block_num_b; b < block_num_e; b++) {
     auto& mb = mo.mem_blocks[b];
     if (che.mode != access_mode::read && !mb.is_home) {
       n_dirty_cache_blocks_ += mb.dirty_sections.empty();
@@ -1156,6 +1113,64 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
 
   pc.free(ps[0]);
   pc.free(ps[1]);
+}
+
+// TODO: add tests to below functions
+
+template <typename P>
+inline void pcas_if<P>::release() {
+  auto ev = logger::template record<logger_kind::Release>();
+  ensure_all_cache_clean();
+}
+
+template <typename P>
+inline void pcas_if<P>::release_lazy(release_handler* handler) {
+  PCAS_CHECK(checkouts_.empty());
+
+  epoch_t next_epoch = cache_dirty_ ? rm_.remote->epoch + 1 : 0; // 0 means clean
+  *handler = {.rank = global_rank_, .epoch = next_epoch};
+}
+
+template <typename P>
+inline void pcas_if<P>::acquire(release_handler handler) {
+  auto ev = logger::template record<logger_kind::Acquire>();
+  ensure_all_cache_clean();
+
+  if (handler.epoch != 0) {
+    if (get_remote_epoch(handler.rank) < handler.epoch) {
+      send_release_request(handler.rank, handler.epoch);
+      // need to wait for the execution of a release by the remote worker
+      while (get_remote_epoch(handler.rank) < handler.epoch) {
+        usleep(10); // TODO: better interval?
+      };
+    }
+  }
+
+  cache_invalidate_all();
+}
+
+template <typename P>
+inline void pcas_if<P>::barrier() {
+  release();
+  MPI_Barrier(global_comm_);
+  acquire();
+}
+
+template <typename P>
+inline void pcas_if<P>::poll() {
+  if (n_dirty_cache_blocks_ >= max_dirty_cache_blocks_) {
+    auto ev = logger::template record<logger_kind::FlushEarly>();
+    flush_dirty_cache();
+  }
+
+  if (rm_.remote->request > rm_.remote->epoch) {
+    auto ev = logger::template record<logger_kind::ReleaseLazy>();
+    PCAS_CHECK(rm_.remote->request == rm_.remote->epoch + 1);
+
+    ensure_all_cache_clean();
+
+    PCAS_CHECK(rm_.remote->request == rm_.remote->epoch);
+  }
 }
 
 }
