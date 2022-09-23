@@ -122,9 +122,10 @@ class pcas_if {
     uint64_t                              size;
     uint64_t                              effective_size;
     std::unique_ptr<mem_mapper::base>     mmapper;
-    std::unordered_map<int, physical_mem> pms;
+    std::unordered_map<int, physical_mem> home_pms;
     virtual_mem                           vm;
     std::vector<mem_block>                mem_blocks;
+    block_num_t                           last_checkout_block_num;
     MPI_Win                               win;
   };
 
@@ -433,7 +434,7 @@ public:
   template <typename T>
   void* get_physical_mem(global_ptr<T> ptr) {
     mem_obj& mo = objs_[ptr.id()];
-    return mo.pms[global_rank_].anon_vm_addr();
+    return mo.home_pms[global_rank_].anon_vm_addr();
   }
 
 };
@@ -518,15 +519,15 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
                  &win);
   MPI_Win_lock_all(0, win);
 
-  std::unordered_map<int, physical_mem> pms;
+  std::unordered_map<int, physical_mem> home_pms;
   for (int i = 0; i < intra_nproc_; i++) {
     if (i == intra_rank_) {
-      pms[global_rank_] = std::move(pm_local);
+      home_pms[global_rank_] = std::move(pm_local);
     } else if (enable_shared_memory_) {
       int target_rank = intra2global_rank_[i];
       int target_local_size = mmapper->get_local_size(target_rank);
       physical_mem pm(target_local_size, obj_id, i, false, false);
-      pms[target_rank] = std::move(pm);
+      home_pms[target_rank] = std::move(pm);
     }
   }
 
@@ -541,7 +542,7 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
       bi.owner == global_rank_ ||
       (enable_shared_memory_ && process_map_[bi.owner].second == inter_rank_);
     if (mb.is_home) {
-      vm.map_physical_mem(b * block_size, bi.pm_offset, block_size, pms[bi.owner]);
+      vm.map_physical_mem(b * block_size, bi.pm_offset, block_size, home_pms[bi.owner]);
     }
     mem_blocks.push_back(std::move(mb));
   }
@@ -550,8 +551,10 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t         nelems,
     .owner = -1, .id = obj_id,
     .size = size, .effective_size = effective_size,
     .mmapper = std::move(mmapper),
-    .pms = std::move(pms), .vm = std::move(vm),
-    .mem_blocks = std::move(mem_blocks), .win = win,
+    .home_pms = std::move(home_pms), .vm = std::move(vm),
+    .mem_blocks = std::move(mem_blocks),
+    .last_checkout_block_num = std::numeric_limits<block_num_t>::max(),
+    .win = win,
   };
 
   auto ret = global_ptr<T>(mo.owner, mo.id, 0);
@@ -837,8 +840,17 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   block_num_t block_num_b = ptr.offset() / block_size;
   block_num_t block_num_e = (ptr.offset() + size + block_size - 1) / block_size;
 
-  int n_prefetch = Mode == access_mode::write ? 0 : n_prefetch_;
   uint64_t bmax = mo.effective_size / block_size;
+
+  int n_prefetch = 0;
+  if (Mode != access_mode::write) {
+    if (block_num_b <= mo.last_checkout_block_num + 1 &&
+        mo.last_checkout_block_num + 1 < block_num_e) {
+      // If it seems sequential access, do prefetch
+      n_prefetch = n_prefetch_;
+    }
+    mo.last_checkout_block_num = block_num_e - 1;
+  }
 
   section block_section{0, block_size};
 
