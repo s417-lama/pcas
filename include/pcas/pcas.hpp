@@ -907,7 +907,9 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     mb.checkout_count++;
   }
 
-  MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+  if (!reqs.empty()) {
+    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+  }
 
   T* ret = (T*)((uint8_t*)mo.vm.addr() + ptr.offset());
 
