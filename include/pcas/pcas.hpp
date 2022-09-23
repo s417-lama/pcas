@@ -51,7 +51,6 @@ class pcas_if {
 
   enum class cache_state {
     evicted,    // this entry is not in the cache
-    transitive, // this entry is under processing (internal state)
     invalid,    // this entry is in the cache, but the data is not up-to-date
     fetching,   // communication (read) is in-progress
     valid,      // the data is up-to-date
@@ -62,6 +61,7 @@ class pcas_if {
     block_num_t       mem_block_num     = std::numeric_limits<block_num_t>::max();
     cache_block_num_t cache_block_num   = std::numeric_limits<block_num_t>::max();
     cache_state       cstate            = cache_state::evicted;
+    bool              transitive        = false;
     bool              flushing          = false;
     int               checkout_count    = 0;
     uint8_t*          vm_addr           = nullptr;
@@ -88,7 +88,7 @@ class pcas_if {
     /* Callback functions for cache_system class */
 
     bool is_evictable() const {
-      return checkout_count == 0 && cstate != cache_state::transitive &&
+      return checkout_count == 0 && !transitive &&
              !flushing && dirty_sections.empty();
     }
 
@@ -103,13 +103,13 @@ class pcas_if {
     void on_cache_remap(cache_block_num_t b, mem_block* prev_block) {
       cache_block_num = b;
       prev_cached_block = prev_block;
-      cstate = cache_state::transitive;
+      cstate = cache_state::invalid;
     }
 
     void on_evict() {
       PCAS_CHECK(is_evictable());
       invalidate();
-      cache_block_num = std::numeric_limits<block_num_t>::max();
+      cache_block_num = std::numeric_limits<cache_block_num_t>::max();
       cstate = cache_state::evicted;
     }
   };
@@ -165,6 +165,8 @@ class pcas_if {
 
   // FIXME: using map instead of unordered_map because std::pair needs a user-defined hash function
   std::map<std::pair<void*, uint64_t>, checkout_entry> checkouts_;
+
+  std::vector<mem_block*> remap_blocks_;
 
   cache_t cache_;
   physical_mem cache_pm_;
@@ -224,6 +226,26 @@ class pcas_if {
     return ret;
   }
 
+  void ensure_remapped() {
+    if (!remap_blocks_.empty()) {
+      for (mem_block* mb : remap_blocks_) {
+        mem_block* prev_mb = mb->prev_cached_block;
+        if (prev_mb) {
+          mb->prev_cached_block = nullptr;
+          if (!prev_mb->is_cached()) {
+            // save the number of mmap entries by unmapping previous virtual memory
+            virtual_mem::mmap_no_physical_mem(prev_mb->vm_addr, block_size);
+          }
+        }
+        if (mb->is_cached()) { // the block might have already been evicted if prefetched
+          PCAS_CHECK(mb->cache_block_num < cache_.num_blocks());
+          cache_pm_.map(mb->vm_addr, mb->cache_block_num * block_size, block_size);
+        }
+      }
+      remap_blocks_.clear();
+    }
+  }
+
   void fetch_begin(mem_block& mb, int owner, size_t owner_disp) {
     mem_obj& mo = objs_[mb.obj_id];
     void* cache_block_ptr = cache_pm_.anon_vm_addr();
@@ -231,6 +253,7 @@ class pcas_if {
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
          sections_inverse(mb.partial_sections, {0, block_size})) {
+      PCAS_CHECK(mb.cache_block_num < cache_.num_blocks());
       MPI_Request req;
       MPI_Rget((uint8_t*)cache_block_ptr + mb.cache_block_num * block_size + offset_in_block_b,
                offset_in_block_e - offset_in_block_b,
@@ -369,6 +392,9 @@ public:
 
   template <typename T>
   void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
+
+  template <typename T>
+  void willread(global_ptr<T> ptr, uint64_t nelems);
 
   template <access_mode Mode, typename T>
   std::conditional_t<Mode == access_mode::read, const T*, T*>
@@ -527,12 +553,18 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
   if (ptr == global_ptr<T>()) {
     die("null pointer was passed to pcas::free()");
   }
+
+  // ensure free safety
+  ensure_remapped();
+  complete_flush();
+
   mem_obj& mo = objs_[ptr.id()];
   for (auto&& mb : mo.mem_blocks) {
     if (!mb.is_home) {
       cache_.ensure_evicted(&mb);
     }
   }
+
   MPI_Win_unlock_all(mo.win);
   MPI_Win_free(&mo.win);
   objs_.erase(ptr.id());
@@ -782,6 +814,57 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
   pc.free(ps[1]);
 }
 
+template <typename P>
+template <typename T>
+inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
+  uint64_t size = nelems * sizeof(T);
+  auto ev = logger::template record<logger_kind::Willread>(size);
+
+  mem_obj& mo = objs_[ptr.id()];
+
+  block_num_t block_num_b = ptr.offset() / block_size;
+  block_num_t block_num_e = (ptr.offset() + size + block_size - 1) / block_size;
+
+  section block_section{0, block_size};
+
+  block_num_t bmax = block_num_e;
+
+  // get cache blocks first, otherwise the same cache block may be assigned to multiple mem blocks
+  for (block_num_t b = block_num_b; b < bmax; b++) {
+    auto& mb = mo.mem_blocks[b];
+    if (!mb.is_home) {
+      cache_state prev_cstate = mb.cstate;
+
+      try {
+        cache_.ensure_cached(&mb);
+      } catch (cache_full_exception& e) {
+        // If the cache is full, just quit prefetching
+        bmax = b;
+        break;
+      }
+
+      if (prev_cstate == cache_state::evicted) {
+        remap_blocks_.push_back(&mb);
+      }
+
+      mb.transitive = true;
+    }
+  }
+
+  for (block_num_t b = block_num_b; b < bmax; b++) {
+    auto& mb = mo.mem_blocks[b];
+    if (!mb.is_home) {
+      auto bi = mo.mmapper->get_block_info(b * block_size);
+
+      fetch_begin(mb, bi.owner, bi.pm_offset);
+
+      sections_insert(mb.partial_sections, block_section);
+
+      PCAS_CHECK(mb.transitive);
+      mb.transitive = false;
+    }
+  }
+}
 
 template <typename P>
 template <access_mode Mode, typename T>
@@ -791,8 +874,6 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   auto ev = logger::template record<logger_kind::Checkout>(size);
 
   mem_obj& mo = objs_[ptr.id()];
-
-  std::vector<block_num_t> remapped_block_nums;
 
   block_num_t block_num_b = ptr.offset() / block_size;
   block_num_t block_num_e = (ptr.offset() + size + block_size - 1) / block_size;
@@ -831,8 +912,10 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       }
 
       if (prev_cstate == cache_state::evicted) {
-        remapped_block_nums.push_back(b);
+        remap_blocks_.push_back(&mb);
       }
+
+      mb.transitive = true;
     }
   }
 
@@ -876,21 +959,14 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
           mb.cstate != cache_state::fetching) {
         mb.cstate = cache_state::valid;
       }
+
+      PCAS_CHECK(mb.transitive);
+      mb.transitive = false;
     }
   }
 
   // Overlap communication and memory remapping
-  for (block_num_t b : remapped_block_nums) {
-    mem_block& mb = mo.mem_blocks[b];
-    mem_block* prev_mb = mb.prev_cached_block;
-    if (prev_mb) {
-      mb.prev_cached_block = nullptr;
-      if (prev_mb->cstate == cache_state::evicted) {
-        virtual_mem::mmap_no_physical_mem(prev_mb->vm_addr, block_size);
-      }
-    }
-    cache_pm_.map(mb.vm_addr, mb.cache_block_num * block_size, block_size);
-  }
+  ensure_remapped();
 
   std::vector<MPI_Request> reqs;
   for (uint64_t b = block_num_b; b < block_num_e; b++) {

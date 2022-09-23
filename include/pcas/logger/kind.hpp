@@ -10,6 +10,7 @@ public:
   enum class value {
     Init = 0,
 
+    Willread,
     Checkout,
     Checkin,
     Release,
@@ -72,6 +73,7 @@ public:
     switch (val_) {
       case value::Init:            return "";
 
+      case value::Willread:        return "willread";
       case value::Checkout:        return "checkout";
       case value::Checkin:         return "checkin";
       case value::Release:         return "release";

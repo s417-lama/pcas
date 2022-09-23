@@ -79,6 +79,8 @@ public:
     }
   }
 
+  cache_block_num_t num_blocks() { return nblocks_; }
+
   void ensure_cached(Entry e) {
     if (!e->is_cached()) {
       cache_block& cb = get_empty_block();
