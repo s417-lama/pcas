@@ -907,10 +907,6 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     mb.checkout_count++;
   }
 
-  if (!reqs.empty()) {
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-  }
-
   T* ret = (T*)((uint8_t*)mo.vm.addr() + ptr.offset());
 
   auto ckey = std::make_pair((void*)ret, size);
@@ -925,6 +921,10 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     checkouts_[ckey] = (checkout_entry){
       .ptr = static_cast<global_ptr<uint8_t>>(ptr), .mode = Mode, .count = 1,
     };
+  }
+
+  if (!reqs.empty()) {
+    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
   }
 
   return ret;
