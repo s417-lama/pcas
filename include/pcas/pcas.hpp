@@ -56,8 +56,60 @@ class pcas_if {
     valid,      // the data is up-to-date
   };
 
+  struct home_block {
+    physical_mem&     pm;
+    uint64_t          pm_offset;
+    uint8_t*          vm_addr;
+    uint64_t          size;
+    int               checkout_count    = 0;
+    bool              mapped            = false;
+    cache_block_num_t block_num         = std::numeric_limits<block_num_t>::max();
+    home_block*       prev_mapped_block = nullptr;
+
+    home_block(physical_mem& pm,
+               uint64_t pm_offset,
+               uint8_t* vm_addr,
+               uint64_t size) : pm(pm), pm_offset(pm_offset), vm_addr(vm_addr), size(size) {}
+
+    void map() {
+      pm.map(vm_addr, pm_offset, size);
+    }
+
+    void unmap() {
+      virtual_mem::mmap_no_physical_mem(vm_addr, size);
+    }
+
+    /* Callback functions for cache_system class */
+
+    bool is_evictable() const {
+      return checkout_count == 0;
+    }
+
+    bool is_cached() const {
+      return mapped;
+    }
+
+    cache_block_num_t get_cache_block_num() const {
+      return block_num;
+    }
+
+    void on_cache_remap(cache_block_num_t b, home_block* prev_block) {
+      block_num = b;
+      prev_mapped_block = prev_block;
+      mapped = true;
+    }
+
+    void on_evict() {
+      PCAS_CHECK(is_evictable());
+      block_num = std::numeric_limits<cache_block_num_t>::max();
+      mapped = false;
+    }
+  };
+
+  using mmap_cache_t = cache_system<home_block*>;
+
   struct mem_block {
-    bool              is_home;
+    home_block*       home_blk          = nullptr;
     block_num_t       mem_block_num     = std::numeric_limits<block_num_t>::max();
     cache_block_num_t cache_block_num   = std::numeric_limits<block_num_t>::max();
     cache_state       cstate            = cache_state::evicted;
@@ -166,10 +218,12 @@ class pcas_if {
   // FIXME: using map instead of unordered_map because std::pair needs a user-defined hash function
   std::map<std::pair<void*, uint64_t>, checkout_entry> checkouts_;
 
-  std::vector<mem_block*> remap_blocks_;
-
+  mmap_cache_t mmap_cache_;
   cache_t cache_;
   physical_mem cache_pm_;
+
+  std::vector<home_block*> remap_home_blocks_;
+  std::vector<mem_block*> remap_cache_blocks_;
 
   bool cache_dirty_ = false;
   release_manager rm_;
@@ -226,9 +280,32 @@ class pcas_if {
     return ret;
   }
 
+  uint64_t get_home_mmap_limit(uint64_t n_cache_blocks) {
+    uint64_t sys_limit = sys_mmap_entry_limit();
+    uint64_t margin = 1000;
+    PCAS_CHECK(sys_limit > n_cache_blocks + margin);
+    return (sys_limit - n_cache_blocks - margin) / 2;
+  }
+
   void ensure_remapped() {
-    if (!remap_blocks_.empty()) {
-      for (mem_block* mb : remap_blocks_) {
+    if (!remap_home_blocks_.empty()) {
+      for (home_block* hb : remap_home_blocks_) {
+        home_block* prev_hb = hb->prev_mapped_block;
+        if (prev_hb) {
+          hb->prev_mapped_block = nullptr;
+          if (!prev_hb->is_cached()) {
+            prev_hb->unmap();
+          }
+        }
+        if (hb->is_cached()) {
+          PCAS_CHECK(hb->block_num < mmap_cache_.num_blocks());
+          hb->map();
+        }
+      }
+      remap_home_blocks_.clear();
+    }
+    if (!remap_cache_blocks_.empty()) {
+      for (mem_block* mb : remap_cache_blocks_) {
         mem_block* prev_mb = mb->prev_cached_block;
         if (prev_mb) {
           mb->prev_cached_block = nullptr;
@@ -242,7 +319,7 @@ class pcas_if {
           cache_pm_.map(mb->vm_addr, mb->cache_block_num * block_size, block_size);
         }
       }
-      remap_blocks_.clear();
+      remap_cache_blocks_.clear();
     }
   }
 
@@ -427,6 +504,7 @@ template <typename P>
 inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
   : process_map_(init_process_map(comm)),
     intra2global_rank_(init_intra2global_rank()),
+    mmap_cache_(get_home_mmap_limit(cache_size / block_size)),
     cache_(cache_size / block_size) {
 
   PCAS_CHECK(cache_size % block_size == 0);
@@ -502,6 +580,7 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
                  &win);
   MPI_Win_lock_all(0, win);
 
+  // Open home physical memory of other intra-node processes
   std::unordered_map<int, physical_mem> home_pms;
   for (int i = 0; i < intra_nproc_; i++) {
     if (i == intra_rank_) {
@@ -514,19 +593,13 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
     }
   }
 
+  // Create memory blocks
   std::vector<mem_block> mem_blocks;
   for (block_num_t b = 0; b < effective_size / block_size; b++) {
-    auto bi = mmapper->get_block_info(b * block_size);
     mem_block mb;
     mb.obj_id = obj_id;
     mb.mem_block_num = b;
     mb.vm_addr = (uint8_t*)vm.addr() + b * block_size;
-    mb.is_home =
-      bi.owner == global_rank_ ||
-      (enable_shared_memory_ && process_map_[bi.owner].second == inter_rank_);
-    if (mb.is_home) {
-      vm.map_physical_mem(b * block_size, bi.pm_offset, block_size, home_pms[bi.owner]);
-    }
     mem_blocks.push_back(std::move(mb));
   }
 
@@ -544,6 +617,27 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
 
   objs_[mo.id] = std::move(mo);
 
+  // Create entries for home blocks
+  for_each_block(ret, nelems, [&](int      owner,
+                                  uint64_t offset_b,
+                                  uint64_t offset_e,
+                                  uint64_t pm_offset) {
+    PCAS_CHECK(offset_b % block_size == 0);
+    if (owner == global_rank_ ||
+        (enable_shared_memory_ && process_map_[owner].second == inter_rank_)) {
+      mem_obj& mo = objs_[obj_id];
+      home_block* hb = new home_block(mo.home_pms[owner],
+                                      pm_offset,
+                                      (uint8_t*)mo.vm.addr() + offset_b,
+                                      offset_e - offset_b);
+      // Register home block for each memory block within the home block
+      // (Note: home blocks can be larger than memory blocks; cf. block dist policy)
+      for (block_num_t b = offset_b / block_size; b < offset_e / block_size; b++) {
+        mo.mem_blocks[b].home_blk = hb;
+      }
+    }
+  });
+
   return ret;
 }
 
@@ -559,11 +653,29 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
   complete_flush();
 
   mem_obj& mo = objs_[ptr.id()];
+
+  // ensure all cache entries are evicted
   for (auto&& mb : mo.mem_blocks) {
-    if (!mb.is_home) {
+    if (mb.home_blk) {
+      mmap_cache_.ensure_evicted(mb.home_blk);
+    } else {
       cache_.ensure_evicted(&mb);
     }
   }
+
+  // free home blocks
+  size_t nelems = mo.size / sizeof(T);
+  for_each_block(ptr, nelems, [&](int      owner,
+                                  uint64_t offset_b,
+                                  uint64_t offset_e [[maybe_unused]],
+                                  uint64_t pm_offset [[maybe_unused]]) {
+    if (owner == global_rank_ ||
+        (enable_shared_memory_ && process_map_[owner].second == inter_rank_)) {
+      // Only the home block pointed by the first memory block should be freed.
+      // Home blocks can be pointed by multiple memory blocks.
+      delete mo.mem_blocks[offset_b / block_size].home_blk;
+    }
+  });
 
   MPI_Win_unlock_all(mo.win);
   MPI_Win_free(&mo.win);
@@ -832,7 +944,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
   // get cache blocks first, otherwise the same cache block may be assigned to multiple mem blocks
   for (block_num_t b = block_num_b; b < bmax; b++) {
     auto& mb = mo.mem_blocks[b];
-    if (!mb.is_home) {
+    if (!mb.home_blk) {
       cache_state prev_cstate = mb.cstate;
 
       try {
@@ -844,7 +956,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
       }
 
       if (prev_cstate == cache_state::evicted) {
-        remap_blocks_.push_back(&mb);
+        remap_cache_blocks_.push_back(&mb);
       }
 
       mb.transitive = true;
@@ -894,8 +1006,27 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
   // get cache blocks first, otherwise the same cache block may be assigned to multiple mem blocks
   for (block_num_t b = block_num_b; b < std::min(block_num_e + n_prefetch, bmax); b++) {
+    bool is_prefetch = b >= block_num_e;
     auto& mb = mo.mem_blocks[b];
-    if (!mb.is_home) {
+    if (mb.home_blk) {
+      // no prefetch for home blocks
+      if (is_prefetch) continue;
+
+      home_block& hb = *mb.home_blk;
+      bool prev_mapped = hb.mapped;
+
+      try {
+        mmap_cache_.ensure_cached(&hb);
+      } catch (cache_full_exception& e) {
+        die("mmap cache is exhausted (too many objects are being checked out)");
+      }
+
+      if (!prev_mapped) {
+        remap_home_blocks_.push_back(&hb);
+      }
+
+      hb.checkout_count++;
+    } else {
       cache_state prev_cstate = mb.cstate;
 
       try {
@@ -912,16 +1043,20 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       }
 
       if (prev_cstate == cache_state::evicted) {
-        remap_blocks_.push_back(&mb);
+        remap_cache_blocks_.push_back(&mb);
       }
 
       mb.transitive = true;
+
+      if (!is_prefetch) {
+        mb.checkout_count++;
+      }
     }
   }
 
   for (block_num_t b = block_num_b; b < std::min(block_num_e + n_prefetch, bmax); b++) {
     auto& mb = mo.mem_blocks[b];
-    if (!mb.is_home) {
+    if (!mb.home_blk) {
       if (mb.flushing && Mode != access_mode::read) {
         // MPI_Put has been already started on this cache block.
         // As overlapping MPI_Put calls for the same location will cause undefined behaviour,
@@ -971,7 +1106,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   std::vector<MPI_Request> reqs;
   for (uint64_t b = block_num_b; b < block_num_e; b++) {
     auto& mb = mo.mem_blocks[b];
-    if (!mb.is_home) {
+    if (!mb.home_blk) {
       if (mb.cstate == cache_state::fetching) {
         PCAS_CHECK(mb.req != MPI_REQUEST_NULL);
         reqs.push_back(mb.req);
@@ -980,7 +1115,6 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       mb.cstate = cache_state::valid;
       /* cache_.use(&mb); */
     }
-    mb.checkout_count++;
   }
 
   T* ret = (T*)((uint8_t*)mo.vm.addr() + ptr.offset());
@@ -1026,16 +1160,21 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
 
   for (block_num_t b = block_num_b; b < block_num_e; b++) {
     auto& mb = mo.mem_blocks[b];
-    if (che.mode != access_mode::read && !mb.is_home) {
-      n_dirty_cache_blocks_ += mb.dirty_sections.empty();
-      uint64_t offset_in_block_b = (che.ptr.offset() > b * block_size) ?
-                                   che.ptr.offset() - b * block_size : 0;
-      uint64_t offset_in_block_e = (che.ptr.offset() + size < (b + 1) * block_size) ?
-                                   che.ptr.offset() + size - b * block_size : block_size;
-      sections_insert(mb.dirty_sections, {offset_in_block_b, offset_in_block_e});
-      cache_dirty_ = true;
+    if (mb.home_blk) {
+      home_block& hb = *mb.home_blk;
+      hb.checkout_count--;
+    } else {
+      if (che.mode != access_mode::read) {
+        n_dirty_cache_blocks_ += mb.dirty_sections.empty();
+        uint64_t offset_in_block_b = (che.ptr.offset() > b * block_size) ?
+                                     che.ptr.offset() - b * block_size : 0;
+        uint64_t offset_in_block_e = (che.ptr.offset() + size < (b + 1) * block_size) ?
+                                     che.ptr.offset() + size - b * block_size : block_size;
+        sections_insert(mb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+        cache_dirty_ = true;
+      }
+      mb.checkout_count--;
     }
-    mb.checkout_count--;
   }
 
   if (--c->second.count == 0) {

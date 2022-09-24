@@ -99,6 +99,7 @@ public:
     PCAS_CHECK(e->is_evictable());
     if (e->is_cached()) {
       cache_block& cb = entry2block(e);
+      e->on_evict();
       cb.entry = nullptr;
     }
   }

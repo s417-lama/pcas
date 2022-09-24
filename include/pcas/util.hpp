@@ -5,10 +5,14 @@
 #include <cstdarg>
 #include <cstdint>
 #include <iostream>
+#include <fstream>
 #include <algorithm>
 #include <tuple>
 #include <sstream>
 #include <forward_list>
+
+#include <sys/syscall.h>
+#include <linux/sysctl.h>
 
 #ifdef DOCTEST_LIBRARY_INCLUDED
 
@@ -91,6 +95,16 @@ inline T get_env(const char* env_var, T default_val, int rank) {
     std::cout << env_var << " = " << val << std::endl;
   }
   return val;
+}
+
+inline size_t sys_mmap_entry_limit() {
+  std::ifstream ifs("/proc/sys/vm/max_map_count");
+  if (!ifs) {
+    die("Cannot open /proc/sys/vm/max_map_count");
+  }
+  size_t sys_limit;
+  ifs >> sys_limit;
+  return sys_limit;
 }
 
 using section = std::pair<uint32_t, uint32_t>;
