@@ -7,18 +7,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <string>
+#include <sstream>
 
 #include "pcas/util.hpp"
 
 namespace pcas {
 
 class physical_mem {
-  int      fd_           = -1;
-  uint64_t size_         = 0;
-  void*    anon_vm_addr_ = nullptr;
-  bool     own_;
-  bool     map_anon_;
-  char     shm_name_[256];
+  int         fd_           = -1;
+  uint64_t    size_         = 0;
+  void*       anon_vm_addr_ = nullptr;
+  bool        own_;
+  bool        map_anon_;
+  std::string shm_name_;
 
 public:
   physical_mem() {}
@@ -27,12 +29,15 @@ public:
     if (intra_rank == -1) {
       intra_rank = getpid(); // for testing
     }
-    snprintf(shm_name_, 255, "/pcas_%ld_%d", id, intra_rank);
+
+    std::stringstream ss;
+    ss << "/pcas_" << id << "_" << intra_rank;
+    shm_name_ = ss.str();
 
     int oflag = O_RDWR;
     if (own) oflag |= O_CREAT | O_TRUNC;
 
-    fd_ = shm_open(shm_name_, oflag, S_IRUSR | S_IWUSR);
+    fd_ = shm_open(shm_name_.c_str(), oflag, S_IRUSR | S_IWUSR);
     if (fd_ == -1) {
       perror("shm_open");
       die("[pcas::physical_mem] shm_open() failed");
@@ -51,7 +56,8 @@ public:
   physical_mem(const physical_mem&) = delete;
 
   physical_mem(physical_mem&& pm)
-    : fd_(pm.fd_), size_(pm.size_), anon_vm_addr_(pm.anon_vm_addr_), own_(pm.own_), map_anon_(pm.map_anon_) {
+    : fd_(pm.fd_), size_(pm.size_), anon_vm_addr_(pm.anon_vm_addr_),
+      own_(pm.own_), map_anon_(pm.map_anon_), shm_name_(std::move(pm.shm_name_)) {
     pm.fd_ = -1;
   }
 
@@ -61,8 +67,9 @@ public:
         unmap(anon_vm_addr_, size_);
       }
       close(fd_);
-      if (own_) {
-        shm_unlink(shm_name_);
+      if (own_ && shm_unlink(shm_name_.c_str()) == -1) {
+        perror("shm_unlink");
+        die("[pcas::physical_mem] shm_unlink() failed");
       }
     }
   }
@@ -76,6 +83,7 @@ public:
     anon_vm_addr_ = pm.anon_vm_addr_;
     own_ = pm.own_;
     map_anon_ = pm.map_anon_;
+    shm_name_ = std::move(pm.shm_name_);
     pm.fd_ = -1;
     return *this;
   }
