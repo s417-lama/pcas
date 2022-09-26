@@ -35,7 +35,7 @@ public:
 
   // Returns the block info that specifies the owner and the range [offset_b, offset_e)
   // of the block that contains the given offset.
-  // pm_offset is an offset of the owner's local physical memory, corresponding to the given offset.
+  // pm_offset is the offset from the beginning of the owner's local physical memory for the block.
   virtual block_info get_block_info(uint64_t offset) = 0;
 };
 
@@ -60,8 +60,7 @@ public:
     int      owner     = offset / size_l;
     uint64_t offset_b  = owner * size_l;
     uint64_t offset_e  = std::min((owner + 1) * size_l, size_);
-    uint64_t pm_offset = offset - size_l * owner;
-    return block_info{owner, offset_b, offset_e, pm_offset};
+    return block_info{owner, offset_b, offset_e, 0};
   }
 };
 
@@ -85,15 +84,15 @@ PCAS_TEST_CASE("[pcas::mem_mapper::block] get block information at specified off
   auto block_index_info = [](uint64_t offset, uint64_t size, int nproc) -> block_info {
     return block<bs>(size, nproc).get_block_info(offset);
   };
-  PCAS_CHECK(block_index_info(0         , bs * 4     , 4) == (block_info{0, 0     , bs         , 0     }));
-  PCAS_CHECK(block_index_info(bs        , bs * 4     , 4) == (block_info{1, bs    , bs * 2     , 0     }));
-  PCAS_CHECK(block_index_info(bs * 2    , bs * 4     , 4) == (block_info{2, bs * 2, bs * 3     , 0     }));
-  PCAS_CHECK(block_index_info(bs * 3    , bs * 4     , 4) == (block_info{3, bs * 3, bs * 4     , 0     }));
-  PCAS_CHECK(block_index_info(bs * 4 - 1, bs * 4     , 4) == (block_info{3, bs * 3, bs * 4     , bs - 1}));
-  PCAS_CHECK(block_index_info(0         , bs * 12    , 4) == (block_info{0, 0     , bs * 3     , 0     }));
-  PCAS_CHECK(block_index_info(bs        , bs * 12    , 4) == (block_info{0, 0     , bs * 3     , bs    }));
-  PCAS_CHECK(block_index_info(bs * 3    , bs * 12    , 4) == (block_info{1, bs * 3, bs * 6     , 0     }));
-  PCAS_CHECK(block_index_info(bs * 11   , bs * 12 - 1, 4) == (block_info{3, bs * 9, bs * 12 - 1, bs * 2}));
+  PCAS_CHECK(block_index_info(0         , bs * 4     , 4) == (block_info{0, 0     , bs         , 0}));
+  PCAS_CHECK(block_index_info(bs        , bs * 4     , 4) == (block_info{1, bs    , bs * 2     , 0}));
+  PCAS_CHECK(block_index_info(bs * 2    , bs * 4     , 4) == (block_info{2, bs * 2, bs * 3     , 0}));
+  PCAS_CHECK(block_index_info(bs * 3    , bs * 4     , 4) == (block_info{3, bs * 3, bs * 4     , 0}));
+  PCAS_CHECK(block_index_info(bs * 4 - 1, bs * 4     , 4) == (block_info{3, bs * 3, bs * 4     , 0}));
+  PCAS_CHECK(block_index_info(0         , bs * 12    , 4) == (block_info{0, 0     , bs * 3     , 0}));
+  PCAS_CHECK(block_index_info(bs        , bs * 12    , 4) == (block_info{0, 0     , bs * 3     , 0}));
+  PCAS_CHECK(block_index_info(bs * 3    , bs * 12    , 4) == (block_info{1, bs * 3, bs * 6     , 0}));
+  PCAS_CHECK(block_index_info(bs * 11   , bs * 12 - 1, 4) == (block_info{3, bs * 9, bs * 12 - 1, 0}));
 }
 
 template <uint64_t BlockSize>
@@ -123,7 +122,7 @@ public:
     int      owner       = block_num_g % nproc_;
     uint64_t offset_b    = block_num_g * block_size_;
     uint64_t offset_e    = std::min((block_num_g + 1) * block_size_, size_);
-    uint64_t pm_offset   = block_num_l * block_size_ + offset % block_size_;
+    uint64_t pm_offset   = block_num_l * block_size_;
     return block_info{owner, offset_b, offset_e, pm_offset};
   }
 };
@@ -154,11 +153,11 @@ PCAS_TEST_CASE("[pcas::mem_mapper::cyclic] get block information at specified of
   PCAS_CHECK(block_index_info(bs        , bs * 4     , 4) == (block_info{1, bs     , bs * 2     , 0     }));
   PCAS_CHECK(block_index_info(bs * 2    , bs * 4     , 4) == (block_info{2, bs * 2 , bs * 3     , 0     }));
   PCAS_CHECK(block_index_info(bs * 3    , bs * 4     , 4) == (block_info{3, bs * 3 , bs * 4     , 0     }));
-  PCAS_CHECK(block_index_info(bs * 4 - 1, bs * 4     , 4) == (block_info{3, bs * 3 , bs * 4     , bs - 1}));
+  PCAS_CHECK(block_index_info(bs * 4 - 1, bs * 4     , 4) == (block_info{3, bs * 3 , bs * 4     , 0     }));
   PCAS_CHECK(block_index_info(0         , bs * 12    , 4) == (block_info{0, 0      , bs         , 0     }));
   PCAS_CHECK(block_index_info(bs        , bs * 12    , 4) == (block_info{1, bs     , bs * 2     , 0     }));
   PCAS_CHECK(block_index_info(bs * 3    , bs * 12    , 4) == (block_info{3, bs * 3 , bs * 4     , 0     }));
-  PCAS_CHECK(block_index_info(bs * 5 + 2, bs * 12    , 4) == (block_info{1, bs * 5 , bs * 6     , bs + 2}));
+  PCAS_CHECK(block_index_info(bs * 5 + 2, bs * 12    , 4) == (block_info{1, bs * 5 , bs * 6     , bs    }));
   PCAS_CHECK(block_index_info(bs * 11   , bs * 12 - 1, 4) == (block_info{3, bs * 11, bs * 12 - 1, bs * 2}));
 }
 

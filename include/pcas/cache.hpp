@@ -6,115 +6,121 @@
 #include <cstdint>
 #include <vector>
 #include <list>
-#include <random>
 #include <limits>
+#include <unordered_map>
 
 #include "pcas/util.hpp"
 
 namespace pcas {
 
-using cache_block_num_t = uint64_t;
+using cache_entry_num_t = uint64_t;
 
 class cache_full_exception : public std::exception {};
 
-template <typename Entry>
+template <typename Key, typename Entry>
 class cache_system {
-public:
-  struct cache_block {
-    Entry                                           entry     = nullptr;
-    cache_block_num_t                               block_num = std::numeric_limits<cache_block_num_t>::max();
-    typename std::list<cache_block_num_t>::iterator lru_it;
+  struct cache_entry {
+    bool                                            allocated;
+    Key                                             key;
+    Entry                                           entry;
+    cache_entry_num_t                               entry_num = std::numeric_limits<cache_entry_num_t>::max();
+    typename std::list<cache_entry_num_t>::iterator lru_it;
   };
 
-private:
-  cache_block_num_t            nblocks_;
-  std::vector<cache_block>     blocks_; // cache_block_num_t -> cache_block
-  std::list<cache_block_num_t> lru_; // front (oldest) <----> back (newest)
+  cache_entry_num_t                          nentries_;
+  std::vector<cache_entry>                   entries_; // cache_entry_num_t -> cache_entry
+  std::unordered_map<Key, cache_entry_num_t> table_; // hash table (Key -> cache_entry_num_t)
+  std::list<cache_entry_num_t>               lru_; // front (oldest) <----> back (newest)
 
-  cache_block& entry2block(Entry e) {
-    PCAS_CHECK(e->is_cached());
-    cache_block_num_t b = e->get_cache_block_num();
-    PCAS_CHECK(b < nblocks_);
-    PCAS_CHECK(blocks_[b].entry == e);
-    return blocks_[b];
-  }
-
-  void move_to_back_lru(cache_block& cb) {
+  void move_to_back_lru(cache_entry& cb) {
     lru_.erase(cb.lru_it);
-    lru_.push_back(cb.block_num);
+    lru_.push_back(cb.entry_num);
     cb.lru_it = --lru_.end();
-    PCAS_CHECK(*cb.lru_it == cb.block_num);
+    PCAS_CHECK(*cb.lru_it == cb.entry_num);
   }
 
-  cache_block& get_empty_block() {
+  cache_entry_num_t get_empty_slot() {
     // FIXME: Performance issue?
     for (auto it = lru_.begin(); it != lru_.end(); it++) {
-      cache_block_num_t b = *it;
-      cache_block& cb = blocks_[b];
-      if (!cb.entry) {
-        return cb;
-      } else if (cb.entry->is_evictable()) {
-        cb.entry->on_evict();
-        return cb;
+      cache_entry_num_t b = *it;
+      cache_entry& cb = entries_[b];
+      if (!cb.allocated) {
+        return cb.entry_num;
+      }
+      if (cb.entry.is_evictable()) {
+        Key prev_key = cb.key;
+        table_.erase(prev_key);
+        cb.entry.on_evict();
+        cb.allocated = false;
+        return cb.entry_num;
       }
     }
     throw cache_full_exception{};
   }
 
 public:
-  cache_system(cache_block_num_t nblocks) : nblocks_(nblocks) {
-    for (cache_block_num_t b = 0; b < nblocks; b++) {
-      cache_block cb;
-      cb.block_num = b;
+  cache_system(cache_entry_num_t nentries) : nentries_(nentries), entries_(nentries) {
+    for (cache_entry_num_t b = 0; b < nentries_; b++) {
+      cache_entry& cb = entries_[b];
+      cb.allocated = false;
+      cb.entry_num = b;
       lru_.push_front(b);
       cb.lru_it = lru_.begin();
       PCAS_CHECK(*cb.lru_it == b);
-      blocks_.push_back(std::move(cb));
     }
   }
 
   ~cache_system() {
-    for (auto& cb : blocks_) {
-      PCAS_CHECK(cb.entry == nullptr);
+    PCAS_CHECK(table_.empty());
+    for (auto& cb : entries_) {
+      PCAS_CHECK(!cb.allocated);
     }
   }
 
-  cache_block_num_t num_blocks() { return nblocks_; }
+  cache_entry_num_t num_entries() { return nentries_; }
 
-  void ensure_cached(Entry e) {
-    if (!e->is_cached()) {
-      cache_block& cb = get_empty_block();
+  bool is_cached(Key key) {
+    return table_.find(key) != table_.end();
+  }
+
+  Entry& ensure_cached(Key key) {
+    auto it = table_.find(key);
+    if (it == table_.end()) {
+      cache_entry_num_t b = get_empty_slot();
+      cache_entry& cb = entries_[b];
+
+      cb.entry.on_cache_map(b);
+
+      cb.allocated = true;
+      cb.key = key;
+      table_[key] = b;
       move_to_back_lru(cb);
-      cache_block_num_t b = cb.block_num;
-      Entry prev_e = cb.entry;
-      e->on_cache_remap(b, prev_e);
-      cb.entry = e;
-    }
-    PCAS_CHECK(e->is_cached());
-    use(e);
-  }
-
-  void ensure_evicted(Entry e) {
-    PCAS_CHECK(e);
-    PCAS_CHECK(e->is_evictable());
-    if (e->is_cached()) {
-      cache_block& cb = entry2block(e);
-      e->on_evict();
-      cb.entry = nullptr;
+      return cb.entry;
+    } else {
+      cache_entry_num_t b = it->second;
+      cache_entry& cb = entries_[b];
+      move_to_back_lru(cb);
+      return cb.entry;
     }
   }
 
-  void use(Entry e) {
-    PCAS_CHECK(e->is_cached());
-    cache_block& cb = entry2block(e);
-    move_to_back_lru(cb);
+  void ensure_evicted(Key key) {
+    auto it = table_.find(key);
+    if (it != table_.end()) {
+      cache_entry_num_t b = it->second;
+      cache_entry& cb = entries_[b];
+      PCAS_CHECK(cb.entry.is_evictable());
+      cb.entry.on_evict();
+      table_.erase(key);
+      cb.allocated = false;
+    }
   }
 
   template <typename Func>
-  void for_each_block(Func&& f) {
-    for (auto& cb : blocks_) {
-      if (cb.entry) {
-        f(*cb.entry);
+  void for_each_entry(Func&& f) {
+    for (auto& cb : entries_) {
+      if (cb.allocated) {
+        f(cb.entry);
       }
     }
   }
@@ -122,48 +128,46 @@ public:
 };
 
 PCAS_TEST_CASE("[pcas::cache] testing cache system") {
+  using key_t = int;
   struct test_entry {
-    bool              cached    = false;
     bool              evictable = true;
-    cache_block_num_t block_num = std::numeric_limits<cache_block_num_t>::max();
+    cache_entry_num_t entry_num = std::numeric_limits<cache_entry_num_t>::max();
 
     bool is_evictable() const { return evictable; }
-    bool is_cached() const { return cached; }
-    cache_block_num_t get_cache_block_num() const { return block_num; }
-    void on_cache_remap(cache_block_num_t b, test_entry* prev_block [[maybe_unused]]) {
-      block_num = b;
-      cached = true;
-    }
-    void on_evict() { cached = false; }
+    void on_cache_map(cache_entry_num_t b) { entry_num = b; }
+    void on_evict() {}
   };
 
   int nblk = 100;
-  cache_system<test_entry*> cs(nblk);
+  cache_system<key_t, test_entry> cs(nblk);
 
-  int nent = 1000;
-  std::vector<test_entry> entries(nent);
+  int nkey = 1000;
+  std::vector<key_t> keys;
+  for (int i = 0; i < nkey; i++) {
+    keys.push_back(i);
+  }
 
   PCAS_SUBCASE("basic test") {
-    for (int i = 0; i < nent; i++) {
-      cs.ensure_cached(&entries[i]);
-      PCAS_CHECK(entries[i].cached);
-      auto b = entries[i].block_num;
-      for (int j = 0; j < 10; j++) {
-        cs.ensure_cached(&entries[i]);
-        PCAS_CHECK(entries[i].block_num == b);
+    for (key_t k : keys) {
+      test_entry& e = cs.ensure_cached(k);
+      PCAS_CHECK(cs.is_cached(k));
+      for (int i = 0; i < 10; i++) {
+        test_entry& e2 = cs.ensure_cached(k);
+        PCAS_CHECK(e.entry_num == e2.entry_num);
       }
     }
   }
 
   PCAS_SUBCASE("all entries should be cached when the number of entries is small enough") {
     for (int i = 0; i < nblk; i++) {
-      cs.ensure_cached(&entries[i]);
-      PCAS_CHECK(entries[i].cached);
+      cs.ensure_cached(keys[i]);
+      PCAS_CHECK(cs.is_cached(keys[i]));
     }
     for (int i = 0; i < nblk; i++) {
-      cs.ensure_cached(&entries[i]);
+      cs.ensure_cached(keys[i]);
+      PCAS_CHECK(cs.is_cached(keys[i]));
       for (int j = 0; j < nblk; j++) {
-        PCAS_CHECK(entries[j].cached);
+        PCAS_CHECK(cs.is_cached(keys[j]));
       }
     }
   }
@@ -171,51 +175,55 @@ PCAS_TEST_CASE("[pcas::cache] testing cache system") {
   PCAS_SUBCASE("nonevictable entries should not be evicted") {
     int nrem = 50;
     for (int i = 0; i < nrem; i++) {
-      entries[i].evictable = false;
-      cs.ensure_cached(&entries[i]);
-      PCAS_CHECK(entries[i].cached);
+      test_entry& e = cs.ensure_cached(keys[i]);
+      PCAS_CHECK(cs.is_cached(keys[i]));
+      e.evictable = false;
     }
-    for (int i = 0; i < nent; i++) {
-      cs.ensure_cached(&entries[i]);
-      PCAS_CHECK(entries[i].cached);
+    for (key_t k : keys) {
+      cs.ensure_cached(k);
+      PCAS_CHECK(cs.is_cached(k));
       for (int j = 0; j < nrem; j++) {
-        PCAS_CHECK(entries[j].cached);
+        PCAS_CHECK(cs.is_cached(keys[j]));
       }
     }
     for (int i = 0; i < nrem; i++) {
-      entries[i].evictable = true;
+      test_entry& e = cs.ensure_cached(keys[i]);
+      PCAS_CHECK(cs.is_cached(keys[i]));
+      e.evictable = true;
     }
   }
 
   PCAS_SUBCASE("should throw exception if cache is full") {
     for (int i = 0; i < nblk; i++) {
-      entries[i].evictable = false;
-      cs.ensure_cached(&entries[i]);
-      PCAS_CHECK(entries[i].cached);
+      test_entry& e = cs.ensure_cached(keys[i]);
+      PCAS_CHECK(cs.is_cached(keys[i]));
+      e.evictable = false;
     }
-    PCAS_CHECK_THROWS_AS(cs.ensure_cached(&entries[nblk]), cache_full_exception);
+    PCAS_CHECK_THROWS_AS(cs.ensure_cached(keys[nblk]), cache_full_exception);
     for (int i = 0; i < nblk; i++) {
-      entries[i].evictable = true;
+      test_entry& e = cs.ensure_cached(keys[i]);
+      PCAS_CHECK(cs.is_cached(keys[i]));
+      e.evictable = true;
     }
-    cs.ensure_cached(&entries[nblk]);
-    PCAS_CHECK(entries[nblk].cached);
+    cs.ensure_cached(keys[nblk]);
+    PCAS_CHECK(cs.is_cached(keys[nblk]));
   }
 
   PCAS_SUBCASE("LRU eviction") {
-    for (int i = 0; i < nent; i++) {
-      cs.ensure_cached(&entries[i]);
-      PCAS_CHECK(entries[i].cached);
+    for (int i = 0; i < nkey; i++) {
+      cs.ensure_cached(keys[i]);
+      PCAS_CHECK(cs.is_cached(keys[i]));
       for (int j = 0; j <= i - nblk; j++) {
-        PCAS_CHECK(!entries[j].cached);
+        PCAS_CHECK(!cs.is_cached(keys[j]));
       }
       for (int j = std::max(0, i - nblk + 1); j < i; j++) {
-        PCAS_CHECK(entries[j].cached);
+        PCAS_CHECK(cs.is_cached(keys[j]));
       }
     }
   }
 
-  for (auto& e : entries) {
-    cs.ensure_evicted(&e);
+  for (key_t k : keys) {
+    cs.ensure_evicted(k);
   }
 }
 
