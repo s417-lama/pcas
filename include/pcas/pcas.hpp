@@ -876,7 +876,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
   for_each_block(ptr, nelems, [&](const auto& bi) {
     if (!is_locally_accessible(bi.owner)) {
       uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + nelems * sizeof(T), offset_max);
+      uint64_t offset_e = std::min({bi.offset_e, ptr.offset() + nelems * sizeof(T), offset_max});
       for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
 
@@ -901,7 +901,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
   for_each_block(ptr, nelems, [&](const auto& bi) {
     if (!is_locally_accessible(bi.owner)) {
       uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + size, offset_max);
+      uint64_t offset_e = std::min({bi.offset_e, ptr.offset() + size, offset_max});
       for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
         cache_block& cb = cache_.ensure_cached(vm_addr);
@@ -937,7 +937,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     mo.last_checkout_block_num = block_num_e - 1;
   }
   uint64_t nelems_pf = std::min(size + n_prefetch * block_size,
-                                mo.effective_size - ptr.offset()) / sizeof(T);
+                                mo.size - ptr.offset()) / sizeof(T);
 
   section block_section{0, block_size};
 
