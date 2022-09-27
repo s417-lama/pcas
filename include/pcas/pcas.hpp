@@ -231,6 +231,7 @@ class pcas_if {
   uint64_t max_dirty_cache_blocks_;
 
   int enable_shared_memory_;
+  int enable_write_through_;
 
   int n_prefetch_;
 
@@ -518,6 +519,7 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
 
   max_dirty_cache_blocks_ = get_env("PCAS_MAX_DIRTY_CACHE_BLOCKS", 4, global_rank_);
   enable_shared_memory_ = get_env("PCAS_ENABLE_SHARED_MEMORY", 1, global_rank_);
+  enable_write_through_ = get_env("PCAS_ENABLE_WRITE_THROUGH", 0, global_rank_);
   n_prefetch_ = get_env("PCAS_PREFETCH_BLOCKS", 0, global_rank_);
 
   barrier();
@@ -1142,6 +1144,14 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
 
   if (--c->second.count == 0) {
     checkouts_.erase(ckey);
+  }
+
+  if (enable_write_through_ == 1) {
+    // 1: wait for PUT completion here (strict write-through)
+    ensure_all_cache_clean();
+  } else if (enable_write_through_ == 2) {
+    // 2: do not flush here (the next release waits for PUT completion)
+    flush_dirty_cache();
   }
 }
 
