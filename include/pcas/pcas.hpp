@@ -517,7 +517,9 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
   rm_.remote->request = 1;
   rm_.remote->epoch = 1;
 
-  max_dirty_cache_blocks_ = get_env("PCAS_MAX_DIRTY_CACHE_BLOCKS", 4, global_rank_);
+  auto max_dirty_cache_size = get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, global_rank_);
+  max_dirty_cache_blocks_ = max_dirty_cache_size / block_size;
+
   enable_shared_memory_ = get_env("PCAS_ENABLE_SHARED_MEMORY", 1, global_rank_);
   enable_write_through_ = get_env("PCAS_ENABLE_WRITE_THROUGH", 0, global_rank_);
   n_prefetch_ = get_env("PCAS_PREFETCH_BLOCKS", 0, global_rank_);
