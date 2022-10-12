@@ -97,7 +97,7 @@ class pcas_if {
     }
   };
 
-  using mmap_cache_t = cache_system<void*, home_block>;
+  using mmap_cache_t = cache_system<uintptr_t, home_block>;
 
   struct cache_block {
     cache_entry_num_t entry_num      = std::numeric_limits<cache_entry_num_t>::max();
@@ -164,7 +164,7 @@ class pcas_if {
     }
   };
 
-  using cache_t = cache_system<void*, cache_block>;
+  using cache_t = cache_system<uintptr_t, cache_block>;
 
   struct mem_obj {
     int                                   owner;
@@ -630,8 +630,8 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
   // ensure all cache entries are evicted
   for (uint64_t offset = 0; offset < mo.effective_size; offset += block_size) {
     void* vm_addr = (uint8_t*)mo.vm.addr() + offset;
-    mmap_cache_.ensure_evicted(vm_addr);
-    cache_.ensure_evicted(vm_addr);
+    mmap_cache_.ensure_evicted((uintptr_t)vm_addr / block_size);
+    cache_.ensure_evicted((uintptr_t)vm_addr / block_size);
   }
 
   MPI_Win_unlock_all(mo.win);
@@ -966,7 +966,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
         home_block& hb = std::invoke([&]() -> home_block& {
           try {
-            return mmap_cache_.ensure_cached(vm_addr);
+            return mmap_cache_.ensure_cached((uintptr_t)vm_addr / block_size);
           } catch (cache_full_exception& e) {
             die("mmap cache is exhausted (too many objects are being checked out)");
             throw;
@@ -992,13 +992,13 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
         cache_block& cb = std::invoke([&]() -> cache_block& {
           try {
-            return cache_.ensure_cached(vm_addr);
+            return cache_.ensure_cached((uintptr_t)vm_addr / block_size);
           } catch (cache_full_exception& e) {
             complete_flush();
             flush_dirty_cache();
             complete_flush();
             try {
-              return cache_.ensure_cached(vm_addr);
+              return cache_.ensure_cached((uintptr_t)vm_addr / block_size);
             } catch (cache_full_exception& e) {
               die("cache is exhausted (too many objects are being checked out)");
               throw;
@@ -1029,7 +1029,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + nelems_pf * sizeof(T));
       for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
-        cache_block& cb = cache_.ensure_cached(vm_addr);
+        cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
 
         if (cb.flushing && Mode != access_mode::read) {
           // MPI_Put has been already started on this cache block.
@@ -1082,7 +1082,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
       uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + size);
       for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
-        cache_block& cb = cache_.ensure_cached(vm_addr);
+        cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
 
         if (cb.cstate == cache_state::fetching) {
           PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
@@ -1135,14 +1135,14 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
   for_each_block(che.ptr, size, [&](const auto& bi) {
     if (is_locally_accessible(bi.owner)) {
       uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
-      home_block& hb = mmap_cache_.ensure_cached(vm_addr);
+      home_block& hb = mmap_cache_.ensure_cached((uintptr_t)vm_addr / block_size);
       hb.checkout_count--;
     } else {
       uint64_t offset_b = std::max(bi.offset_b, che.ptr.offset() / block_size * block_size);
       uint64_t offset_e = std::min(bi.offset_e, che.ptr.offset() + size);
       for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
-        cache_block& cb = cache_.ensure_cached(vm_addr);
+        cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
 
         if (che.mode != access_mode::read) {
           n_dirty_cache_blocks_ += cb.dirty_sections.empty();
