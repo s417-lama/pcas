@@ -8,6 +8,7 @@
 #include <list>
 #include <limits>
 #include <unordered_map>
+#include <iterator>
 
 #include "pcas/util.hpp"
 
@@ -33,9 +34,8 @@ class cache_system {
   std::list<cache_entry_num_t>               lru_; // front (oldest) <----> back (newest)
 
   void move_to_back_lru(cache_entry& cb) {
-    lru_.erase(cb.lru_it);
-    lru_.push_back(cb.entry_num);
-    cb.lru_it = --lru_.end();
+    lru_.splice(lru_.end(), lru_, cb.lru_it);
+    PCAS_CHECK(std::prev(lru_.end()) == cb.lru_it);
     PCAS_CHECK(*cb.lru_it == cb.entry_num);
   }
 
