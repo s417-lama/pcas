@@ -419,16 +419,30 @@ class pcas_if {
     return remote_epoch;
   }
 
-  void send_release_request(int target_rank, epoch_t request) {
-    epoch_t prev;
-    MPI_Fetch_and_op(&request,
-                     &prev,
-                     MPI_UINT64_T, // should match epoch_t
-                     target_rank,
-                     offsetof(release_remote_region, request),
-                     MPI_MAX,
-                     rm_.win);
-    MPI_Win_flush(target_rank, rm_.win);
+  void send_release_request(int target_rank, epoch_t remote_epoch, epoch_t request_epoch) {
+    do {
+      epoch_t prev;
+      MPI_Compare_and_swap(&request_epoch,
+                           &remote_epoch,
+                           &prev,
+                           MPI_UINT64_T, // should match epoch_t
+                           target_rank,
+                           offsetof(release_remote_region, request),
+                           rm_.win);
+      MPI_Win_flush(target_rank, rm_.win);
+      remote_epoch = prev;
+    } while (remote_epoch < request_epoch);
+    // FIXME: MPI_Fetch_and_op + MPI_MAX seems not offloaded to RDMA NICs,
+    // which consumes too much resources. So currently MPI_Compare_and_swap is used instead.
+    // Fix to use fetch_and_op once MPI_MAX gets offloaded to RDMA NICs.
+    /* MPI_Fetch_and_op(&request, */
+    /*                  &prev, */
+    /*                  MPI_UINT64_T, // should match epoch_t */
+    /*                  target_rank, */
+    /*                  offsetof(release_remote_region, request), */
+    /*                  MPI_MAX, */
+    /*                  rm_.win); */
+    /* MPI_Win_flush(target_rank, rm_.win); */
   }
 
 public:
@@ -1329,8 +1343,9 @@ inline void pcas_if<P>::acquire(release_handler handler) {
   ensure_all_cache_clean();
 
   if (handler.epoch != 0) {
-    if (get_remote_epoch(handler.rank) < handler.epoch) {
-      send_release_request(handler.rank, handler.epoch);
+    epoch_t remote_epoch = get_remote_epoch(handler.rank);
+    if (remote_epoch < handler.epoch) {
+      send_release_request(handler.rank, remote_epoch, handler.epoch);
       // need to wait for the execution of a release by the remote worker
       while (get_remote_epoch(handler.rank) < handler.epoch) {
         usleep(10); // TODO: better interval?
