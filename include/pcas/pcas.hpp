@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <memory>
 #include <functional>
+#include <optional>
 
 #include <mpi.h>
 
@@ -255,7 +256,7 @@ class pcas_if {
   std::vector<int> intra2global_rank_;
 
   obj_id_t obj_id_count_ = 1; // TODO: better management of used IDs
-  std::unordered_map<obj_id_t, mem_obj> objs_;
+  std::vector<std::optional<mem_obj>> objs_;
 
   // FIXME: using map instead of unordered_map because std::pair needs a user-defined hash function
   std::map<std::pair<void*, uint64_t>, checkout_entry> checkouts_;
@@ -343,6 +344,14 @@ class pcas_if {
     return ret;
   }
 
+  // Misc
+  // -----------------------------------------------------------------------------
+
+  mem_obj& get_mem_obj(obj_id_t id) {
+    PCAS_CHECK(objs_[id].has_value());
+    return *objs_[id];
+  }
+
   uint64_t get_home_mmap_limit(uint64_t n_cache_blocks) {
     uint64_t sys_limit = sys_mmap_entry_limit();
     uint64_t margin = 1000;
@@ -411,7 +420,7 @@ class pcas_if {
         if (cb.mapped && !cb.dirty_sections.empty()) {
           PCAS_CHECK(!cb.flushing);
 
-          mem_obj& mo = objs_[cb.obj_id];
+          mem_obj& mo = get_mem_obj(cb.obj_id);
           void* cache_block_ptr = cache_pm_.anon_vm_addr();
           uint64_t offset = cb.vm_addr - (uint8_t*)mo.vm.addr();
           auto bi = mo.mmapper->get_block_info(offset);
@@ -572,7 +581,7 @@ public:
 
   template <typename T>
   void* get_physical_mem(global_ptr<T> ptr) {
-    mem_obj& mo = objs_[ptr.id()];
+    mem_obj& mo = get_mem_obj(ptr.id());
     return mo.home_pms[cg_global_.rank].anon_vm_addr();
   }
 
@@ -586,6 +595,7 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
     cg_inter_(create_inter_comm()),
     process_map_(create_process_map()),
     intra2global_rank_(create_intra2global_rank()),
+    objs_(obj_id_count_),
     mmap_cache_(get_home_mmap_limit(cache_size / block_size), *this),
     cache_(cache_size / block_size, *this),
     cache_pm_(cache_size, 0, cg_intra_.rank, true, true),
@@ -658,7 +668,7 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
 
   auto ret = global_ptr<T>(mo.owner, mo.id, 0);
 
-  objs_[mo.id] = std::move(mo);
+  objs_.push_back(std::move(mo));
 
   return ret;
 }
@@ -674,7 +684,7 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
   ensure_remapped();
   complete_flush();
 
-  mem_obj& mo = objs_[ptr.id()];
+  mem_obj& mo = get_mem_obj(ptr.id());
 
   // ensure all cache entries are evicted
   for (uint64_t offset = 0; offset < mo.effective_size; offset += block_size) {
@@ -685,7 +695,8 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
 
   MPI_Win_unlock_all(mo.win);
   MPI_Win_free(&mo.win);
-  objs_.erase(ptr.id());
+
+  objs_[ptr.id()].reset();
 }
 
 PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
@@ -731,7 +742,7 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with cyclic policy") {
 template <typename P>
 template <typename T, typename Func>
 inline void pcas_if<P>::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn) {
-  mem_obj& mo = objs_[ptr.id()];
+  mem_obj& mo = get_mem_obj(ptr.id());
 
   uint64_t offset_min = ptr.offset();
   uint64_t offset_max = offset_min + nelems * sizeof(T);
@@ -830,7 +841,7 @@ inline void pcas_if<P>::get_nocache(global_ptr<T> from_ptr, T* to_ptr, uint64_t 
     die("unimplemented");
   }
 
-  mem_obj& mo = objs_[from_ptr.id()];
+  mem_obj& mo = get_mem_obj(from_ptr.id());
 
   const uint64_t offset_b = from_ptr.offset();
   const uint64_t offset_e = offset_b + nelems * sizeof(T);
@@ -875,7 +886,7 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uin
     die("unimplemented");
   }
 
-  mem_obj& mo = objs_[to_ptr.id()];
+  mem_obj& mo = get_mem_obj(to_ptr.id());
 
   const uint64_t offset_b = to_ptr.offset();
   const uint64_t offset_e = offset_b + nelems * sizeof(T);
@@ -1054,7 +1065,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Willread>(size);
 
-  mem_obj& mo = objs_[ptr.id()];
+  mem_obj& mo = get_mem_obj(ptr.id());
 
   const uint64_t offset_b = ptr.offset();
   const uint64_t offset_e = offset_b + size;
@@ -1117,7 +1128,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
 void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
-  mem_obj& mo = objs_[ptr.id()];
+  mem_obj& mo = get_mem_obj(ptr.id());
 
   const uint64_t offset_b = ptr.offset();
   const uint64_t offset_e = offset_b + size;
@@ -1280,7 +1291,7 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
 template <typename P>
 template <bool DoCheckout>
 void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mode mode) {
-  mem_obj& mo = objs_[ptr.id()];
+  mem_obj& mo = get_mem_obj(ptr.id());
 
   const uint64_t offset_b = ptr.offset();
   const uint64_t offset_e = offset_b + size;
