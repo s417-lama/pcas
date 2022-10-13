@@ -65,6 +65,7 @@ public:
   template <typename... Args>
   cache_system(cache_entry_num_t nentries, Args&&... args)
     : nentries_(nentries) {
+    table_.reserve(nentries_);
     for (cache_entry_num_t b = 0; b < nentries_; b++) {
       cache_entry& cb = entries_.emplace_back(std::forward<Args>(args)...);
       cb.allocated = false;
