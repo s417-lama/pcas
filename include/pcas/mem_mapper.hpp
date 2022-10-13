@@ -41,25 +41,30 @@ public:
 
 template <uint64_t BlockSize>
 class block : public base {
-public:
-  using base::base;
-
-  uint64_t get_local_size(int rank [[maybe_unused]]) {
+  // non-virtual common part
+  uint64_t get_local_size_impl() {
     uint64_t nblock_g = (size_ + BlockSize - 1) / BlockSize;
     uint64_t nblock_l = (nblock_g + nproc_ - 1) / nproc_;
     return nblock_l * BlockSize;
   }
 
-  uint64_t get_effective_size() {
-    return get_local_size(0) * nproc_;
+public:
+  using base::base;
+
+  uint64_t get_local_size(int rank [[maybe_unused]]) override {
+    return get_local_size_impl();
   }
 
-  block_info get_block_info(uint64_t offset) {
+  uint64_t get_effective_size() override {
+    return get_local_size_impl() * nproc_;
+  }
+
+  block_info get_block_info(uint64_t offset) override {
     PCAS_CHECK(offset < get_effective_size());
-    uint64_t size_l    = get_local_size(0);
-    int      owner     = offset / size_l;
-    uint64_t offset_b  = owner * size_l;
-    uint64_t offset_e  = std::min((owner + 1) * size_l, size_);
+    uint64_t size_l   = get_local_size_impl();
+    int      owner    = offset / size_l;
+    uint64_t offset_b = owner * size_l;
+    uint64_t offset_e = std::min((owner + 1) * size_l, size_);
     return block_info{owner, offset_b, offset_e, 0};
   }
 };
@@ -99,23 +104,28 @@ template <uint64_t BlockSize>
 class cyclic : public base {
   size_t block_size_;
 
+  // non-virtual common part
+  uint64_t get_local_size_impl() {
+    uint64_t nblock_g = (size_ + block_size_ - 1) / block_size_;
+    uint64_t nblock_l = (nblock_g + nproc_ - 1) / nproc_;
+    return nblock_l * block_size_;
+  }
+
 public:
   cyclic(uint64_t size, int nproc, size_t block_size = BlockSize) : base(size, nproc), block_size_(block_size) {
     PCAS_CHECK(block_size >= BlockSize);
     PCAS_CHECK(block_size % BlockSize == 0);
   }
 
-  uint64_t get_local_size(int rank [[maybe_unused]]) {
-    uint64_t nblock_g = (size_ + block_size_ - 1) / block_size_;
-    uint64_t nblock_l = (nblock_g + nproc_ - 1) / nproc_;
-    return nblock_l * block_size_;
+  uint64_t get_local_size(int rank [[maybe_unused]]) override {
+    return get_local_size_impl();
   }
 
-  uint64_t get_effective_size() {
-    return get_local_size(0) * nproc_;
+  uint64_t get_effective_size() override {
+    return get_local_size_impl() * nproc_;
   }
 
-  block_info get_block_info(uint64_t offset) {
+  block_info get_block_info(uint64_t offset) override {
     PCAS_CHECK(offset < get_effective_size());
     uint64_t block_num_g = offset / block_size_;
     uint64_t block_num_l = block_num_g / nproc_;
