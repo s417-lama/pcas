@@ -66,9 +66,13 @@ class pcas_if {
     uint64_t          pm_offset;
     uint8_t*          vm_addr;
     uint64_t          size;
+    uint64_t          transaction_id = 0;
     int               checkout_count = 0;
     uint8_t*          prev_vm_addr   = nullptr;
     bool              mapped         = false;
+    this_t&           outer;
+
+    home_block(this_t& outer_ref) : outer(outer_ref) {}
 
     void map() {
       pm->map(vm_addr, pm_offset, size);
@@ -85,7 +89,7 @@ class pcas_if {
     /* Callback functions for cache_system class */
 
     bool is_evictable() const {
-      return checkout_count == 0;
+      return checkout_count == 0 && transaction_id != outer.transaction_id_;
     }
 
     void on_evict() {
@@ -105,7 +109,7 @@ class pcas_if {
   struct cache_block {
     cache_entry_num_t entry_num      = std::numeric_limits<cache_entry_num_t>::max();
     cache_state       cstate         = cache_state::unmapped;
-    bool              transitive     = false;
+    uint64_t          transaction_id = 0;
     bool              flushing       = false;
     int               checkout_count = 0;
     uint8_t*          vm_addr        = nullptr;
@@ -115,6 +119,9 @@ class pcas_if {
     obj_id_t          obj_id;
     sections          dirty_sections;
     sections          partial_sections; // for write-only update
+    this_t&           outer;
+
+    cache_block(this_t& outer_ref) : outer(outer_ref) {}
 
     void invalidate() {
       if (cstate == cache_state::fetching) {
@@ -147,7 +154,7 @@ class pcas_if {
     /* Callback functions for cache_system class */
 
     bool is_evictable() const {
-      return checkout_count == 0 && !transitive &&
+      return checkout_count == 0 && transaction_id != outer.transaction_id_ &&
              !flushing && dirty_sections.empty();
     }
 
@@ -252,6 +259,8 @@ class pcas_if {
 
   std::vector<home_block*> remap_home_blocks_;
   std::vector<cache_block*> remap_cache_blocks_;
+
+  uint64_t transaction_id_ = 1;
 
   bool cache_dirty_ = false;
   release_manager rm_;
@@ -571,8 +580,8 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
     cg_inter_(create_inter_comm()),
     process_map_(create_process_map()),
     intra2global_rank_(create_intra2global_rank()),
-    mmap_cache_(get_home_mmap_limit(cache_size / block_size)),
-    cache_(cache_size / block_size),
+    mmap_cache_(get_home_mmap_limit(cache_size / block_size), *this),
+    cache_(cache_size / block_size, *this),
     cache_pm_(cache_size, 0, cg_intra_.rank, true, true),
     rm_(comm),
     max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, cg_global_.rank) / block_size),
@@ -1026,19 +1035,18 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
 
   mem_obj& mo = objs_[ptr.id()];
 
-  section block_section{0, block_size};
+  const uint64_t offset_b = ptr.offset();
+  const uint64_t offset_e = offset_b + size;
 
-  uint64_t offset_max = ptr.offset() + size;
+  const section block_section{0, block_size};
 
-  // get cache blocks first, otherwise the same cache block may be assigned to multiple mem blocks
-  for_each_block(ptr, nelems, [&](const auto& bi) {
-    if (!is_locally_accessible(bi.owner)) {
-      uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min({bi.offset_e, ptr.offset() + nelems * sizeof(T), offset_max});
-      for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
-
-        try {
+  try {
+    for_each_block(ptr, size, [&](const auto& bi) {
+      if (!is_locally_accessible(bi.owner)) {
+        uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+        uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+        for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
+          uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
           cache_block& cb = cache_.ensure_cached(vm_addr);
 
           if (!cb.mapped) {
@@ -1047,31 +1055,18 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
             remap_cache_blocks_.push_back(&cb);
           }
 
-          cb.transitive = true;
-        } catch (cache_full_exception& e) {
-          offset_max = offset;
-          break;
+          cb.transaction_id = transaction_id_;
+
+          fetch_begin(mo, cb, bi.owner, bi.pm_offset + o - bi.offset_b);
+          sections_insert(cb.partial_sections, block_section);
         }
       }
-    }
-  });
+    });
+  } catch (cache_full_exception& e) {
+    // do not go further
+  }
 
-  for_each_block(ptr, nelems, [&](const auto& bi) {
-    if (!is_locally_accessible(bi.owner)) {
-      uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min({bi.offset_e, ptr.offset() + size, offset_max});
-      for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
-        cache_block& cb = cache_.ensure_cached(vm_addr);
-
-        fetch_begin(mo, cb, bi.owner, bi.pm_offset + offset - bi.offset_b);
-        sections_insert(cb.partial_sections, block_section);
-
-        PCAS_CHECK(cb.transitive);
-        cb.transitive = false;
-      }
-    }
-  });
+  transaction_id_++;
 }
 
 template <typename P>
@@ -1126,7 +1121,8 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
 
   const section block_section{0, block_size};
 
-  // get cache blocks first, otherwise the same cache block may be assigned to multiple mem blocks
+  std::vector<MPI_Request> reqs;
+
   for_each_block(ptr, size_pf, [&](const auto& bi) {
     if (is_locally_accessible(bi.owner)) {
       bool is_prefetch = bi.offset_b >= offset_e;
@@ -1149,6 +1145,8 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
           hb.size = bi.offset_e - bi.offset_b;
           remap_home_blocks_.push_back(&hb);
         }
+
+        hb.transaction_id = transaction_id_;
 
         if (DoCheckout) {
           hb.checkout_count++;
@@ -1183,26 +1181,7 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
           remap_cache_blocks_.push_back(&cb);
         }
 
-        cb.transitive = true;
-
-        bool is_prefetch = o >= offset_e;
-        if (DoCheckout && !is_prefetch) {
-          cb.checkout_count++;
-        }
-      }
-    }
-  });
-
-  std::vector<MPI_Request> reqs;
-
-  // begin fetching data
-  for_each_block(ptr, size_pf, [&](const auto& bi) {
-    if (!is_locally_accessible(bi.owner)) {
-      uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
-      uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
-      for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
-        cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
+        cb.transaction_id = transaction_id_;
 
         if (cb.flushing && Mode != access_mode::read) {
           // MPI_Put has been already started on this cache block.
@@ -1231,17 +1210,12 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
           sections_insert(cb.partial_sections, block_section); // the entire cache block is now fetched
         }
 
-        // cache with write-only mode is always valid
-        if (Mode == access_mode::write &&
-            cb.cstate != cache_state::fetching) {
-          cb.cstate = cache_state::valid;
-        }
-
-        PCAS_CHECK(cb.transitive);
-        cb.transitive = false;
-
         bool is_prefetch = o >= offset_e;
         if (!is_prefetch) {
+          if (DoCheckout) {
+            cb.checkout_count++;
+          }
+
           if (cb.cstate == cache_state::fetching) {
             PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
             reqs.push_back(cb.req);
@@ -1253,6 +1227,10 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
       }
     }
   });
+
+  // If the transaction ID of a cache entry is equal to the current transaction ID (outer.transaction_id_),
+  // we do not evict it from the cache.
+  transaction_id_++;
 
   // Overlap communication and memory remapping
   ensure_remapped();

@@ -26,6 +26,9 @@ class cache_system {
     Entry                                           entry;
     cache_entry_num_t                               entry_num = std::numeric_limits<cache_entry_num_t>::max();
     typename std::list<cache_entry_num_t>::iterator lru_it;
+
+    template <typename... Args>
+    cache_entry(Args&&... args) : entry(std::forward<Args>(args)...) {}
   };
 
   cache_entry_num_t                          nentries_;
@@ -59,9 +62,11 @@ class cache_system {
   }
 
 public:
-  cache_system(cache_entry_num_t nentries) : nentries_(nentries), entries_(nentries) {
+  template <typename... Args>
+  cache_system(cache_entry_num_t nentries, Args&&... args)
+    : nentries_(nentries) {
     for (cache_entry_num_t b = 0; b < nentries_; b++) {
-      cache_entry& cb = entries_[b];
+      cache_entry& cb = entries_.emplace_back(std::forward<Args>(args)...);
       cb.allocated = false;
       cb.entry_num = b;
       lru_.push_front(b);
