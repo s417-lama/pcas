@@ -11,6 +11,8 @@ public:
     Init = 0,
 
     Willread,
+    Get,
+    Put,
     Checkout,
     Checkin,
     Release,
@@ -74,6 +76,8 @@ public:
       case value::Init:            return "";
 
       case value::Willread:        return "willread";
+      case value::Get:             return "get";
+      case value::Put:             return "put";
       case value::Checkout:        return "checkout";
       case value::Checkin:         return "checkin";
       case value::Release:         return "release";

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstring>
 #include <type_traits>
 #include <map>
 #include <unordered_map>
@@ -493,6 +494,12 @@ class pcas_if {
     /* MPI_Win_flush(target_rank, rm_.win); */
   }
 
+  template <access_mode Mode, bool DoCheckout>
+  void* checkout_impl(global_ptr<uint8_t> ptr, uint64_t size);
+
+  template <bool DoCheckout>
+  void checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mode mode);
+
 public:
   using logger = typename logger::template logger_if<logger::policy<P>>;
   using logger_kind = typename P::logger_kind_t::value;
@@ -519,6 +526,12 @@ public:
 
   template <typename T>
   void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
+
+  template <typename T>
+  void get_nocache(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems);
+
+  template <typename T>
+  void put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
 
   template <typename T>
   void willread(global_ptr<T> ptr, uint64_t nelems);
@@ -774,6 +787,35 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
+  uint64_t size = nelems * sizeof(T);
+  auto ev = logger::template record<logger_kind::Get>(size);
+
+  if (from_ptr.owner() != -1) {
+    die("unimplemented");
+  }
+
+  T* raw_ptr = (T*)checkout_impl<access_mode::read, false>(static_cast<global_ptr<uint8_t>>(from_ptr), size);
+  std::memcpy(to_ptr, raw_ptr, size);
+}
+
+template <typename P>
+template <typename T>
+inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
+  uint64_t size = nelems * sizeof(T);
+  auto ev = logger::template record<logger_kind::Put>(size);
+
+  if (to_ptr.owner() != -1) {
+    die("unimplemented");
+  }
+
+  T* raw_ptr = (T*)checkout_impl<access_mode::write, false>(static_cast<global_ptr<uint8_t>>(to_ptr), size);
+  std::memcpy(raw_ptr, from_ptr, size);
+  checkin_impl<false>(static_cast<global_ptr<uint8_t>>(to_ptr), size, access_mode::write);
+}
+
+template <typename P>
+template <typename T>
+inline void pcas_if<P>::get_nocache(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
   if (from_ptr.owner() == -1) {
     mem_obj& mo = objs_[from_ptr.id()];
     std::vector<MPI_Request> reqs;
@@ -806,7 +848,7 @@ inline void pcas_if<P>::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) 
 
 template <typename P>
 template <typename T>
-inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
   if (to_ptr.owner() == -1) {
     mem_obj& mo = objs_[to_ptr.id()];
 
@@ -905,6 +947,77 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
   pc.free(ps[1]);
 }
 
+PCAS_TEST_CASE("[pcas::pcas] get and put (nocache)") {
+  pcas pc;
+
+  int rank = pc.rank();
+
+  int n = 1000000;
+
+  global_ptr<int> ps[2];
+  ps[0] = pc.malloc<int, mem_mapper::block >(n);
+  ps[1] = pc.malloc<int, mem_mapper::cyclic>(n);
+
+  int* buf = new int[n + 2];
+
+  for (auto p : ps) {
+    if (rank == 0) {
+      for (int i = 0; i < n; i++) {
+        buf[i] = i;
+      }
+      pc.put_nocache(buf, p, n);
+    }
+
+    pc.barrier();
+
+    PCAS_SUBCASE("get the entire array") {
+      int special = 417;
+      buf[0] = buf[n + 1] = special;
+
+      pc.get_nocache(p, buf + 1, n);
+
+      for (int i = 0; i < n; i++) {
+        PCAS_CHECK(buf[i + 1] == i);
+      }
+      PCAS_CHECK(buf[0]     == special);
+      PCAS_CHECK(buf[n + 1] == special);
+    }
+
+    PCAS_SUBCASE("get the partial array") {
+      int ib = n / 5 * 2;
+      int ie = n / 5 * 4;
+      int s = ie - ib;
+
+      int special = 417;
+      buf[0] = buf[s + 1] = special;
+
+      pc.get_nocache(p + ib, buf + 1, s);
+
+      for (int i = 0; i < s; i++) {
+        PCAS_CHECK(buf[i + 1] == i + ib);
+      }
+      PCAS_CHECK(buf[0]     == special);
+      PCAS_CHECK(buf[s + 1] == special);
+    }
+
+    PCAS_SUBCASE("get each element") {
+      for (int i = 0; i < n; i++) {
+        int special = 417;
+        buf[0] = buf[2] = special;
+        pc.get_nocache(p + i, &buf[1], 1);
+        PCAS_CHECK(buf[0] == special);
+        PCAS_CHECK(buf[1] == i);
+        PCAS_CHECK(buf[2] == special);
+      }
+    }
+  }
+
+  delete[] buf;
+
+  pc.free(ps[0]);
+  pc.free(ps[1]);
+}
+
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
@@ -968,12 +1081,39 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkout>(size);
 
+  T* raw_ptr = (T*)checkout_impl<Mode, true>(static_cast<global_ptr<uint8_t>>(ptr), size);
+
+  auto ckey = std::make_pair((void*)raw_ptr, size);
+  auto c = checkouts_.find(ckey);
+  if (c != checkouts_.end()) {
+    // Only read-only access is allowed for overlapped checkout
+    // TODO: dynamic check for conflicting access when the region is overlapped but not the same
+    PCAS_CHECK(c->second.mode == access_mode::read);
+    PCAS_CHECK(Mode == access_mode::read);
+    c->second.count++;
+  } else {
+    checkouts_[ckey] = (checkout_entry){
+      .ptr = static_cast<global_ptr<uint8_t>>(ptr), .mode = Mode, .count = 1,
+    };
+  }
+
+  return raw_ptr;
+}
+
+template <typename P>
+template <access_mode Mode, bool DoCheckout>
+void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
   mem_obj& mo = objs_[ptr.id()];
+
+  const uint64_t offset_b = ptr.offset();
+  const uint64_t offset_e = offset_b + size;
+
+  PCAS_CHECK(offset_e <= mo.size);
 
   int n_prefetch = 0;
   if (Mode != access_mode::write) {
-    block_num_t block_num_b = ptr.offset() / block_size;
-    block_num_t block_num_e = (ptr.offset() + size + block_size - 1) / block_size;
+    block_num_t block_num_b = offset_b / block_size;
+    block_num_t block_num_e = (offset_e + block_size - 1) / block_size;
     if (block_num_b <= mo.last_checkout_block_num + 1 &&
         mo.last_checkout_block_num + 1 < block_num_e) {
       // If it seems sequential access, do prefetch
@@ -981,15 +1121,15 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     }
     mo.last_checkout_block_num = block_num_e - 1;
   }
-  uint64_t nelems_pf = std::min(size + n_prefetch * block_size,
-                                mo.size - ptr.offset()) / sizeof(T);
 
-  section block_section{0, block_size};
+  const uint64_t size_pf = std::min(size + n_prefetch * block_size, mo.size - offset_b);
+
+  const section block_section{0, block_size};
 
   // get cache blocks first, otherwise the same cache block may be assigned to multiple mem blocks
-  for_each_block(ptr, nelems_pf, [&](const auto& bi) {
+  for_each_block(ptr, size_pf, [&](const auto& bi) {
     if (is_locally_accessible(bi.owner)) {
-      bool is_prefetch = bi.offset_b >= ptr.offset() + size;
+      bool is_prefetch = bi.offset_b >= offset_e;
       if (!is_prefetch) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
 
@@ -1010,14 +1150,16 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
           remap_home_blocks_.push_back(&hb);
         }
 
-        hb.checkout_count++;
+        if (DoCheckout) {
+          hb.checkout_count++;
+        }
       }
     } else {
       // for each cache block
-      uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + nelems_pf * sizeof(T));
-      for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
+      uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+      uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+      for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
+        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
 
         cache_block& cb = std::invoke([&]() -> cache_block& {
           try {
@@ -1043,8 +1185,8 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
         cb.transitive = true;
 
-        bool is_prefetch = offset >= ptr.offset() + size;
-        if (!is_prefetch) {
+        bool is_prefetch = o >= offset_e;
+        if (DoCheckout && !is_prefetch) {
           cb.checkout_count++;
         }
       }
@@ -1052,12 +1194,12 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   });
 
   // begin fetching data
-  for_each_block(ptr, nelems_pf, [&](const auto& bi) {
+  for_each_block(ptr, size_pf, [&](const auto& bi) {
     if (!is_locally_accessible(bi.owner)) {
-      uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + nelems_pf * sizeof(T));
-      for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
+      uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+      uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+      for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
+        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
         cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
 
         if (cb.flushing && Mode != access_mode::read) {
@@ -1071,10 +1213,8 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         // If only a part of the block is written, we need to fetch the block
         // when this block is checked out again with read access mode.
         if (Mode == access_mode::write) {
-          uint64_t offset_in_block_b = (ptr.offset() > offset) ?
-                                       ptr.offset() - offset : 0;
-          uint64_t offset_in_block_e = (ptr.offset() + size < offset + block_size) ?
-                                       ptr.offset() + size - offset : block_size;
+          uint64_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
+          uint64_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
           sections_insert(cb.partial_sections, {offset_in_block_b, offset_in_block_e});
         }
 
@@ -1085,7 +1225,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
         // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
         // has been already fetched or not.
         if (Mode != access_mode::write) {
-          fetch_begin(mo, cb, bi.owner, bi.pm_offset + offset - bi.offset_b);
+          fetch_begin(mo, cb, bi.owner, bi.pm_offset + o - bi.offset_b);
           sections_insert(cb.partial_sections, block_section); // the entire cache block is now fetched
         }
 
@@ -1105,12 +1245,12 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   ensure_remapped();
 
   std::vector<MPI_Request> reqs;
-  for_each_block(ptr, nelems, [&](const auto& bi) {
+  for_each_block(ptr, size, [&](const auto& bi) {
     if (!is_locally_accessible(bi.owner)) {
-      uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + size);
-      for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
+      uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+      uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+      for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
+        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
         cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
 
         if (cb.cstate == cache_state::fetching) {
@@ -1123,27 +1263,11 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     }
   });
 
-  T* ret = (T*)((uint8_t*)mo.vm.addr() + ptr.offset());
-
-  auto ckey = std::make_pair((void*)ret, size);
-  auto c = checkouts_.find(ckey);
-  if (c != checkouts_.end()) {
-    // Only read-only access is allowed for overlapped checkout
-    // TODO: dynamic check for conflicting access when the region is overlapped but not the same
-    PCAS_CHECK(c->second.mode == access_mode::read);
-    PCAS_CHECK(Mode == access_mode::read);
-    c->second.count++;
-  } else {
-    checkouts_[ckey] = (checkout_entry){
-      .ptr = static_cast<global_ptr<uint8_t>>(ptr), .mode = Mode, .count = 1,
-    };
-  }
-
   if (!reqs.empty()) {
     MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
   }
 
-  return ret;
+  return (uint8_t*)mo.vm.addr() + offset_b;
 }
 
 template <typename P>
@@ -1159,37 +1283,47 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
   }
 
   checkout_entry che = c->second;
-  mem_obj& mo = objs_[che.ptr.id()];
+  checkin_impl<true>(che.ptr, size, che.mode);
 
-  for_each_block(che.ptr, size, [&](const auto& bi) {
+  if (--c->second.count == 0) {
+    checkouts_.erase(c);
+  }
+}
+
+template <typename P>
+template <bool DoCheckout>
+void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mode mode) {
+  mem_obj& mo = objs_[ptr.id()];
+
+  for_each_block(ptr, size, [&](const auto& bi) {
     if (is_locally_accessible(bi.owner)) {
-      uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
-      home_block& hb = mmap_cache_.ensure_cached((uintptr_t)vm_addr / block_size);
-      hb.checkout_count--;
+      if (DoCheckout) {
+        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
+        home_block& hb = mmap_cache_.ensure_cached((uintptr_t)vm_addr / block_size);
+        hb.checkout_count--;
+      }
     } else {
-      uint64_t offset_b = std::max(bi.offset_b, che.ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min(bi.offset_e, che.ptr.offset() + size);
+      uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
+      uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + size);
       for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
         cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
 
-        if (che.mode != access_mode::read) {
+        if (mode != access_mode::read) {
           n_dirty_cache_blocks_ += cb.dirty_sections.empty();
-          uint64_t offset_in_block_b = (che.ptr.offset() > offset) ?
-                                       che.ptr.offset() - offset : 0;
-          uint64_t offset_in_block_e = (che.ptr.offset() + size < offset + block_size) ?
-                                       che.ptr.offset() + size - offset : block_size;
+          uint64_t offset_in_block_b = (ptr.offset() > offset) ?
+                                       ptr.offset() - offset : 0;
+          uint64_t offset_in_block_e = (ptr.offset() + size < offset + block_size) ?
+                                       ptr.offset() + size - offset : block_size;
           sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
           cache_dirty_ = true;
         }
-        cb.checkout_count--;
+        if (DoCheckout) {
+          cb.checkout_count--;
+        }
       }
     }
   });
-
-  if (--c->second.count == 0) {
-    checkouts_.erase(ckey);
-  }
 
   if (enable_write_through_ == 1) {
     // 1: wait for PUT completion here (strict write-through)
