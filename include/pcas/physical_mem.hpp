@@ -107,7 +107,10 @@ public:
     }
   }
 
-  void* anon_vm_addr() const { return anon_vm_addr_; };
+  void* anon_vm_addr() const {
+    PCAS_CHECK(map_anon_);
+    return anon_vm_addr_;
+  };
 
 };
 

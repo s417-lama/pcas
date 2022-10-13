@@ -642,7 +642,7 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
     } else if (enable_shared_memory_) {
       int target_rank = intra2global_rank_[i];
       int target_local_size = mmapper->get_local_size(target_rank);
-      physical_mem pm(target_local_size, obj_id, i, false, false);
+      physical_mem pm(target_local_size, obj_id, i, false, true);
       home_pms[target_rank] = std::move(pm);
     }
   }
@@ -823,64 +823,87 @@ inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t ne
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::get_nocache(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
-  if (from_ptr.owner() == -1) {
-    mem_obj& mo = objs_[from_ptr.id()];
-    std::vector<MPI_Request> reqs;
+  uint64_t size = nelems * sizeof(T);
+  auto ev = logger::template record<logger_kind::Get>(size);
 
-    uint64_t offset_min = from_ptr.offset();
-    uint64_t offset_max = offset_min + nelems * sizeof(T);
+  if (from_ptr.owner() != -1) {
+    die("unimplemented");
+  }
 
-    for_each_block(from_ptr, nelems, [&](const auto& bi) {
-      uint64_t offset_b = std::max(bi.offset_b, offset_min);
-      uint64_t offset_e = std::min(bi.offset_e, offset_max);
-      uint64_t pm_offset = bi.pm_offset + offset_b - bi.offset_b;
+  mem_obj& mo = objs_[from_ptr.id()];
+
+  const uint64_t offset_b = from_ptr.offset();
+  const uint64_t offset_e = offset_b + nelems * sizeof(T);
+
+  std::vector<MPI_Request> reqs;
+
+  for_each_block(from_ptr, nelems, [&](const auto& bi) {
+    uint64_t block_offset_b = std::max(bi.offset_b, offset_b);
+    uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+    uint64_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
+
+    if (is_locally_accessible(bi.owner)) {
+      void* from_vm_addr = mo.home_pms[bi.owner].anon_vm_addr();
+      std::memcpy((uint8_t*)to_ptr - offset_b + block_offset_b,
+                  (uint8_t*)from_vm_addr + pm_offset,
+                  block_offset_e - block_offset_b);
+    } else {
       MPI_Request req;
-      MPI_Rget((uint8_t*)to_ptr - offset_min + offset_b,
-               offset_e - offset_b,
+      MPI_Rget((uint8_t*)to_ptr - offset_b + block_offset_b,
+               block_offset_e - block_offset_b,
                MPI_UINT8_T,
                bi.owner,
                pm_offset,
-               offset_e - offset_b,
+               block_offset_e - block_offset_b,
                MPI_UINT8_T,
                mo.win,
                &req);
       reqs.push_back(req);
-    });
+    }
+  });
 
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-  } else {
-    die("unimplemented");
-  }
+  MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
 }
 
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
-  if (to_ptr.owner() == -1) {
-    mem_obj& mo = objs_[to_ptr.id()];
+  uint64_t size = nelems * sizeof(T);
+  auto ev = logger::template record<logger_kind::Put>(size);
 
-    uint64_t offset_min = to_ptr.offset();
-    uint64_t offset_max = offset_min + nelems * sizeof(T);
+  if (to_ptr.owner() != -1) {
+    die("unimplemented");
+  }
 
-    for_each_block(to_ptr, nelems, [&](const auto& bi) {
-      uint64_t offset_b = std::max(bi.offset_b, offset_min);
-      uint64_t offset_e = std::min(bi.offset_e, offset_max);
-      uint64_t pm_offset = bi.pm_offset + offset_b - bi.offset_b;
-      MPI_Put((uint8_t*)from_ptr - offset_min + offset_b,
-              offset_e - offset_b,
+  mem_obj& mo = objs_[to_ptr.id()];
+
+  const uint64_t offset_b = to_ptr.offset();
+  const uint64_t offset_e = offset_b + nelems * sizeof(T);
+
+  for_each_block(to_ptr, nelems, [&](const auto& bi) {
+    uint64_t block_offset_b = std::max(bi.offset_b, offset_b);
+    uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+    uint64_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
+
+    if (is_locally_accessible(bi.owner)) {
+      void* to_vm_addr = mo.home_pms[bi.owner].anon_vm_addr();
+      std::memcpy((uint8_t*)to_vm_addr + pm_offset,
+                  (uint8_t*)from_ptr - offset_b + block_offset_b,
+                  block_offset_e - block_offset_b);
+    } else {
+      MPI_Put((uint8_t*)from_ptr - offset_b + block_offset_b,
+              block_offset_e - block_offset_b,
               MPI_UINT8_T,
               bi.owner,
               pm_offset,
-              offset_e - offset_b,
+              block_offset_e - block_offset_b,
               MPI_UINT8_T,
               mo.win);
-    });
+    }
+  });
 
-    // ensure remote completion
-    MPI_Win_flush_all(mo.win);
-  } else {
-    die("unimplemented");
-  }
+  // ensure remote completion
+  MPI_Win_flush_all(mo.win);
 }
 
 PCAS_TEST_CASE("[pcas::pcas] get and put") {
