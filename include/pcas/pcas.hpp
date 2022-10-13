@@ -1193,6 +1193,8 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
     }
   });
 
+  std::vector<MPI_Request> reqs;
+
   // begin fetching data
   for_each_block(ptr, size_pf, [&](const auto& bi) {
     if (!is_locally_accessible(bi.owner)) {
@@ -1235,33 +1237,22 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
           cb.cstate = cache_state::valid;
         }
 
+        if (cb.cstate == cache_state::fetching) {
+          PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
+          reqs.push_back(cb.req);
+          cb.req = MPI_REQUEST_NULL;
+        }
+
         PCAS_CHECK(cb.transitive);
         cb.transitive = false;
+
+        cb.cstate = cache_state::valid;
       }
     }
   });
 
   // Overlap communication and memory remapping
   ensure_remapped();
-
-  std::vector<MPI_Request> reqs;
-  for_each_block(ptr, size, [&](const auto& bi) {
-    if (!is_locally_accessible(bi.owner)) {
-      uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
-      uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
-      for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
-        cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
-
-        if (cb.cstate == cache_state::fetching) {
-          PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
-          reqs.push_back(cb.req);
-          cb.req = MPI_REQUEST_NULL;
-        }
-        cb.cstate = cache_state::valid;
-      }
-    }
-  });
 
   if (!reqs.empty()) {
     MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
