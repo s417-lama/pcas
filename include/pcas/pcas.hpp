@@ -191,6 +191,8 @@ class pcas_if {
 
   struct checkout_entry {
     global_ptr<uint8_t> ptr;
+    void*               raw_ptr;
+    uint64_t            size;
     access_mode         mode;
     uint64_t            count;
   };
@@ -258,8 +260,7 @@ class pcas_if {
   obj_id_t obj_id_count_ = 1; // TODO: better management of used IDs
   std::vector<std::optional<mem_obj>> objs_;
 
-  // FIXME: using map instead of unordered_map because std::pair needs a user-defined hash function
-  std::map<std::pair<void*, uint64_t>, checkout_entry> checkouts_;
+  std::vector<std::optional<checkout_entry>> checkouts_;
 
   mmap_cache_t mmap_cache_;
   cache_t cache_;
@@ -350,6 +351,29 @@ class pcas_if {
   mem_obj& get_mem_obj(obj_id_t id) {
     PCAS_CHECK(objs_[id].has_value());
     return *objs_[id];
+  }
+
+  std::optional<std::optional<checkout_entry>*> find_checkout_entry(void* raw_ptr, uint64_t size) {
+    for (auto& c : checkouts_) {
+      if (c.has_value() && c->raw_ptr == raw_ptr && c->size == size) {
+        return &c;
+      }
+    }
+    return std::nullopt;
+  }
+
+  void add_checkout_entry(checkout_entry che) {
+    for (auto& c : checkouts_) {
+      if (!c.has_value()) {
+        c = che;
+        return;
+      }
+    }
+    checkouts_.emplace_back(che);
+  }
+
+  void remove_checkout_entry(std::optional<checkout_entry>* c) {
+    c->reset();
   }
 
   uint64_t get_home_mmap_limit(uint64_t n_cache_blocks) {
@@ -460,7 +484,7 @@ class pcas_if {
   }
 
   void ensure_all_cache_clean() {
-    PCAS_CHECK(checkouts_.empty());
+    PCAS_CHECK(empty(checkouts_));
     flush_dirty_cache();
     complete_flush();
     PCAS_CHECK(n_dirty_cache_blocks_ == 0);
@@ -1108,18 +1132,18 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
   T* raw_ptr = (T*)checkout_impl<Mode, true>(static_cast<global_ptr<uint8_t>>(ptr), size);
 
-  auto ckey = std::make_pair((void*)raw_ptr, size);
-  auto c = checkouts_.find(ckey);
-  if (c != checkouts_.end()) {
+  auto c = find_checkout_entry(raw_ptr, size);
+  if (c.has_value()) {
     // Only read-only access is allowed for overlapped checkout
     // TODO: dynamic check for conflicting access when the region is overlapped but not the same
-    PCAS_CHECK(c->second.mode == access_mode::read);
+    PCAS_CHECK((**c)->mode == access_mode::read);
     PCAS_CHECK(Mode == access_mode::read);
-    c->second.count++;
+    (**c)->count++;
   } else {
-    checkouts_[ckey] = (checkout_entry){
-      .ptr = static_cast<global_ptr<uint8_t>>(ptr), .mode = Mode, .count = 1,
-    };
+    add_checkout_entry({
+      .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = raw_ptr,
+      .size = size, .mode = Mode, .count = 1,
+    });
   }
 
   return raw_ptr;
@@ -1274,17 +1298,15 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkin>();
 
-  auto ckey = std::make_pair((void*)raw_ptr, size);
-  auto c = checkouts_.find(ckey);
-  if (c == checkouts_.end()) {
+  auto c = find_checkout_entry((void*)raw_ptr, size);
+  if (!c.has_value()) {
     die("The region [%p, %p) passed to checkin() is not registered", raw_ptr, raw_ptr + size);
   }
 
-  checkout_entry che = c->second;
-  checkin_impl<true>(che.ptr, size, che.mode);
+  checkin_impl<true>((**c)->ptr, size, (**c)->mode);
 
-  if (--c->second.count == 0) {
-    checkouts_.erase(c);
+  if (--(**c)->count == 0) {
+    remove_checkout_entry(*c);
   }
 }
 
@@ -1319,6 +1341,7 @@ void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mod
 
           cache_dirty_ = true;
         }
+
         if (DoCheckout) {
           cb.checkout_count--;
         }
@@ -1495,7 +1518,7 @@ inline void pcas_if<P>::release() {
 
 template <typename P>
 inline void pcas_if<P>::release_lazy(release_handler* handler) {
-  PCAS_CHECK(checkouts_.empty());
+  PCAS_CHECK(empty(checkouts_));
 
   epoch_t next_epoch = cache_dirty_ ? rm_.remote->epoch + 1 : 0; // 0 means clean
   *handler = {.rank = cg_global_.rank, .epoch = next_epoch};

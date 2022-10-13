@@ -10,6 +10,7 @@
 #include <tuple>
 #include <sstream>
 #include <forward_list>
+#include <optional>
 
 #include <sys/syscall.h>
 #include <linux/sysctl.h>
@@ -106,6 +107,15 @@ inline size_t sys_mmap_entry_limit() {
   ifs >> sys_limit;
   return sys_limit;
 }
+
+template <typename T>
+inline bool empty(const std::vector<std::optional<T>>& v) {
+  return std::none_of(v.begin(), v.end(),
+                      [](const std::optional<T>& x) { return x.has_value(); });
+}
+
+// Section
+// -----------------------------------------------------------------------------
 
 using section = std::pair<uint32_t, uint32_t>;
 using sections = std::forward_list<section>;
