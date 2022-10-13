@@ -60,21 +60,7 @@ public:
                       access_mode         mode) override {
     return ((P*)this_p)->template checkout_impl<derived_t>(ptr, size, mode);
   }
-
-  template <typename Fn>
-  inline void for_each_block(uint64_t offset_b, uint64_t offset_e, Fn&& fn) {
-    uint64_t offset = offset_b;
-    while (offset < offset_e) {
-      const block_info bi = static_cast<derived_t&>(*this)._get_block_info(offset);
-      std::forward<Fn>(fn)(bi);
-      offset = bi.offset_e;
-    }
-  }
-
 };
-
-// Preset block distribution
-// -----------------------------------------------------------------------------
 
 template <typename P>
 class mem_mapper_block : public mem_mapper<mem_mapper_block, P> {
@@ -91,14 +77,6 @@ public:
     return get_local_size(0) * this->nproc_;
   }
 
-  block_info _get_block_info(uint64_t offset) {
-    PCAS_CHECK(offset < get_effective_size());
-    uint64_t size_l    = get_local_size(0);
-    int      owner     = offset / size_l;
-    uint64_t offset_b  = owner * size_l;
-    uint64_t offset_e  = std::min((owner + 1) * size_l, this->size_);
-    return block_info{owner, offset_b, offset_e, 0};
-  }
   block_info get_block_info(uint64_t offset) {
     PCAS_CHECK(offset < get_effective_size());
     uint64_t size_l    = get_local_size(0);
@@ -146,9 +124,6 @@ PCAS_TEST_CASE("[pcas::mem_mapper_block] get block information at specified offs
   PCAS_CHECK(block_index_info(bs * 11   , bs * 12 - 1, 4) == (block_info{3, bs * 9, bs * 12 - 1, 0}));
 }
 
-// Preset cycle distribution
-// -----------------------------------------------------------------------------
-
 template <typename P>
 class mem_mapper_cyclic : public mem_mapper<mem_mapper_cyclic, P> {
   size_t block_size_;
@@ -170,16 +145,6 @@ public:
     return get_local_size(0) * this->nproc_;
   }
 
-  block_info _get_block_info(uint64_t offset) {
-    PCAS_CHECK(offset < get_effective_size());
-    uint64_t block_num_g = offset / block_size_;
-    uint64_t block_num_l = block_num_g / this->nproc_;
-    int      owner       = block_num_g % this->nproc_;
-    uint64_t offset_b    = block_num_g * block_size_;
-    uint64_t offset_e    = std::min((block_num_g + 1) * block_size_, this->size_);
-    uint64_t pm_offset   = block_num_l * block_size_;
-    return block_info{owner, offset_b, offset_e, pm_offset};
-  }
   block_info get_block_info(uint64_t offset) {
     PCAS_CHECK(offset < get_effective_size());
     uint64_t block_num_g = offset / block_size_;
