@@ -1237,16 +1237,19 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
           cb.cstate = cache_state::valid;
         }
 
-        if (cb.cstate == cache_state::fetching) {
-          PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
-          reqs.push_back(cb.req);
-          cb.req = MPI_REQUEST_NULL;
-        }
-
         PCAS_CHECK(cb.transitive);
         cb.transitive = false;
 
-        cb.cstate = cache_state::valid;
+        bool is_prefetch = o >= offset_e;
+        if (!is_prefetch) {
+          if (cb.cstate == cache_state::fetching) {
+            PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
+            reqs.push_back(cb.req);
+            cb.req = MPI_REQUEST_NULL;
+          }
+
+          cb.cstate = cache_state::valid;
+        }
       }
     }
   });
