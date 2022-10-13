@@ -222,6 +222,7 @@ class pcas_if {
     }
   };
 
+  template <bool Free>
   struct comm_group {
     int      rank  = -1;
     int      nproc = -1;
@@ -233,6 +234,12 @@ class pcas_if {
       PCAS_CHECK(rank != -1);
       PCAS_CHECK(nproc != -1);
     }
+
+    ~comm_group() {
+      if (Free) {
+        MPI_Comm_free(&comm);
+      }
+    }
   };
 
   // Member variables
@@ -240,9 +247,9 @@ class pcas_if {
 
   bool validate_dummy_; // for initialization
 
-  comm_group cg_global_;
-  comm_group cg_intra_;
-  comm_group cg_inter_;
+  comm_group<false> cg_global_;
+  comm_group<true>  cg_intra_;
+  comm_group<true>  cg_inter_;
 
   std::vector<std::pair<int, int>> process_map_; // pair: (intra, inter rank)
   std::vector<int> intra2global_rank_;
@@ -516,7 +523,6 @@ public:
   constexpr static uint64_t block_size = P::block_size;
 
   pcas_if(uint64_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
-  ~pcas_if();
 
   int rank() const { return cg_global_.rank; }
   int nproc() const { return cg_global_.nproc; }
@@ -594,13 +600,6 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
   barrier();
 }
 
-template <typename P>
-inline pcas_if<P>::~pcas_if() {
-  MPI_Comm_free(&cg_intra_.comm);
-  MPI_Comm_free(&cg_inter_.comm);
-  /* barrier(); */
-}
-
 PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
   for (int i = 0; i < 3; i++) {
     pcas pc;
@@ -616,8 +615,7 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
 
   uint64_t size = nelems * sizeof(T);
 
-  std::unique_ptr<MemMapper<block_size>> mmapper(
-    new MemMapper<block_size>(size, cg_global_.nproc, mmargs...));
+  auto mmapper = std::make_unique<MemMapper<block_size>>(size, cg_global_.nproc, mmargs...);
 
   uint64_t local_size = mmapper->get_local_size(cg_global_.rank);
   uint64_t effective_size = mmapper->get_effective_size();
@@ -1038,8 +1036,6 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
   const uint64_t offset_b = ptr.offset();
   const uint64_t offset_e = offset_b + size;
 
-  const section block_section{0, block_size};
-
   try {
     for_each_block(ptr, size, [&](const auto& bi) {
       if (!is_locally_accessible(bi.owner)) {
@@ -1058,7 +1054,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
           cb.transaction_id = transaction_id_;
 
           fetch_begin(mo, cb, bi.owner, bi.pm_offset + o - bi.offset_b);
-          sections_insert(cb.partial_sections, block_section);
+          sections_insert(cb.partial_sections, {0, block_size});
         }
       }
     });
@@ -1105,21 +1101,17 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
 
   PCAS_CHECK(offset_e <= mo.size);
 
-  int n_prefetch = 0;
-  if (Mode != access_mode::write) {
+  uint64_t size_pf = size;
+  if (Mode != access_mode::write && n_prefetch_ > 0) {
     block_num_t block_num_b = offset_b / block_size;
     block_num_t block_num_e = (offset_e + block_size - 1) / block_size;
     if (block_num_b <= mo.last_checkout_block_num + 1 &&
         mo.last_checkout_block_num + 1 < block_num_e) {
       // If it seems sequential access, do prefetch
-      n_prefetch = n_prefetch_;
+      size_pf = std::min(size + n_prefetch_ * block_size, mo.size - offset_b);
     }
     mo.last_checkout_block_num = block_num_e - 1;
   }
-
-  const uint64_t size_pf = std::min(size + n_prefetch * block_size, mo.size - offset_b);
-
-  const section block_section{0, block_size};
 
   std::vector<MPI_Request> reqs;
 
@@ -1155,7 +1147,7 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
     } else {
       // for each cache block
       uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
-      uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+      uint64_t block_offset_e = std::min(bi.offset_e, offset_b + size_pf);
       for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
 
@@ -1207,7 +1199,7 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
         // has been already fetched or not.
         if (Mode != access_mode::write) {
           fetch_begin(mo, cb, bi.owner, bi.pm_offset + o - bi.offset_b);
-          sections_insert(cb.partial_sections, block_section); // the entire cache block is now fetched
+          sections_insert(cb.partial_sections, {0, block_size}); // the entire cache block is now fetched
         }
 
         bool is_prefetch = o >= offset_e;
@@ -1267,6 +1259,9 @@ template <bool DoCheckout>
 void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mode mode) {
   mem_obj& mo = objs_[ptr.id()];
 
+  const uint64_t offset_b = ptr.offset();
+  const uint64_t offset_e = offset_b + size;
+
   for_each_block(ptr, size, [&](const auto& bi) {
     if (is_locally_accessible(bi.owner)) {
       if (DoCheckout) {
@@ -1275,19 +1270,19 @@ void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mod
         hb.checkout_count--;
       }
     } else {
-      uint64_t offset_b = std::max(bi.offset_b, ptr.offset() / block_size * block_size);
-      uint64_t offset_e = std::min(bi.offset_e, ptr.offset() + size);
-      for (uint64_t offset = offset_b; offset < offset_e; offset += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + offset;
+      uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+      uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+      for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
+        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
         cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
 
         if (mode != access_mode::read) {
           n_dirty_cache_blocks_ += cb.dirty_sections.empty();
-          uint64_t offset_in_block_b = (ptr.offset() > offset) ?
-                                       ptr.offset() - offset : 0;
-          uint64_t offset_in_block_e = (ptr.offset() + size < offset + block_size) ?
-                                       ptr.offset() + size - offset : block_size;
+
+          uint64_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
+          uint64_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
           sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+
           cache_dirty_ = true;
         }
         if (DoCheckout) {
