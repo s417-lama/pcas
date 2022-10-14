@@ -353,13 +353,13 @@ class pcas_if {
     return *objs_[id];
   }
 
-  std::optional<std::optional<checkout_entry>*> find_checkout_entry(void* raw_ptr, uint64_t size) {
+  std::optional<checkout_entry>* find_checkout_entry(void* raw_ptr, uint64_t size) {
     for (auto& c : checkouts_) {
       if (c.has_value() && c->raw_ptr == raw_ptr && c->size == size) {
         return &c;
       }
     }
-    return std::nullopt;
+    return nullptr;
   }
 
   void add_checkout_entry(checkout_entry che) {
@@ -373,6 +373,7 @@ class pcas_if {
   }
 
   void remove_checkout_entry(std::optional<checkout_entry>* c) {
+    PCAS_CHECK(c);
     c->reset();
   }
 
@@ -1145,12 +1146,12 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
     checkout_impl<Mode, true>(static_cast<global_ptr<uint8_t>>(ptr), size);
 
   auto c = find_checkout_entry(raw_ptr, size);
-  if (c.has_value()) {
+  if (c) {
     // Only read-only access is allowed for overlapped checkout
     // TODO: dynamic check for conflicting access when the region is overlapped but not the same
-    PCAS_CHECK((**c)->mode == access_mode::read);
+    PCAS_CHECK((*c)->mode == access_mode::read);
     PCAS_CHECK(Mode == access_mode::read);
-    (**c)->count++;
+    (*c)->count++;
   } else {
     add_checkout_entry({
       .ptr = static_cast<global_ptr<uint8_t>>(ptr), .raw_ptr = raw_ptr,
@@ -1313,14 +1314,14 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
   auto ev = logger::template record<logger_kind::Checkin>();
 
   auto c = find_checkout_entry((void*)raw_ptr, size);
-  if (!c.has_value()) {
+  if (!c) {
     die("The region [%p, %p) passed to checkin() is not registered", raw_ptr, raw_ptr + size);
   }
 
-  checkin_impl<true>((**c)->ptr, size, (**c)->mode);
+  checkin_impl<true>((*c)->ptr, size, (*c)->mode);
 
-  if (--(**c)->count == 0) {
-    remove_checkout_entry(*c);
+  if (--(*c)->count == 0) {
+    remove_checkout_entry(c);
   }
 }
 
