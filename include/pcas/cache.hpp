@@ -89,6 +89,7 @@ public:
     return table_.find(key) != table_.end();
   }
 
+  template <bool UpdateLRU = true>
   Entry& ensure_cached(Key key) {
     auto it = table_.find(key);
     if (it == table_.end()) {
@@ -100,12 +101,16 @@ public:
       cb.allocated = true;
       cb.key = key;
       table_[key] = b;
-      move_to_back_lru(cb);
+      if (UpdateLRU) {
+        move_to_back_lru(cb);
+      }
       return cb.entry;
     } else {
       cache_entry_num_t b = it->second;
       cache_entry& cb = entries_[b];
-      move_to_back_lru(cb);
+      if (UpdateLRU) {
+        move_to_back_lru(cb);
+      }
       return cb.entry;
     }
   }

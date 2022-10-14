@@ -1337,7 +1337,7 @@ void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mod
     if (is_locally_accessible(bi.owner)) {
       if (DoCheckout) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
-        home_block& hb = mmap_cache_.ensure_cached((uintptr_t)vm_addr / block_size);
+        home_block& hb = mmap_cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
         hb.checkout_count--;
       }
     } else {
@@ -1345,7 +1345,7 @@ void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mod
       uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
       for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
         uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
-        cache_block& cb = cache_.ensure_cached((uintptr_t)vm_addr / block_size);
+        cache_block& cb = cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
 
         if (mode != access_mode::read) {
           n_dirty_cache_blocks_ += cb.dirty_sections.empty();
