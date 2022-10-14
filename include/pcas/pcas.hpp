@@ -98,6 +98,9 @@ class pcas_if {
       PCAS_CHECK(prev_vm_addr == nullptr);
       prev_vm_addr = (uint8_t*)vm_addr;
       mapped = false;
+
+      // for safety
+      outer.home_tlb_.clear();
     }
 
     void on_cache_map(cache_entry_num_t b) {
@@ -167,6 +170,9 @@ class pcas_if {
       PCAS_CHECK(prev_vm_addr == nullptr);
       prev_vm_addr = (uint8_t*)vm_addr;
       mapped = false;
+
+      // for safety
+      outer.cache_tlb_.clear();
     }
 
     void on_cache_map(cache_entry_num_t b) {
@@ -245,6 +251,38 @@ class pcas_if {
     }
   };
 
+  template <typename T, int MaxEntries = 3>
+  class tlb {
+    std::array<std::optional<T>, MaxEntries> entries_;
+    int last_index_ = 0;
+
+  public:
+    template <typename Fn>
+    std::optional<T> find(Fn&& f) {
+      for (auto& e : entries_) {
+        if (e.has_value()) {
+          bool found = std::forward<Fn>(f)(*e);
+          if (found) {
+            return *e;
+          }
+        }
+      }
+      return std::nullopt;
+    }
+
+    void add(T entry) {
+      int idx = last_index_ % MaxEntries;
+      entries_[idx] = entry;
+      last_index_++;
+    }
+
+    void clear() {
+      for (auto& e : entries_) {
+        e.reset();
+      }
+    }
+  };
+
   // Member variables
   // -----------------------------------------------------------------------------
 
@@ -268,6 +306,9 @@ class pcas_if {
 
   std::vector<home_block*> remap_home_blocks_;
   std::vector<cache_block*> remap_cache_blocks_;
+
+  tlb<home_block*> home_tlb_;
+  tlb<cache_block*> cache_tlb_;
 
   uint64_t transaction_id_ = 1;
 
@@ -412,6 +453,10 @@ class pcas_if {
 
   void fetch_begin(mem_obj& mo, cache_block& cb, int owner, size_t owner_disp) {
     void* cache_block_ptr = cache_pm_.anon_vm_addr();
+
+    PCAS_CHECK(owner < cg_global_.nproc);
+    PCAS_CHECK(owner_disp + block_size <= mo.mmapper->get_local_size(owner));
+
     int count = 0;
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
@@ -498,6 +543,7 @@ class pcas_if {
     cache_.for_each_entry([&](cache_block& cb) {
       cb.invalidate();
     });
+    cache_tlb_.clear();
   }
 
   epoch_t get_remote_epoch(int target_rank) {
@@ -719,6 +765,9 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
     mmap_cache_.ensure_evicted((uintptr_t)vm_addr / block_size);
     cache_.ensure_evicted((uintptr_t)vm_addr / block_size);
   }
+
+  home_tlb_.clear();
+  cache_tlb_.clear();
 
   MPI_Win_unlock_all(mo.win);
   MPI_Win_free(&mo.win);
@@ -1164,13 +1213,72 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
+inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
   mem_obj& mo = get_mem_obj(ptr.id());
 
   const uint64_t offset_b = ptr.offset();
   const uint64_t offset_e = offset_b + size;
 
   PCAS_CHECK(offset_e <= mo.size);
+
+  uint8_t* raw_ptr = (uint8_t*)mo.vm.addr() + offset_b;
+
+  // fast path for small requests using TLB
+  {
+    std::optional<home_block*> hbe = home_tlb_.find([&](const home_block* hb) {
+      return hb->vm_addr <= raw_ptr && raw_ptr + size <= hb->vm_addr + hb->size;
+    });
+    if (hbe.has_value()) {
+      home_block& hb = **hbe;
+      PCAS_ASSERT(hb.mapped);
+      if (DoCheckout) {
+        hb.checkout_count++;
+      }
+      return raw_ptr;
+    }
+
+    bool is_within_block = offset_b / block_size == (offset_e - 1) / block_size;
+    if (is_within_block) { // TLB works only for requests within each cache block
+      std::optional<cache_block*> cbe = cache_tlb_.find([&](const cache_block* cb) {
+        return cb->vm_addr <= raw_ptr && raw_ptr + size <= cb->vm_addr + block_size;
+      });
+      if (cbe.has_value()) {
+        cache_block& cb = **cbe;
+        PCAS_ASSERT(cb.cstate == cache_state::valid);
+        PCAS_ASSERT(cb.mapped);
+
+        if (cb.flushing && Mode != access_mode::read) {
+          auto ev2 = logger::template record<logger_kind::FlushConflicted>();
+          complete_flush();
+        }
+
+        if (Mode == access_mode::write) {
+          uint64_t offset_in_block_b = raw_ptr - cb.vm_addr;
+          uint64_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
+          sections_insert(cb.partial_sections, {offset_in_block_b, offset_in_block_e});
+        }
+
+        if (Mode != access_mode::write &&
+            *cb.partial_sections.begin() != section{0, block_size}) {
+          // fetch the rest of the block
+          auto bi = mo.mmapper->get_block_info(offset_b);
+          fetch_begin(mo, cb, bi.owner, bi.pm_offset + offset_b / block_size * block_size - bi.offset_b);
+
+          PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
+          MPI_Wait(&cb.req, MPI_STATUS_IGNORE);
+          PCAS_CHECK(cb.req == MPI_REQUEST_NULL);
+
+          cb.cstate = cache_state::valid;
+          sections_insert(cb.partial_sections, {0, block_size}); // the entire cache block is now fetched
+        }
+
+        if (DoCheckout) {
+          cb.checkout_count++;
+        }
+        return raw_ptr;
+      }
+    }
+  }
 
   uint64_t size_pf = size;
   if (Mode != access_mode::write && n_prefetch_ > 0) {
@@ -1214,6 +1322,8 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
         if (DoCheckout) {
           hb.checkout_count++;
         }
+
+        home_tlb_.add(&hb);
       }
     } else {
       // for each cache block
@@ -1286,6 +1396,8 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
           }
 
           cb.cstate = cache_state::valid;
+
+          cache_tlb_.add(&cb);
         }
       }
     }
@@ -1302,7 +1414,7 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
     MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
   }
 
-  return (uint8_t*)mo.vm.addr() + offset_b;
+  return raw_ptr;
 }
 
 template <typename P>
@@ -1327,41 +1439,87 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
 
 template <typename P>
 template <bool DoCheckout>
-void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mode mode) {
+inline void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mode mode) {
   mem_obj& mo = get_mem_obj(ptr.id());
 
   const uint64_t offset_b = ptr.offset();
   const uint64_t offset_e = offset_b + size;
 
-  for_each_block(ptr, size, [&](const auto& bi) {
-    if (is_locally_accessible(bi.owner)) {
-      if (DoCheckout) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
-        home_block& hb = mmap_cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
-        hb.checkout_count--;
-      }
-    } else {
-      uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
-      uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
-      for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
-        cache_block& cb = cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
+  uint8_t* raw_ptr = (uint8_t*)mo.vm.addr() + offset_b;
 
-        if (mode != access_mode::read) {
-          n_dirty_cache_blocks_ += cb.dirty_sections.empty();
-
-          uint64_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
-          uint64_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
-          sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
-
-          cache_dirty_ = true;
-        }
-
+  std::invoke([&]() { // for early return
+    // fast path for small requests using TLB
+    {
+      std::optional<home_block*> hbe = home_tlb_.find([&](const home_block* hb) {
+        return hb->vm_addr <= raw_ptr && raw_ptr + size <= hb->vm_addr + hb->size;
+      });
+      if (hbe.has_value()) {
+        home_block& hb = **hbe;
+        PCAS_ASSERT(hb.mapped);
         if (DoCheckout) {
-          cb.checkout_count--;
+          hb.checkout_count--;
+        }
+        return;
+      }
+
+      bool is_within_block = offset_b / block_size == (offset_e - 1) / block_size;
+      if (is_within_block) {
+        std::optional<cache_block*> cbe = cache_tlb_.find([&](const cache_block* cb) {
+          return cb->vm_addr <= raw_ptr && raw_ptr + size <= cb->vm_addr + block_size;
+        });
+        if (cbe.has_value()) {
+          cache_block& cb = **cbe;
+          PCAS_ASSERT(cb.cstate == cache_state::valid);
+          PCAS_ASSERT(cb.mapped);
+
+          if (mode != access_mode::read) {
+            n_dirty_cache_blocks_ += cb.dirty_sections.empty();
+
+            uint64_t offset_in_block_b = raw_ptr - cb.vm_addr;
+            uint64_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
+            sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+
+            cache_dirty_ = true;
+          }
+
+          if (DoCheckout) {
+            cb.checkout_count--;
+          }
+          return;
         }
       }
     }
+
+    for_each_block(ptr, size, [&](const auto& bi) {
+      if (is_locally_accessible(bi.owner)) {
+        if (DoCheckout) {
+          uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
+          home_block& hb = mmap_cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
+          hb.checkout_count--;
+        }
+      } else {
+        uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+        uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
+        for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
+          uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
+          cache_block& cb = cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
+
+          if (mode != access_mode::read) {
+            n_dirty_cache_blocks_ += cb.dirty_sections.empty();
+
+            uint64_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
+            uint64_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
+            sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+
+            cache_dirty_ = true;
+          }
+
+          if (DoCheckout) {
+            cb.checkout_count--;
+          }
+        }
+      }
+    });
   });
 
   if (enable_write_through_ == 1) {
