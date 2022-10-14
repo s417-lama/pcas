@@ -569,14 +569,16 @@ public:
   template <typename T, typename Func>
   void for_each_block(global_ptr<T> ptr, uint64_t nelems, Func fn);
 
-  template <typename T>
-  void get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems);
+  template <typename ConstT, typename T>
+  std::enable_if_t<std::is_same_v<std::remove_const_t<ConstT>, T>>
+  get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems);
 
   template <typename T>
   void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
 
-  template <typename T>
-  void get_nocache(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems);
+  template <typename ConstT, typename T>
+  std::enable_if_t<std::is_same_v<std::remove_const_t<ConstT>, T>>
+  get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems);
 
   template <typename T>
   void put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
@@ -827,8 +829,9 @@ PCAS_TEST_CASE("[pcas::pcas] loop over blocks") {
 }
 
 template <typename P>
-template <typename T>
-inline void pcas_if<P>::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
+template <typename ConstT, typename T>
+inline std::enable_if_t<std::is_same_v<std::remove_const_t<ConstT>, T>>
+pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
 
@@ -843,6 +846,8 @@ inline void pcas_if<P>::get(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) 
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
+  static_assert(!std::is_const_v<T>);
+
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Put>(size);
 
@@ -856,8 +861,9 @@ inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t ne
 }
 
 template <typename P>
-template <typename T>
-inline void pcas_if<P>::get_nocache(global_ptr<T> from_ptr, T* to_ptr, uint64_t nelems) {
+template <typename ConstT, typename T>
+inline std::enable_if_t<std::is_same_v<std::remove_const_t<ConstT>, T>>
+pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
 
@@ -903,6 +909,8 @@ inline void pcas_if<P>::get_nocache(global_ptr<T> from_ptr, T* to_ptr, uint64_t 
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
+  static_assert(!std::is_const_v<T>);
+
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Put>(size);
 
@@ -1127,10 +1135,14 @@ template <typename P>
 template <access_mode Mode, typename T>
 inline std::conditional_t<Mode == access_mode::read, const T*, T*>
 pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
+  // If T is const, then it cannot be checked out with write access mode
+  static_assert(!std::is_const_v<T> || Mode == access_mode::read);
+
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkout>(size);
 
-  T* raw_ptr = (T*)checkout_impl<Mode, true>(static_cast<global_ptr<uint8_t>>(ptr), size);
+  auto raw_ptr = (std::remove_const_t<T>*)
+    checkout_impl<Mode, true>(static_cast<global_ptr<uint8_t>>(ptr), size);
 
   auto c = find_checkout_entry(raw_ptr, size);
   if (c.has_value()) {
@@ -1295,6 +1307,8 @@ void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
+  // TODO: judge access mode by its type (const/nonconst)?
+
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkin>();
 
