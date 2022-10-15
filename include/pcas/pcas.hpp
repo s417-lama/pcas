@@ -314,9 +314,10 @@ class pcas_if {
   release_manager rm_;
 
   std::vector<MPI_Win> flushing_wins_;
+  bool early_flushing_ = false;
 
-  uint64_t n_dirty_cache_blocks_ = 0;
   uint64_t max_dirty_cache_blocks_;
+  std::vector<cache_block*> dirty_cache_blocks_;
 
   int enable_shared_memory_;
   int n_prefetch_;
@@ -481,6 +482,20 @@ class pcas_if {
     }
   }
 
+  void add_dirty_cache_block(cache_block& cb) {
+    dirty_cache_blocks_.push_back(&cb);
+    cache_dirty_ = true;
+
+    if (P::enable_write_through) {
+      flush_dirty_cache_block(cb);
+    } else if (dirty_cache_blocks_.size() >= max_dirty_cache_blocks_) {
+      auto ev = logger::template record<logger_kind::FlushEarly>();
+      flush_dirty_cache();
+      dirty_cache_blocks_.clear();
+      early_flushing_ = true;
+    }
+  }
+
   void flush_dirty_cache_block(cache_block& cb) {
     PCAS_CHECK(!cb.flushing);
 
@@ -507,29 +522,36 @@ class pcas_if {
     if (w == flushing_wins_.end()) {
       flushing_wins_.push_back(mo.win);
     }
-    n_dirty_cache_blocks_--;
   }
 
   void flush_dirty_cache() {
-    if (!P::enable_write_through && cache_dirty_) {
-      cache_.for_each_entry([&](cache_block& cb) {
-        if (cb.mapped && !cb.dirty_sections.empty()) {
-          flush_dirty_cache_block(cb);
-        }
-      });
+    for (auto& cb : dirty_cache_blocks_) {
+      if (!cb->dirty_sections.empty()) {
+        flush_dirty_cache_block(*cb);
+      }
     }
   }
 
   void complete_flush() {
     if (!flushing_wins_.empty()) {
+      if (early_flushing_) {
+        // When early flush happened, dirty_cache_blocks_ was cleared, so we cannot make
+        // assumption on which cache blocks are possibly flushing here
+        cache_.for_each_entry([&](cache_block& cb) {
+          cb.flushing = false;
+        });
+        early_flushing_ = false;
+      } else {
+        // We can reduce the number of iterations if early flush did not happen
+        for (auto& cb : dirty_cache_blocks_) {
+          cb->flushing = false;
+        }
+      }
+
       for (auto win : flushing_wins_) {
         MPI_Win_flush_all(win);
       }
       flushing_wins_.clear();
-
-      cache_.for_each_entry([&](cache_block& cb) {
-        cb.flushing = false;
-      });
     }
   }
 
@@ -537,10 +559,13 @@ class pcas_if {
     PCAS_CHECK(empty(checkouts_));
     flush_dirty_cache();
     complete_flush();
-    PCAS_CHECK(n_dirty_cache_blocks_ == 0);
 
-    cache_dirty_ = false;
-    rm_.remote->epoch++;
+    dirty_cache_blocks_.clear();
+
+    if (cache_dirty_) {
+      cache_dirty_ = false;
+      rm_.remote->epoch++;
+    }
   }
 
   void cache_invalidate_all() {
@@ -683,6 +708,8 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
 
   logger::init(cg_global_.rank, cg_global_.nproc);
 
+  dirty_cache_blocks_.reserve(max_dirty_cache_blocks_);
+
   barrier();
 }
 
@@ -758,7 +785,7 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
 
   // ensure free safety
   ensure_remapped();
-  complete_flush();
+  ensure_all_cache_clean();
 
   mem_obj& mo = get_mem_obj(ptr.id());
 
@@ -1342,9 +1369,7 @@ inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
           try {
             return cache_.ensure_cached((uintptr_t)vm_addr / block_size);
           } catch (cache_full_exception& e) {
-            complete_flush();
-            flush_dirty_cache();
-            complete_flush();
+            ensure_all_cache_clean();
             try {
               return cache_.ensure_cached((uintptr_t)vm_addr / block_size);
             } catch (cache_full_exception& e) {
@@ -1478,16 +1503,14 @@ inline void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, acc
         PCAS_ASSERT(cb.mapped);
 
         if (mode != access_mode::read) {
-          n_dirty_cache_blocks_ += cb.dirty_sections.empty();
+          bool is_new_dirty_block = cb.dirty_sections.empty();
 
           uint64_t offset_in_block_b = raw_ptr - cb.vm_addr;
           uint64_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
           sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
 
-          cache_dirty_ = true;
-
-          if (P::enable_write_through) {
-            flush_dirty_cache_block(cb);
+          if (is_new_dirty_block) {
+            add_dirty_cache_block(cb);
           }
         }
 
@@ -1514,16 +1537,14 @@ inline void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, acc
         cache_block& cb = cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
 
         if (mode != access_mode::read) {
-          n_dirty_cache_blocks_ += cb.dirty_sections.empty();
+          bool is_new_dirty_block = cb.dirty_sections.empty();
 
           uint64_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
           uint64_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
           sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
 
-          cache_dirty_ = true;
-
-          if (P::enable_write_through) {
-            flush_dirty_cache_block(cb);
+          if (is_new_dirty_block) {
+            add_dirty_cache_block(cb);
           }
         }
 
@@ -1729,11 +1750,6 @@ inline void pcas_if<P>::barrier() {
 
 template <typename P>
 inline void pcas_if<P>::poll() {
-  if (n_dirty_cache_blocks_ >= max_dirty_cache_blocks_) {
-    auto ev = logger::template record<logger_kind::FlushEarly>();
-    flush_dirty_cache();
-  }
-
   if (rm_.remote->request > rm_.remote->epoch) {
     auto ev = logger::template record<logger_kind::ReleaseLazy>();
     PCAS_CHECK(rm_.remote->request == rm_.remote->epoch + 1);
