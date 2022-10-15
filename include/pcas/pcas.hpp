@@ -4,7 +4,6 @@
 #include <type_traits>
 #include <map>
 #include <unordered_map>
-#include <unordered_set>
 #include <memory>
 #include <functional>
 #include <optional>
@@ -316,7 +315,7 @@ class pcas_if {
   bool cache_dirty_ = false;
   release_manager rm_;
 
-  std::unordered_set<MPI_Win> flushing_wins_;
+  std::vector<MPI_Win> flushing_wins_;
 
   uint64_t n_dirty_cache_blocks_ = 0;
   uint64_t max_dirty_cache_blocks_;
@@ -506,7 +505,10 @@ class pcas_if {
     cb.dirty_sections.clear();
     cb.flushing = true;
 
-    flushing_wins_.insert(mo.win);
+    auto w = std::find(flushing_wins_.begin(), flushing_wins_.end(), mo.win);
+    if (w == flushing_wins_.end()) {
+      flushing_wins_.push_back(mo.win);
+    }
     n_dirty_cache_blocks_--;
   }
 
