@@ -2,8 +2,6 @@
 
 #include <cstring>
 #include <type_traits>
-#include <map>
-#include <unordered_map>
 #include <memory>
 #include <functional>
 #include <optional>
@@ -184,15 +182,15 @@ class pcas_if {
   using cache_t = cache_system<uintptr_t, cache_block>;
 
   struct mem_obj {
-    int                                   owner;
-    obj_id_t                              id;
-    uint64_t                              size;
-    uint64_t                              effective_size;
-    std::unique_ptr<mem_mapper::base>     mmapper;
-    std::unordered_map<int, physical_mem> home_pms;
-    virtual_mem                           vm;
-    block_num_t                           last_checkout_block_num;
-    MPI_Win                               win;
+    int                               owner;
+    obj_id_t                          id;
+    uint64_t                          size;
+    uint64_t                          effective_size;
+    std::unique_ptr<mem_mapper::base> mmapper;
+    std::vector<physical_mem>         home_pms; // intra-rank -> pm
+    virtual_mem                       vm;
+    block_num_t                       last_checkout_block_num;
+    MPI_Win                           win;
   };
 
   struct checkout_entry {
@@ -292,7 +290,7 @@ class pcas_if {
   comm_group<true>  cg_intra_;
   comm_group<true>  cg_inter_;
 
-  std::vector<std::pair<int, int>> process_map_; // pair: (intra, inter rank)
+  std::vector<std::pair<int, int>> process_map_; // global_rank -> (intra, inter rank)
   std::vector<int> intra2global_rank_;
 
   obj_id_t obj_id_count_ = 1; // TODO: better management of used IDs
@@ -661,7 +659,7 @@ public:
   template <typename T>
   void* get_physical_mem(global_ptr<T> ptr) {
     mem_obj& mo = get_mem_obj(ptr.id());
-    return mo.home_pms[cg_global_.rank].anon_vm_addr();
+    return mo.home_pms[cg_intra_.rank].anon_vm_addr();
   }
 
 };
@@ -723,15 +721,15 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
   MPI_Win_lock_all(0, win);
 
   // Open home physical memory of other intra-node processes
-  std::unordered_map<int, physical_mem> home_pms;
+  std::vector<physical_mem> home_pms(cg_intra_.nproc);
   for (int i = 0; i < cg_intra_.nproc; i++) {
     if (i == cg_intra_.rank) {
-      home_pms[cg_global_.rank] = std::move(pm_local);
+      home_pms[i] = std::move(pm_local);
     } else if (enable_shared_memory_) {
       int target_rank = intra2global_rank_[i];
       int target_local_size = mmapper->get_local_size(target_rank);
       physical_mem pm(target_local_size, obj_id, i, false, true);
-      home_pms[target_rank] = std::move(pm);
+      home_pms[i] = std::move(pm);
     }
   }
 
@@ -939,7 +937,8 @@ pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems)
     uint64_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
 
     if (is_locally_accessible(bi.owner)) {
-      void* from_vm_addr = mo.home_pms[bi.owner].anon_vm_addr();
+      int target_intra_rank = process_map_[bi.owner].first;
+      void* from_vm_addr = mo.home_pms[target_intra_rank].anon_vm_addr();
       std::memcpy((uint8_t*)to_ptr - offset_b + block_offset_b,
                   (uint8_t*)from_vm_addr + pm_offset,
                   block_offset_e - block_offset_b);
@@ -984,7 +983,8 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uin
     uint64_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
 
     if (is_locally_accessible(bi.owner)) {
-      void* to_vm_addr = mo.home_pms[bi.owner].anon_vm_addr();
+      int target_intra_rank = process_map_[bi.owner].first;
+      void* to_vm_addr = mo.home_pms[target_intra_rank].anon_vm_addr();
       std::memcpy((uint8_t*)to_vm_addr + pm_offset,
                   (uint8_t*)from_ptr - offset_b + block_offset_b,
                   block_offset_e - block_offset_b);
@@ -1315,7 +1315,8 @@ inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
         });
 
         if (!hb.mapped) {
-          hb.pm = &mo.home_pms[bi.owner];
+          int target_intra_rank = process_map_[bi.owner].first;
+          hb.pm = &mo.home_pms[target_intra_rank];
           hb.pm_offset = bi.pm_offset;
           hb.vm_addr = vm_addr;
           hb.size = bi.offset_e - bi.offset_b;
