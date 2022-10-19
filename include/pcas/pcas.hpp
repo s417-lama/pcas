@@ -16,6 +16,7 @@
 #include "pcas/wallclock.hpp"
 #include "pcas/logger/logger.hpp"
 #include "pcas/mem_mapper.hpp"
+#include "pcas/allocator.hpp"
 
 namespace pcas {
 
@@ -37,6 +38,8 @@ struct policy_default {
   using logger_kind_t = logger::kind;
   template <typename P>
   using logger_impl_t = logger::impl_dummy<P>;
+  template <typename P>
+  using allocator_impl_t = std_pool_resource_impl<P>;
   constexpr static uint64_t block_size = 65536;
   constexpr static bool enable_write_through = false;
 };
@@ -281,6 +284,28 @@ class pcas_if {
     }
   };
 
+  // Policies
+  // -----------------------------------------------------------------------------
+
+  struct logger_policy {
+    static const char* outfile_prefix() { return "pcas"; }
+    using wallclock_t = typename P::wallclock_t;
+    using logger_kind_t = typename P::logger_kind_t;
+    template <typename P_>
+    using logger_impl_t = typename P::template logger_impl_t<P_>;
+  };
+  using logger_ = typename logger::template logger_if<logger_policy>;
+
+  struct allocator_policy {
+    using logger = logger_;
+    template <typename P_>
+    using allocator_impl_t = typename P::template allocator_impl_t<P_>;
+  };
+  using allocator = allocator_if<allocator_policy>;
+
+  using logger = logger_;
+  using logger_kind = typename logger::kind::value;
+
   // Member variables
   // -----------------------------------------------------------------------------
 
@@ -297,6 +322,8 @@ class pcas_if {
   std::vector<std::optional<mem_obj>> objs_;
 
   std::vector<std::optional<checkout_entry>> checkouts_;
+
+  allocator allocator_;
 
   mmap_cache_t mmap_cache_;
   cache_t cache_;
@@ -626,9 +653,6 @@ class pcas_if {
   void checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, access_mode mode);
 
 public:
-  using logger = typename logger::template logger_if<logger::policy<P>>;
-  using logger_kind = typename P::logger_kind_t::value;
-
   constexpr static uint64_t block_size = P::block_size;
 
   pcas_if(uint64_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
@@ -698,6 +722,7 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
     process_map_(create_process_map()),
     intra2global_rank_(create_intra2global_rank()),
     objs_(obj_id_count_),
+    allocator_(comm),
     mmap_cache_(get_home_mmap_limit(cache_size / block_size), *this),
     cache_(cache_size / block_size, *this),
     cache_pm_(cache_size, 0, cg_intra_.rank, true, true),

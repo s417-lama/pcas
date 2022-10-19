@@ -19,6 +19,9 @@ public:
     ReleaseLazy,
     Acquire,
 
+    MemAlloc,
+    MemFree,
+
     FlushEarly,
     FlushConflicted,
 
@@ -83,6 +86,9 @@ public:
       case value::Release:         return "release";
       case value::ReleaseLazy:     return "release_lazy";
       case value::Acquire:         return "acquire";
+
+      case value::MemAlloc:        return "mem_alloc";
+      case value::MemFree:         return "mem_free";
 
       case value::FlushEarly:      return "flush_early";
       case value::FlushConflicted: return "flush_conflicted";

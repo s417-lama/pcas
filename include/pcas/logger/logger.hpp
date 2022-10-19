@@ -10,29 +10,20 @@
 namespace pcas {
 namespace logger {
 
-template <typename ParentPolicy>
-struct policy {
-  static const char* outfile_prefix() { return "pcas"; }
-  using wallclock_t = typename ParentPolicy::wallclock_t;
-  using logger_kind_t = typename ParentPolicy::logger_kind_t;
-  template <typename P>
-  using impl_t = typename ParentPolicy::template logger_impl_t<P>;
-};
-
 // unused
 struct policy_default {
   using wallclock_t = wallclock_native;
   using logger_kind_t = kind;
   template <typename P>
-  using impl_t = impl_dummy<P>;
+  using logger_impl_t = impl_dummy<P>;
 };
 
 template <typename P>
 class logger_if {
-  using kind = typename P::logger_kind_t;
-  using impl = typename P::template impl_t<P>;
+  using impl = typename P::template logger_impl_t<P>;
 
 public:
+  using kind = typename P::logger_kind_t;
   using begin_data_t = typename impl::begin_data_t;
 
   static void init(int rank, int n_ranks) {
