@@ -10,7 +10,6 @@
 namespace pcas {
 namespace logger {
 
-// unused
 struct policy_default {
   using wallclock_t = wallclock_native;
   using logger_kind_t = kind;
