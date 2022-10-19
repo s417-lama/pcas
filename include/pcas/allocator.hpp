@@ -5,7 +5,16 @@
 #include <unordered_map>
 #include <mpi.h>
 
+#define PCAS_HAS_MEMORY_RESOURCE __has_include(<memory_resource>)
+#if PCAS_HAS_MEMORY_RESOURCE
 #include <memory_resource>
+namespace pcas { namespace pmr = std::pmr; }
+#else
+#include <boost/container/pmr/memory_resource.hpp>
+#include <boost/container/pmr/unsynchronized_pool_resource.hpp>
+#include <boost/container/pmr/pool_options.hpp>
+namespace pcas { namespace pmr = boost::container::pmr; }
+#endif
 
 #include "pcas/util.hpp"
 #include "pcas/logger/logger.hpp"
@@ -13,7 +22,7 @@
 namespace pcas {
 
 template <typename P>
-class allocator_if final : public std::pmr::memory_resource {
+class allocator_if final : public pmr::memory_resource {
 protected:
   struct dynamic_win {
     MPI_Win win;
@@ -43,7 +52,7 @@ public:
     allocator_.do_deallocate(p, bytes, alignment);
   }
 
-  bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+  bool do_is_equal(const pmr::memory_resource& other) const noexcept override {
     return this == &other;
   }
 
@@ -61,7 +70,7 @@ public:
   }
 };
 
-class mpi_win_resource final : public std::pmr::memory_resource {
+class mpi_win_resource final : public pmr::memory_resource {
   MPI_Win win_;
   std::unordered_map<void*, void*> allocated_;
 
@@ -87,7 +96,7 @@ public:
     MPI_Free_mem(orig_p);
   }
 
-  bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+  bool do_is_equal(const pmr::memory_resource& other) const noexcept override {
     return this == &other;
   }
 };
@@ -97,7 +106,7 @@ class std_pool_resource_impl {
   MPI_Comm comm_;
   MPI_Win win_;
   mpi_win_resource win_mr_;
-  std::pmr::unsynchronized_pool_resource mr_;
+  pmr::unsynchronized_pool_resource mr_;
 
   using logger = typename P::logger;
   using logger_kind = typename P::logger::kind::value;
@@ -131,12 +140,20 @@ class std_pool_resource_impl {
     }
   }
 
+  // FIXME: workaround for boost
+  // Ideally: pmr::pool_options{.max_blocks_per_chunk = (std::size_t)16 * 1024 * 1024 * 1024}
+  pmr::pool_options my_pool_options() {
+    pmr::pool_options opts;
+    opts.max_blocks_per_chunk = (std::size_t)16 * 1024 * 1024 * 1024;
+    return opts;
+  }
+
 public:
   std_pool_resource_impl(MPI_Comm comm, MPI_Win win) :
     comm_(comm),
     win_(win),
     win_mr_(win),
-    mr_(std::pmr::pool_options{.max_blocks_per_chunk = (std::size_t)16 * 1024 * 1024 * 1024}, &win_mr_) {}
+    mr_(my_pool_options(), &win_mr_) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
     auto ev = logger::template record<logger_kind::MemAlloc>(bytes);
@@ -180,8 +197,9 @@ public:
     void* flag_addr = &h->freed;
 
     static constexpr int one = 1;
+    static int ret; // dummy value; passing NULL to result_addr causes segfault on some MPI
     MPI_Fetch_and_op(&one,
-                     nullptr,
+                     &ret,
                      MPI_INT,
                      target_rank,
                      (uint64_t)flag_addr,
@@ -309,6 +327,7 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
         int target_rank = (rank + 1) % nproc;
         allocator.remote_deallocate((void*)addrs[target_rank], size, target_rank);
 
+        MPI_Win_flush_all(allocator.get_win());
         MPI_Barrier(MPI_COMM_WORLD);
 
         allocator.collect_deallocated();

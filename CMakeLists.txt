@@ -25,6 +25,17 @@ if(MPI_CXX_LINK_FLAGS)
   target_link_options(pcas INTERFACE ${MPI_CXX_LINK_OPTIONS})
 endif()
 
+# FIXME: Hopefully remove Boost dependency in the future.
+# This is only for platforms that do not support <memory_resource> of C++17.
+set(Boost_USE_STATIC_LIBS OFF)
+set(Boost_USE_MULTITHREADED OFF)
+set(Boost_USE_STATIC_RUNTIME OFF)
+find_package(Boost 1.60.0 COMPONENTS container)
+if(Boost_FOUND)
+  include_directories(${Boost_INCLUDE_DIRS})
+  target_link_libraries(pcas INTERFACE ${Boost_LIBRARIES})
+endif()
+
 include(GNUInstallDirs)
 install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 
