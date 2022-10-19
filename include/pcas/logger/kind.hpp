@@ -21,6 +21,7 @@ public:
 
     MemAlloc,
     MemFree,
+    MemCollect,
 
     FlushEarly,
     FlushConflicted,
@@ -89,6 +90,7 @@ public:
 
       case value::MemAlloc:        return "mem_alloc";
       case value::MemFree:         return "mem_free";
+      case value::MemCollect:      return "mem_collect";
 
       case value::FlushEarly:      return "flush_early";
       case value::FlushConflicted: return "flush_conflicted";

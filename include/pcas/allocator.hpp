@@ -2,9 +2,10 @@
 
 #include <cstddef>
 #include <cstdlib>
-#include <memory_resource>
 #include <unordered_map>
 #include <mpi.h>
+
+#include <memory_resource>
 
 #include "pcas/util.hpp"
 #include "pcas/logger/logger.hpp"
@@ -30,7 +31,7 @@ protected:
   typename P::template allocator_impl_t<P> allocator_;
 
 public:
-  allocator_if(MPI_Comm comm) : dwin_(comm), allocator_(dwin_.win) {}
+  allocator_if(MPI_Comm comm) : dwin_(comm), allocator_(comm, dwin_.win) {}
 
   MPI_Win get_win() { return dwin_.win; }
 
@@ -44,6 +45,19 @@ public:
 
   bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
     return this == &other;
+  }
+
+  void remote_deallocate(void* p, std::size_t bytes, int target_rank, std::size_t alignment = alignof(max_align_t)) {
+    allocator_.remote_deallocate(p, bytes, target_rank, alignment);
+  }
+
+  void collect_deallocated() {
+    allocator_.collect_deallocated();
+  }
+
+  // mainly for debugging
+  bool empty() {
+    return allocator_.empty();
   }
 };
 
@@ -80,26 +94,119 @@ public:
 
 template <typename P>
 class std_pool_resource_impl {
+  MPI_Comm comm_;
+  MPI_Win win_;
   mpi_win_resource win_mr_;
   std::pmr::unsynchronized_pool_resource mr_;
 
   using logger = typename P::logger;
   using logger_kind = typename P::logger::kind::value;
 
-public:
-  std_pool_resource_impl(MPI_Win win) :
-    win_mr_(win),
-    mr_(std::pmr::pool_options{.max_blocks_per_chunk = (std::size_t)16 * 1024 * 1024 * 1024}, &win_mr_) {
+  struct header {
+    header* prev          = nullptr;
+    header* next          = nullptr;
+    std::size_t size      = 0;
+    std::size_t alignment = 0;
+    int freed             = 0;
+  };
+
+  header allocated_list_;
+  header* allocated_list_end_ = &allocated_list_;
+
+  int get_my_rank() {
+    int rank;
+    MPI_Comm_rank(comm_, &rank);
+    return rank;
   }
+
+  void remove_header_from_list(header* h) {
+    PCAS_CHECK(h->prev);
+    h->prev->next = h->next;
+
+    if (h->next) {
+      h->next->prev = h->prev;
+    } else {
+      PCAS_CHECK(h == allocated_list_end_);
+      allocated_list_end_ = h->prev;
+    }
+  }
+
+public:
+  std_pool_resource_impl(MPI_Comm comm, MPI_Win win) :
+    comm_(comm),
+    win_(win),
+    win_mr_(win),
+    mr_(std::pmr::pool_options{.max_blocks_per_chunk = (std::size_t)16 * 1024 * 1024 * 1024}, &win_mr_) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
     auto ev = logger::template record<logger_kind::MemAlloc>(bytes);
-    return mr_.allocate(bytes, alignment);
+
+    std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
+    std::size_t real_bytes = bytes + n_pad * alignment;
+
+    uint8_t* p = (uint8_t*)mr_.allocate(real_bytes, alignment);
+    uint8_t* ret = p + n_pad * alignment;
+
+    PCAS_CHECK(ret + bytes <= p + real_bytes);
+    PCAS_CHECK(p + sizeof(header) <= ret);
+
+    header* h = new(p) header {
+      .prev = allocated_list_end_, .next = nullptr,
+      .size = real_bytes, .alignment = alignment, .freed = 0};
+    PCAS_CHECK(allocated_list_end_->next == nullptr);
+    allocated_list_end_->next = h;
+    allocated_list_end_ = h;
+
+    return ret;
   }
 
   void do_deallocate(void* p, std::size_t bytes, [[maybe_unused]] std::size_t alignment) {
     auto ev = logger::template record<logger_kind::MemFree>(bytes);
-    mr_.deallocate(p, bytes, alignment);
+
+    std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
+    std::size_t real_bytes = bytes + n_pad * alignment;
+
+    header* h = (header*)((uint8_t*)p - n_pad * alignment);
+    remove_header_from_list(h);
+
+    mr_.deallocate((void*)h, real_bytes, alignment);
+  }
+
+  void remote_deallocate(void* p, std::size_t bytes [[maybe_unused]], int target_rank, std::size_t alignment) {
+    PCAS_CHECK(get_my_rank() != target_rank);
+
+    std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
+    header* h = (header*)((uint8_t*)p - n_pad * alignment);
+    void* flag_addr = &h->freed;
+
+    static constexpr int one = 1;
+    MPI_Fetch_and_op(&one,
+                     nullptr,
+                     MPI_INT,
+                     target_rank,
+                     (uint64_t)flag_addr,
+                     MPI_REPLACE,
+                     win_);
+  }
+
+  void collect_deallocated() {
+    auto ev = logger::template record<logger_kind::MemCollect>();
+
+    header *h = allocated_list_.next;
+    while (h) {
+      if (h->freed) {
+        header h_copy = *h;
+        remove_header_from_list(h);
+        mr_.deallocate((void*)h, h_copy.size, h_copy.alignment);
+        h = h_copy.next;
+      } else {
+        h = h->next;
+      }
+    }
+  }
+
+  bool empty() {
+    return allocated_list_.next == nullptr;
   }
 };
 
@@ -188,6 +295,27 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
     for (std::size_t i = 0; i < size; i++) {
       PCAS_CHECK(((uint8_t*)p)[i] == (nproc + rank - 1) % nproc);
     }
+
+    PCAS_SUBCASE("Local free") {
+      allocator.deallocate(p, size);
+    }
+
+    if (nproc > 1) {
+      PCAS_SUBCASE("Remote free") {
+        PCAS_CHECK(!allocator.empty());
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        int target_rank = (rank + 1) % nproc;
+        allocator.remote_deallocate((void*)addrs[target_rank], size, target_rank);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        allocator.collect_deallocated();
+      }
+    }
+
+    PCAS_CHECK(allocator.empty());
   }
 }
 
