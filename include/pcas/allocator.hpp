@@ -2,7 +2,10 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <list>
 #include <unordered_map>
+#include <optional>
+#include <sys/mman.h>
 #include <mpi.h>
 
 #define PCAS_HAS_MEMORY_RESOURCE __has_include(<memory_resource>)
@@ -18,6 +21,9 @@ namespace pcas { namespace pmr = boost::container::pmr; }
 
 #include "pcas/util.hpp"
 #include "pcas/logger/logger.hpp"
+#include "pcas/topology.hpp"
+#include "pcas/virtual_mem.hpp"
+#include "pcas/physical_mem.hpp"
 
 namespace pcas {
 
@@ -36,11 +42,54 @@ protected:
     }
   };
 
+  const topology& topo_;
+
+  // FIXME: make them configurable
+  static constexpr uint64_t global_max_size_ = (uint64_t)1 << 46;
+  static constexpr uint64_t global_base_addr_ = 0x100000000000;
+
+  static_assert(global_base_addr_ % P::block_size == 0);
+  static_assert(global_max_size_ % P::block_size == 0);
+
+  const uint64_t local_max_size_;
+  const uint64_t local_base_addr_;
+
+  virtual_mem vm_;
+  physical_mem pm_;
+
   dynamic_win dwin_;
+
   typename P::template allocator_impl_t<P> allocator_;
 
+  physical_mem init_pm() {
+    physical_mem pm;
+
+    if (topo_.intra_rank() == 0) {
+      pm = physical_mem("/pcas_allocator", global_max_size_, true, false);
+    }
+
+    MPI_Barrier(topo_.intra_comm());
+
+    if (topo_.intra_rank() != 0) {
+      pm = physical_mem("/pcas_allocator", global_max_size_, false, false);
+    }
+
+    PCAS_CHECK(vm_.addr() == reinterpret_cast<void*>(global_base_addr_));
+    PCAS_CHECK(vm_.size() == global_max_size_);
+    pm.map(vm_.addr(), 0, vm_.size());
+
+    return pm;
+  }
+
 public:
-  allocator_if(MPI_Comm comm) : dwin_(comm), allocator_(comm, dwin_.win) {}
+  allocator_if(const topology& topo) :
+    topo_(topo),
+    local_max_size_(global_max_size_ / next_pow2(topo.global_nproc())),
+    local_base_addr_(global_base_addr_ + local_max_size_ * topo.global_rank()),
+    vm_(reinterpret_cast<void*>(global_base_addr_), global_max_size_),
+    pm_(init_pm()),
+    dwin_(topo.global_comm()),
+    allocator_(topo, local_base_addr_, local_max_size_, dwin_.win) {}
 
   MPI_Win get_win() { return dwin_.win; }
 
@@ -70,30 +119,62 @@ public:
   }
 };
 
+template <typename P>
 class mpi_win_resource final : public pmr::memory_resource {
-  MPI_Win win_;
-  std::unordered_map<void*, void*> allocated_;
+  const topology& topo_;
+  const uint64_t  local_base_addr_;
+  const uint64_t  local_max_size_;
+  const MPI_Win   win_;
+
+  std::list<span> freelist_;
 
 public:
-  mpi_win_resource(MPI_Win win) : win_(win) {}
+  mpi_win_resource(const topology& topo,
+                   uint64_t        local_base_addr,
+                   uint64_t        local_max_size,
+                   MPI_Win         win) :
+    topo_(topo),
+    local_base_addr_(local_base_addr),
+    local_max_size_(local_max_size),
+    win_(win),
+    freelist_(1, {local_base_addr, local_max_size}) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-    std::size_t bytes_pad = bytes + alignment;
-    void* p;
-    if (MPI_Alloc_mem(bytes_pad, MPI_INFO_NULL, &p) != MPI_SUCCESS) {
-      throw std::bad_alloc{};
+    if (alignment > P::block_size) {
+      die("Alignment request for allocation must be <= %ld (block size)", P::block_size);
     }
-    MPI_Win_attach(win_, p, bytes_pad);
-    void* ret = (void*)(((uintptr_t)p + alignment - 1) / alignment * alignment);
-    allocated_[ret] = p;
+
+    // Align with block size
+    std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
+
+    // FIXME: assumption that freelist returns block-aligned address
+    auto s = freelist_get(freelist_, real_bytes);
+    if (!s.has_value()) {
+      die("Could not allocate memory for malloc_local()");
+    }
+    PCAS_CHECK(s->size == real_bytes);
+    PCAS_CHECK(s->addr % P::block_size == 0);
+
+    void* ret = reinterpret_cast<void*>(s->addr);
+    MPI_Win_attach(win_, ret, s->size);
+
     return ret;
   }
 
-  void do_deallocate(void* p, [[maybe_unused]] std::size_t bytes, [[maybe_unused]] std::size_t alignment) override {
-    void* orig_p = allocated_[p];
-    allocated_.erase(p);
-    MPI_Win_detach(win_, orig_p);
-    MPI_Free_mem(orig_p);
+  void do_deallocate(void* p, std::size_t bytes, [[maybe_unused]] std::size_t alignment) override {
+    std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
+    span s {reinterpret_cast<uint64_t>(p), real_bytes};
+
+    MPI_Win_detach(win_, p);
+
+    PCAS_CHECK(reinterpret_cast<uint64_t>(p) % P::block_size == 0);
+
+    if (madvise(p, real_bytes, MADV_REMOVE) == -1) {
+      perror("madvise");
+      die("madvise() failed");
+    }
+
+    freelist_add(freelist_, s);
   }
 
   bool do_is_equal(const pmr::memory_resource& other) const noexcept override {
@@ -103,30 +184,24 @@ public:
 
 template <typename P>
 class std_pool_resource_impl {
-  MPI_Comm comm_;
-  MPI_Win win_;
-  mpi_win_resource win_mr_;
+  const topology&                   topo_;
+  MPI_Win                           win_;
+  mpi_win_resource<P>               win_mr_;
   pmr::unsynchronized_pool_resource mr_;
 
   using logger = typename P::logger;
   using logger_kind = typename P::logger::kind::value;
 
   struct header {
-    header* prev          = nullptr;
-    header* next          = nullptr;
+    header*     prev      = nullptr;
+    header*     next      = nullptr;
     std::size_t size      = 0;
     std::size_t alignment = 0;
-    int freed             = 0;
+    int         freed     = 0;
   };
 
   header allocated_list_;
   header* allocated_list_end_ = &allocated_list_;
-
-  int get_my_rank() {
-    int rank;
-    MPI_Comm_rank(comm_, &rank);
-    return rank;
-  }
 
   void remove_header_from_list(header* h) {
     PCAS_CHECK(h->prev);
@@ -149,10 +224,13 @@ class std_pool_resource_impl {
   }
 
 public:
-  std_pool_resource_impl(MPI_Comm comm, MPI_Win win) :
-    comm_(comm),
+  std_pool_resource_impl(const topology& topo,
+                         uint64_t        local_base_addr,
+                         uint64_t        local_max_size,
+                         MPI_Win         win) :
+    topo_(topo),
     win_(win),
-    win_mr_(win),
+    win_mr_(topo, local_base_addr, local_max_size, win),
     mr_(my_pool_options(), &win_mr_) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
@@ -190,7 +268,7 @@ public:
   }
 
   void remote_deallocate(void* p, std::size_t bytes [[maybe_unused]], int target_rank, std::size_t alignment) {
-    PCAS_CHECK(get_my_rank() != target_rank);
+    PCAS_CHECK(topo_.global_rank() != target_rank);
 
     std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
     header* h = (header*)((uint8_t*)p - n_pad * alignment);
@@ -229,6 +307,7 @@ public:
 };
 
 struct allocator_policy_default {
+  constexpr static uint64_t block_size = 65536;
   using logger = logger::logger_if<logger::policy_default>;
   template <typename P>
   using allocator_impl_t = std_pool_resource_impl<P>;

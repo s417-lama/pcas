@@ -15,25 +15,17 @@
 namespace pcas {
 
 class physical_mem {
+  std::string shm_name_;
   int         fd_           = -1;
   uint64_t    size_         = 0;
   void*       anon_vm_addr_ = nullptr;
   bool        own_;
   bool        map_anon_;
-  std::string shm_name_;
 
 public:
   physical_mem() {}
-  physical_mem(uint64_t size, obj_id_t id, int intra_rank, bool own, bool map_anon)
-    : size_(size), own_(own), map_anon_(map_anon) {
-    if (intra_rank == -1) {
-      intra_rank = getpid(); // for testing
-    }
-
-    std::stringstream ss;
-    ss << "/pcas_" << id << "_" << intra_rank;
-    shm_name_ = ss.str();
-
+  physical_mem(std::string shm_name, uint64_t size, bool own, bool map_anon)
+    : shm_name_(shm_name), size_(size), own_(own), map_anon_(map_anon) {
     int oflag = O_RDWR;
     if (own) oflag |= O_CREAT | O_TRUNC;
 
@@ -56,8 +48,8 @@ public:
   physical_mem(const physical_mem&) = delete;
 
   physical_mem(physical_mem&& pm)
-    : fd_(pm.fd_), size_(pm.size_), anon_vm_addr_(pm.anon_vm_addr_),
-      own_(pm.own_), map_anon_(pm.map_anon_), shm_name_(std::move(pm.shm_name_)) {
+    : shm_name_(std::move(pm.shm_name_)), fd_(pm.fd_), size_(pm.size_), anon_vm_addr_(pm.anon_vm_addr_),
+      own_(pm.own_), map_anon_(pm.map_anon_) {
     pm.fd_ = -1;
   }
 
@@ -78,12 +70,12 @@ public:
 
   physical_mem& operator=(physical_mem&& pm) {
     this->~physical_mem();
+    shm_name_ = std::move(pm.shm_name_);
     fd_ = pm.fd_;
     size_ = pm.size_;
     anon_vm_addr_ = pm.anon_vm_addr_;
     own_ = pm.own_;
     map_anon_ = pm.map_anon_;
-    shm_name_ = std::move(pm.shm_name_);
     pm.fd_ = -1;
     return *this;
   }
@@ -117,7 +109,10 @@ public:
 PCAS_TEST_CASE("[pcas::physical_mem] map two virtual addresses to the same physical address") {
   uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
 
-  physical_mem pm(16 * pagesize, 0, -1, true, true);
+  std::stringstream ss;
+  ss << "/pcas_test_" << getpid();
+
+  physical_mem pm(ss.str(), 16 * pagesize, true, true);
   int* b1 = nullptr;
   int* b2 = nullptr;
 

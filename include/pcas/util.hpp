@@ -6,14 +6,14 @@
 #include <cstdint>
 #include <iostream>
 #include <fstream>
+#include <vector>
+#include <list>
 #include <algorithm>
 #include <tuple>
 #include <sstream>
 #include <forward_list>
 #include <optional>
-
-#include <sys/syscall.h>
-#include <linux/sysctl.h>
+#include <random>
 
 #ifdef DOCTEST_LIBRARY_INCLUDED
 
@@ -112,6 +112,28 @@ template <typename T>
 inline bool empty(const std::vector<std::optional<T>>& v) {
   return std::none_of(v.begin(), v.end(),
                       [](const std::optional<T>& x) { return x.has_value(); });
+}
+
+constexpr inline uint64_t next_pow2(uint64_t x) {
+  x--;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  x |= x >> 32;
+  return x + 1;
+}
+
+PCAS_TEST_CASE("[pcas::util] next_pow2") {
+  PCAS_CHECK(next_pow2(0) == 0);
+  PCAS_CHECK(next_pow2(1) == 1);
+  PCAS_CHECK(next_pow2(2) == 2);
+  PCAS_CHECK(next_pow2(3) == 4);
+  PCAS_CHECK(next_pow2(4) == 4);
+  PCAS_CHECK(next_pow2(5) == 8);
+  PCAS_CHECK(next_pow2(15) == 16);
+  PCAS_CHECK(next_pow2(((uint64_t)1 << 38) - 100) == (uint64_t)1 << 38);
 }
 
 // Section
@@ -214,6 +236,98 @@ PCAS_TEST_CASE("[pcas::util] sections inverse") {
   PCAS_CHECK(sections_inverse(ss, {2, 6}) == (sections{{5, 6}}));
   sections ss_empty{};
   PCAS_CHECK(sections_inverse(ss_empty, {0, 100}) == (sections{{0, 100}}));
+}
+
+// Freelist
+// -----------------------------------------------------------------------------
+
+struct span {
+  uint64_t addr;
+  uint64_t size;
+};
+
+inline std::optional<span> freelist_get(std::list<span>& fl, uint64_t size) {
+  auto it = fl.begin();
+  while (it != fl.end()) {
+    if (it->size == size) {
+      span ret = *it;
+      fl.erase(it);
+      return ret;
+    } else if (it->size > size) {
+      span ret {it->addr, size};
+      it->addr += size;
+      it->size -= size;
+      return ret;
+    }
+    it = std::next(it);
+  }
+  return std::nullopt;
+}
+
+inline void freelist_add(std::list<span>& fl, span s) {
+  auto it = fl.begin();
+  while (it != fl.end()) {
+    if (s.addr + s.size == it->addr) {
+      it->addr = s.addr;
+      it->size += s.size;
+      return;
+    } else if (s.addr + s.size < it->addr) {
+      fl.insert(it, s);
+      return;
+    } else if (s.addr == it->addr + it->size) {
+      it->size += s.size;
+      auto next_it = std::next(it);
+      if (next_it != fl.end() &&
+          next_it->addr == it->addr + it->size) {
+        it->size += next_it->size;
+        fl.erase(next_it);
+      }
+      return;
+    }
+    it = std::next(it);
+  }
+  fl.insert(it, s);
+}
+
+PCAS_TEST_CASE("[pcas::util] freelist for span") {
+  span s0 {100, 920};
+  std::list<span> fl(1, s0);
+  std::vector<span> got;
+
+  uint64_t n = 100;
+  for (uint64_t i = 0; i < s0.size / n; i++) {
+    auto s = freelist_get(fl, n);
+    PCAS_CHECK(s.has_value());
+    got.push_back(*s);
+  }
+  PCAS_CHECK(!freelist_get(fl, n).has_value());
+
+  // check for no overlap
+  for (uint64_t i = 0; i < got.size(); i++) {
+    for (uint64_t j = 0; j < got.size(); j++) {
+      if (i != j) {
+        PCAS_CHECK((got[i].addr + got[i].size <= got[j].addr ||
+                    got[j].addr + got[j].size <= got[i].addr));
+      }
+    }
+  }
+
+  // random shuffle
+  std::random_device seed_gen;
+  std::mt19937 engine(seed_gen());
+  std::shuffle(got.begin(), got.end(), engine);
+
+  for (auto& s : got) {
+    freelist_add(fl, s);
+  }
+
+  for (auto s : fl) {
+    printf("%ld %ld\n", s.addr, s.size);
+  }
+
+  PCAS_CHECK(fl.size() == 1);
+  PCAS_CHECK(fl.begin()->addr == s0.addr);
+  PCAS_CHECK(fl.begin()->size == s0.size);
 }
 
 }

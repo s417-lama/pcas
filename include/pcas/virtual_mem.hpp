@@ -95,8 +95,11 @@ PCAS_TEST_CASE("[pcas::virtual_mem] allocate virtual memory") {
 PCAS_TEST_CASE("[pcas::virtual_mem] map physical memory to virtual memory") {
   uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
 
+  std::stringstream ss;
+  ss << "/pcas_test_" << getpid();
+
   virtual_mem vm(nullptr, 20 * pagesize);
-  physical_mem pm(10 * pagesize, 0, -1, true, true);
+  physical_mem pm(ss.str(), 10 * pagesize, true, true);
   uint8_t* mapped_addr = (uint8_t*)vm.map_physical_mem(5 * pagesize, 5 * pagesize, 5 * pagesize, pm);
   PCAS_CHECK(mapped_addr == (uint8_t*)vm.addr() + 5 * pagesize);
 
