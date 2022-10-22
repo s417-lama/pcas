@@ -45,7 +45,7 @@ protected:
   const topology& topo_;
 
   // FIXME: make them configurable
-  static constexpr uint64_t global_max_size_ = (uint64_t)1 << 46;
+  static constexpr uint64_t global_max_size_ = (uint64_t)1 << 45;
   static constexpr uint64_t global_base_addr_ = 0x100000000000;
 
   static_assert(global_base_addr_ % P::block_size == 0);
