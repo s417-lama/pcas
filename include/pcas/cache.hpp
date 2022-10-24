@@ -83,9 +83,9 @@ public:
     }
   }
 
-  cache_entry_num_t num_entries() { return nentries_; }
+  cache_entry_num_t num_entries() const { return nentries_; }
 
-  bool is_cached(Key key) {
+  bool is_cached(Key key) const {
     return table_.find(key) != table_.end();
   }
 

@@ -238,20 +238,71 @@ PCAS_TEST_CASE("[pcas::util] sections insert") {
   PCAS_CHECK(ss == (sections{{0, 700}}));
 }
 
-inline sections sections_inverse(const sections& ss, section s_range) {
+inline void sections_remove(sections& ss, section s) {
+  auto it = ss.before_begin();
+
+  while (std::next(it) != ss.end()) {
+    if (s.second <= std::next(it)->first) break;
+
+    if (std::next(it)->second <= s.first) {
+      // no overlap
+      it++;
+    } else if (s.first <= std::next(it)->first && std::next(it)->second <= s.second) {
+      // s contains std::next(it)
+      ss.erase_after(it);
+      // do not increment it
+    } else if (s.first <= std::next(it)->first && s.second <= std::next(it)->second) {
+      // the left end of std::next(it) is overlaped
+      std::next(it)->first = s.second;
+      it++;
+    } else if (std::next(it)->first <= s.first && std::next(it)->second <= s.second) {
+      // the right end of std::next(it) is overlaped
+      std::next(it)->second = s.first;
+      it++;
+    } else if (std::next(it)->first <= s.first && s.second <= std::next(it)->second) {
+      // std::next(it) contains s
+      section new_s = {std::next(it)->first, s.first};
+      std::next(it)->first = s.second;
+      ss.insert_after(it, new_s);
+      it++;
+    } else {
+      die("Something is wrong in sections_remove()\n");
+    }
+  }
+}
+
+PCAS_TEST_CASE("[pcas::util] sections remove") {
+  sections ss{{2, 5}, {6, 9}, {11, 20}, {50, 100}};
+  sections_remove(ss, {6, 9});
+  PCAS_CHECK(ss == (sections{{2, 5}, {11, 20}, {50, 100}}));
+  sections_remove(ss, {4, 10});
+  PCAS_CHECK(ss == (sections{{2, 4}, {11, 20}, {50, 100}}));
+  sections_remove(ss, {70, 80});
+  PCAS_CHECK(ss == (sections{{2, 4}, {11, 20}, {50, 70}, {80, 100}}));
+  sections_remove(ss, {18, 55});
+  PCAS_CHECK(ss == (sections{{2, 4}, {11, 18}, {55, 70}, {80, 100}}));
+  sections_remove(ss, {10, 110});
+  PCAS_CHECK(ss == (sections{{2, 4}}));
+  sections_remove(ss, {2, 4});
+  PCAS_CHECK(ss == (sections{}));
+  sections_remove(ss, {2, 4});
+  PCAS_CHECK(ss == (sections{}));
+}
+
+inline sections sections_inverse(const sections& ss, section s) {
   sections ret;
   auto it = ret.before_begin();
   for (auto [b, e] : ss) {
-    if (s_range.first < b) {
-      it = ret.insert_after(it, {s_range.first, std::min(b, s_range.second)});
+    if (s.first < b) {
+      it = ret.insert_after(it, {s.first, std::min(b, s.second)});
     }
-    if (s_range.first < e) {
-      s_range.first = e;
-      if (s_range.first >= s_range.second) break;
+    if (s.first < e) {
+      s.first = e;
+      if (s.first >= s.second) break;
     }
   }
-  if (s_range.first < s_range.second) {
-    ret.insert_after(it, s_range);
+  if (s.first < s.second) {
+    ret.insert_after(it, s);
   }
   return ret;
 }
