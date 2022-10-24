@@ -7,15 +7,15 @@
 
 namespace pcas {
 
-using obj_id_t = uint64_t;
+using mem_obj_id_t = uint64_t;
 
 template <typename T>
 class global_ptr {
   using this_t = global_ptr<T>;
 
-  int      owner_;
-  obj_id_t id_;
-  uint64_t offset_;
+  int          owner_;
+  mem_obj_id_t id_;
+  uint64_t     offset_;
 
   class global_ptr_deref {
     global_ptr ptr_;
@@ -26,13 +26,13 @@ class global_ptr {
 
 public:
   global_ptr() : owner_(-2), id_(0), offset_(0) {}
-  global_ptr(int owner, obj_id_t id, uint64_t offset) : owner_(owner), id_(id), offset_(offset) {}
+  global_ptr(int owner, mem_obj_id_t id, uint64_t offset) : owner_(owner), id_(id), offset_(offset) {}
 
   global_ptr(const this_t&) = default;
   this_t& operator=(const this_t&) = default;
 
   int owner() const noexcept { return owner_; }
-  obj_id_t id() const noexcept { return id_; }
+  mem_obj_id_t id() const noexcept { return id_; }
   uint64_t offset() const noexcept { return offset_; }
 
   template<class U>

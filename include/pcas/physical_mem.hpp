@@ -45,14 +45,6 @@ public:
     }
   }
 
-  physical_mem(const physical_mem&) = delete;
-
-  physical_mem(physical_mem&& pm)
-    : shm_name_(std::move(pm.shm_name_)), fd_(pm.fd_), size_(pm.size_), anon_vm_addr_(pm.anon_vm_addr_),
-      own_(pm.own_), map_anon_(pm.map_anon_) {
-    pm.fd_ = -1;
-  }
-
   ~physical_mem() {
     if (fd_ != -1) {
       if (map_anon_) {
@@ -66,8 +58,12 @@ public:
     }
   }
 
+  physical_mem(const physical_mem&) = delete;
   physical_mem& operator=(const physical_mem&) = delete;
 
+  physical_mem(physical_mem&& pm)
+    : shm_name_(std::move(pm.shm_name_)), fd_(pm.fd_), size_(pm.size_), anon_vm_addr_(pm.anon_vm_addr_),
+      own_(pm.own_), map_anon_(pm.map_anon_) { pm.fd_ = -1; }
   physical_mem& operator=(physical_mem&& pm) {
     this->~physical_mem();
     shm_name_ = std::move(pm.shm_name_);

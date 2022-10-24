@@ -29,20 +29,20 @@ public:
 
   virtual ~base() = default;
 
-  virtual uint64_t get_local_size(int rank) = 0;
+  virtual uint64_t get_local_size(int rank) const = 0;
 
-  virtual uint64_t get_effective_size() = 0;
+  virtual uint64_t get_effective_size() const = 0;
 
   // Returns the block info that specifies the owner and the range [offset_b, offset_e)
   // of the block that contains the given offset.
   // pm_offset is the offset from the beginning of the owner's local physical memory for the block.
-  virtual block_info get_block_info(uint64_t offset) = 0;
+  virtual block_info get_block_info(uint64_t offset) const = 0;
 };
 
 template <uint64_t BlockSize>
 class block : public base {
   // non-virtual common part
-  uint64_t get_local_size_impl() {
+  uint64_t get_local_size_impl() const {
     uint64_t nblock_g = (size_ + BlockSize - 1) / BlockSize;
     uint64_t nblock_l = (nblock_g + nproc_ - 1) / nproc_;
     return nblock_l * BlockSize;
@@ -51,15 +51,15 @@ class block : public base {
 public:
   using base::base;
 
-  uint64_t get_local_size(int rank [[maybe_unused]]) override {
+  uint64_t get_local_size(int rank [[maybe_unused]]) const override {
     return get_local_size_impl();
   }
 
-  uint64_t get_effective_size() override {
+  uint64_t get_effective_size() const override {
     return get_local_size_impl() * nproc_;
   }
 
-  block_info get_block_info(uint64_t offset) override {
+  block_info get_block_info(uint64_t offset) const override {
     PCAS_CHECK(offset < get_effective_size());
     uint64_t size_l   = get_local_size_impl();
     int      owner    = offset / size_l;
@@ -105,7 +105,7 @@ class cyclic : public base {
   size_t block_size_;
 
   // non-virtual common part
-  uint64_t get_local_size_impl() {
+  uint64_t get_local_size_impl() const {
     uint64_t nblock_g = (size_ + block_size_ - 1) / block_size_;
     uint64_t nblock_l = (nblock_g + nproc_ - 1) / nproc_;
     return nblock_l * block_size_;
@@ -117,15 +117,15 @@ public:
     PCAS_CHECK(block_size % BlockSize == 0);
   }
 
-  uint64_t get_local_size(int rank [[maybe_unused]]) override {
+  uint64_t get_local_size(int rank [[maybe_unused]]) const override {
     return get_local_size_impl();
   }
 
-  uint64_t get_effective_size() override {
+  uint64_t get_effective_size() const override {
     return get_local_size_impl() * nproc_;
   }
 
-  block_info get_block_info(uint64_t offset) override {
+  block_info get_block_info(uint64_t offset) const override {
     PCAS_CHECK(offset < get_effective_size());
     uint64_t block_num_g = offset / block_size_;
     uint64_t block_num_l = block_num_g / nproc_;

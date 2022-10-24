@@ -30,18 +30,6 @@ namespace pcas {
 template <typename P>
 class allocator_if final : public pmr::memory_resource {
 protected:
-  struct dynamic_win {
-    MPI_Win win;
-    dynamic_win(MPI_Comm comm) {
-      MPI_Win_create_dynamic(MPI_INFO_NULL, comm, &win);
-      MPI_Win_lock_all(0, win);
-    }
-    ~dynamic_win() {
-      MPI_Win_unlock_all(win);
-      MPI_Win_free(&win);
-    }
-  };
-
   const topology& topo_;
 
   // FIXME: make them configurable
@@ -57,7 +45,7 @@ protected:
   virtual_mem vm_;
   physical_mem pm_;
 
-  dynamic_win dwin_;
+  win_manager dwin_;
 
   typename P::template allocator_impl_t<P> allocator_;
 
@@ -84,14 +72,18 @@ protected:
 public:
   allocator_if(const topology& topo) :
     topo_(topo),
-    local_max_size_(global_max_size_ / next_pow2(topo.global_nproc())),
-    local_base_addr_(global_base_addr_ + local_max_size_ * topo.global_rank()),
+    local_max_size_(global_max_size_ / next_pow2(topo_.global_nproc())),
+    local_base_addr_(global_base_addr_ + local_max_size_ * topo_.global_rank()),
     vm_(reinterpret_cast<void*>(global_base_addr_), global_max_size_),
     pm_(init_pm()),
-    dwin_(topo.global_comm()),
-    allocator_(topo, local_base_addr_, local_max_size_, dwin_.win) {}
+    dwin_(topo_.global_comm()),
+    allocator_(topo_, local_base_addr_, local_max_size_, dwin_.win()) {}
 
-  MPI_Win get_win() { return dwin_.win; }
+  MPI_Win win() const { return dwin_.win(); }
+
+  topology::rank_t get_owner(uint64_t vm_addr) const {
+    return (vm_addr - global_base_addr_) / local_max_size_;
+  }
 
   void* do_allocate(std::size_t bytes, std::size_t alignment = alignof(max_align_t)) override {
     return allocator_.do_allocate(bytes, alignment);
@@ -306,12 +298,18 @@ public:
   }
 };
 
+// Policy
+// -----------------------------------------------------------------------------
+
 struct allocator_policy_default {
   constexpr static uint64_t block_size = 65536;
   using logger = logger::logger_if<logger::policy_default>;
   template <typename P>
   using allocator_impl_t = std_pool_resource_impl<P>;
 };
+
+// Tests
+// -----------------------------------------------------------------------------
 
 PCAS_TEST_CASE("[pcas::allocator] basic test") {
   allocator_if<allocator_policy_default> allocator(MPI_COMM_WORLD);
@@ -360,8 +358,8 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
                 addrs[target_rank],
                 size,
                 MPI_UINT8_T,
-                allocator.get_win());
-        MPI_Win_flush(target_rank, allocator.get_win());
+                allocator.win());
+        MPI_Win_flush(target_rank, allocator.win());
 
         for (std::size_t i = 0; i < size; i++) {
           PCAS_CHECK(buf[i] == target_rank);
@@ -384,8 +382,8 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
             addrs[target_rank],
             size,
             MPI_UINT8_T,
-            allocator.get_win());
-    MPI_Win_flush(target_rank, allocator.get_win());
+            allocator.win());
+    MPI_Win_flush(target_rank, allocator.win());
 
     MPI_Barrier(MPI_COMM_WORLD);
 
@@ -406,7 +404,7 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
         int target_rank = (rank + 1) % nproc;
         allocator.remote_deallocate((void*)addrs[target_rank], size, target_rank);
 
-        MPI_Win_flush_all(allocator.get_win());
+        MPI_Win_flush_all(allocator.win());
         MPI_Barrier(MPI_COMM_WORLD);
 
         allocator.collect_deallocated();

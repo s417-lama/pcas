@@ -18,6 +18,7 @@
 #include "pcas/mem_mapper.hpp"
 #include "pcas/allocator.hpp"
 #include "pcas/topology.hpp"
+#include "pcas/mem_obj.hpp"
 
 namespace pcas {
 
@@ -64,16 +65,16 @@ class pcas_if {
   };
 
   struct home_block {
-    cache_entry_num_t entry_num = std::numeric_limits<cache_entry_num_t>::max();
-    physical_mem*     pm;
-    uint64_t          pm_offset;
-    uint8_t*          vm_addr;
-    uint64_t          size;
-    uint64_t          transaction_id = 0;
-    int               checkout_count = 0;
-    uint8_t*          prev_vm_addr   = nullptr;
-    bool              mapped         = false;
-    this_t&           outer;
+    cache_entry_num_t   entry_num = std::numeric_limits<cache_entry_num_t>::max();
+    const physical_mem* pm;
+    uint64_t            pm_offset;
+    uint8_t*            vm_addr;
+    uint64_t            size;
+    uint64_t            transaction_id = 0;
+    int                 checkout_count = 0;
+    uint8_t*            prev_vm_addr   = nullptr;
+    bool                mapped         = false;
+    this_t&             outer;
 
     home_block(this_t& outer_ref) : outer(outer_ref) {}
 
@@ -121,8 +122,10 @@ class pcas_if {
     uint8_t*          vm_addr        = nullptr;
     uint8_t*          prev_vm_addr   = nullptr;
     bool              mapped         = false;
+    topology::rank_t  owner          = -1;
+    uint64_t          pm_offset      = 0;
+    MPI_Win           win            = MPI_WIN_NULL;
     MPI_Request       req            = MPI_REQUEST_NULL;
-    obj_id_t          obj_id;
     sections          dirty_sections;
     sections          partial_sections; // for write-only update
     this_t&           outer;
@@ -145,7 +148,7 @@ class pcas_if {
       PCAS_CHECK(is_evictable());
     }
 
-    void map(physical_mem& cache_pm) {
+    void map(const physical_mem& cache_pm) {
       cache_pm.map(vm_addr, entry_num * block_size, block_size);
       mapped = true;
     }
@@ -184,18 +187,6 @@ class pcas_if {
   };
 
   using cache_t = cache_system<uintptr_t, cache_block>;
-
-  struct mem_obj {
-    int                               owner;
-    obj_id_t                          id;
-    uint64_t                          size;
-    uint64_t                          effective_size;
-    std::unique_ptr<mem_mapper::base> mmapper;
-    std::vector<physical_mem>         home_pms; // intra-rank -> pm
-    virtual_mem                       vm;
-    block_num_t                       last_checkout_block_num;
-    MPI_Win                           win;
-  };
 
   struct checkout_entry {
     global_ptr<uint8_t> ptr;
@@ -285,6 +276,11 @@ class pcas_if {
   };
   using allocator = allocator_if<allocator_policy>;
 
+  struct mem_obj_policy {
+    constexpr static uint64_t block_size = P::block_size;
+  };
+  using mem_obj = mem_obj_if<mem_obj_policy>;
+
   // Member variables
   // -----------------------------------------------------------------------------
 
@@ -292,12 +288,11 @@ class pcas_if {
 
   topology topo_;
 
-  obj_id_t obj_id_count_ = 1; // TODO: better management of used IDs
+  allocator allocator_;
+
   std::vector<std::optional<mem_obj>> objs_;
 
   std::vector<std::optional<checkout_entry>> checkouts_;
-
-  allocator allocator_;
 
   mmap_cache_t mmap_cache_;
   cache_t cache_;
@@ -319,9 +314,6 @@ class pcas_if {
 
   uint64_t max_dirty_cache_blocks_;
   std::vector<cache_block*> dirty_cache_blocks_;
-
-  int enable_shared_memory_;
-  int n_prefetch_;
 
   // Initializaiton
   // -----------------------------------------------------------------------------
@@ -352,19 +344,13 @@ class pcas_if {
   // Misc
   // -----------------------------------------------------------------------------
 
-  std::string home_shmem_name(obj_id_t id, int intra_rank) {
-    std::stringstream ss;
-    ss << "/pcas_" << id << "_" << intra_rank;
-    return ss.str();
-  }
-
   std::string cache_shmem_name(int intra_rank) {
     std::stringstream ss;
     ss << "/pcas_cache_" << intra_rank;
     return ss.str();
   }
 
-  mem_obj& get_mem_obj(obj_id_t id) {
+  mem_obj& get_mem_obj(mem_obj_id_t id) {
     PCAS_CHECK(objs_[id].has_value());
     return *objs_[id];
   }
@@ -400,11 +386,6 @@ class pcas_if {
     return (sys_limit - n_cache_blocks - margin) / 2;
   }
 
-  bool is_locally_accessible(int owner) {
-    return owner == rank() ||
-           (enable_shared_memory_ && topo_.inter_rank(owner) == topo_.inter_rank());
-  }
-
   void ensure_remapped() {
     if (!remap_home_blocks_.empty()) {
       for (home_block* hb : remap_home_blocks_) {
@@ -423,6 +404,31 @@ class pcas_if {
         cb->map(cache_pm_);
       }
       remap_cache_blocks_.clear();
+    }
+  }
+
+  home_block& ensure_mmap_cached_strict(uint8_t* vm_addr) {
+    PCAS_CHECK((uintptr_t)vm_addr % block_size == 0);
+    try {
+      return mmap_cache_.ensure_cached((uintptr_t)vm_addr / block_size);
+    } catch (cache_full_exception& e) {
+      die("mmap cache is exhausted (too many objects are being checked out)");
+      throw;
+    }
+  }
+
+  cache_block& ensure_cached_strict(uint8_t* vm_addr) {
+    PCAS_CHECK((uintptr_t)vm_addr % block_size == 0);
+    try {
+      return cache_.ensure_cached((uintptr_t)vm_addr / block_size);
+    } catch (cache_full_exception& e) {
+      ensure_all_cache_clean();
+      try {
+        return cache_.ensure_cached((uintptr_t)vm_addr / block_size);
+      } catch (cache_full_exception& e) {
+        die("cache is exhausted (too many objects are being checked out)");
+        throw;
+      }
     }
   }
 
@@ -476,28 +482,24 @@ class pcas_if {
   void flush_dirty_cache_block(cache_block& cb) {
     PCAS_CHECK(!cb.flushing);
 
-    mem_obj& mo = get_mem_obj(cb.obj_id);
     void* cache_block_ptr = cache_pm_.anon_vm_addr();
-    uint64_t offset = cb.vm_addr - (uint8_t*)mo.vm.addr();
-    auto bi = mo.mmapper->get_block_info(offset);
-    uint64_t pm_offset = bi.pm_offset + offset - bi.offset_b;
 
     for (auto [offset_in_block_b, offset_in_block_e] : cb.dirty_sections) {
       MPI_Put((uint8_t*)cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
               offset_in_block_e - offset_in_block_b,
               MPI_UINT8_T,
-              bi.owner,
-              pm_offset + offset_in_block_b,
+              cb.owner,
+              cb.pm_offset + offset_in_block_b,
               offset_in_block_e - offset_in_block_b,
               MPI_UINT8_T,
-              mo.win);
+              cb.win);
     }
     cb.dirty_sections.clear();
     cb.flushing = true;
 
-    auto w = std::find(flushing_wins_.begin(), flushing_wins_.end(), mo.win);
+    auto w = std::find(flushing_wins_.begin(), flushing_wins_.end(), cb.win);
     if (w == flushing_wins_.end()) {
-      flushing_wins_.push_back(mo.win);
+      flushing_wins_.push_back(cb.win);
     }
   }
 
@@ -666,7 +668,7 @@ public:
   template <typename T>
   void* get_physical_mem(global_ptr<T> ptr) {
     mem_obj& mo = get_mem_obj(ptr.id());
-    return mo.home_pms[topo_.intra_rank()].anon_vm_addr();
+    return mo.home_pm().anon_vm_addr();
   }
 
 };
@@ -675,15 +677,13 @@ template <typename P>
 inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
   : validate_dummy_(validate_input(cache_size, comm)),
     topo_(comm),
-    objs_(obj_id_count_),
     allocator_(comm),
+    objs_(1), // objs_[0] = dummy
     mmap_cache_(get_home_mmap_limit(cache_size / block_size), *this),
     cache_(cache_size / block_size, *this),
     cache_pm_(cache_shmem_name(topo_.intra_rank()), cache_size, true, true),
     rm_(comm),
-    max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, rank()) / block_size),
-    enable_shared_memory_(get_env("PCAS_ENABLE_SHARED_MEMORY", 1, rank())),
-    n_prefetch_(get_env("PCAS_PREFETCH_BLOCKS", 0, rank())) {
+    max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, rank()) / block_size) {
 
   logger::init(rank(), nproc());
 
@@ -706,54 +706,13 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
   }
 
   uint64_t size = nelems * sizeof(T);
+  mem_obj_id_t obj_id = objs_.size();
 
   auto mmapper = std::make_unique<MemMapper<block_size>>(size, nproc(), mmargs...);
 
-  uint64_t local_size = mmapper->get_local_size(rank());
-  uint64_t effective_size = mmapper->get_effective_size();
+  objs_.emplace_back(std::in_place, std::move(mmapper), obj_id, size, topo_);
 
-  obj_id_t obj_id = obj_id_count_++;
-
-  virtual_mem vm(nullptr, effective_size);
-  physical_mem pm_local(home_shmem_name(obj_id, topo_.intra_rank()), local_size, true, true);
-
-  MPI_Win win = MPI_WIN_NULL;
-  MPI_Win_create(pm_local.anon_vm_addr(),
-                 local_size,
-                 1,
-                 MPI_INFO_NULL,
-                 topo_.global_comm(),
-                 &win);
-  MPI_Win_lock_all(0, win);
-
-  // Open home physical memory of other intra-node processes
-  std::vector<physical_mem> home_pms(topo_.intra_nproc());
-  for (int i = 0; i < topo_.intra_nproc(); i++) {
-    if (i == topo_.intra_rank()) {
-      home_pms[i] = std::move(pm_local);
-    } else if (enable_shared_memory_) {
-      int target_rank = topo_.intra2global_rank(i);
-      int target_local_size = mmapper->get_local_size(target_rank);
-      physical_mem pm(home_shmem_name(obj_id, i), target_local_size, false, true);
-      home_pms[i] = std::move(pm);
-    }
-  }
-
-  // owner = -1 means collective memory object
-  mem_obj mo {
-    .owner = -1, .id = obj_id,
-    .size = size, .effective_size = effective_size,
-    .mmapper = std::move(mmapper),
-    .home_pms = std::move(home_pms), .vm = std::move(vm),
-    .last_checkout_block_num = std::numeric_limits<block_num_t>::max(),
-    .win = win,
-  };
-
-  auto ret = global_ptr<T>(mo.owner, mo.id, 0);
-
-  objs_.push_back(std::move(mo));
-
-  return ret;
+  return global_ptr<T>(-1, obj_id, 0);
 }
 
 template <typename P>
@@ -785,17 +744,14 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
     mem_obj& mo = get_mem_obj(ptr.id());
 
     // ensure all cache entries are evicted
-    for (uint64_t offset = 0; offset < mo.effective_size; offset += block_size) {
-      void* vm_addr = (uint8_t*)mo.vm.addr() + offset;
+    for (uint64_t offset = 0; offset < mo.effective_size(); offset += block_size) {
+      uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + offset;
       mmap_cache_.ensure_evicted((uintptr_t)vm_addr / block_size);
       cache_.ensure_evicted((uintptr_t)vm_addr / block_size);
     }
 
     home_tlb_.clear();
     cache_tlb_.clear();
-
-    MPI_Win_unlock_all(mo.win);
-    MPI_Win_free(&mo.win);
 
     objs_[ptr.id()].reset();
 
@@ -859,10 +815,10 @@ inline void pcas_if<P>::for_each_block(global_ptr<T> ptr, uint64_t nelems, Func 
   uint64_t offset_max = offset_min + nelems * sizeof(T);
   uint64_t offset     = offset_min;
 
-  PCAS_CHECK(offset_max <= mo.size);
+  PCAS_CHECK(offset_max <= mo.size());
 
   while (offset < offset_max) {
-    auto bi = mo.mmapper->get_block_info(offset);
+    auto bi = mo.mem_mapper().get_block_info(offset);
     fn(bi);
     offset = bi.offset_e;
   }
@@ -968,9 +924,9 @@ pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems)
     uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
     uint64_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
 
-    if (is_locally_accessible(bi.owner)) {
+    if (mo.is_locally_accessible(bi.owner)) {
       int target_intra_rank = topo_.intra_rank(bi.owner);
-      void* from_vm_addr = mo.home_pms[target_intra_rank].anon_vm_addr();
+      void* from_vm_addr = mo.home_pm(target_intra_rank).anon_vm_addr();
       std::memcpy((uint8_t*)to_ptr - offset_b + block_offset_b,
                   (uint8_t*)from_vm_addr + pm_offset,
                   block_offset_e - block_offset_b);
@@ -983,7 +939,7 @@ pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems)
                pm_offset,
                block_offset_e - block_offset_b,
                MPI_UINT8_T,
-               mo.win,
+               mo.win(),
                &req);
       reqs.push_back(req);
     }
@@ -1014,9 +970,9 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uin
     uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
     uint64_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
 
-    if (is_locally_accessible(bi.owner)) {
+    if (mo.is_locally_accessible(bi.owner)) {
       int target_intra_rank = topo_.intra_rank(bi.owner);
-      void* to_vm_addr = mo.home_pms[target_intra_rank].anon_vm_addr();
+      void* to_vm_addr = mo.home_pm(target_intra_rank).anon_vm_addr();
       std::memcpy((uint8_t*)to_vm_addr + pm_offset,
                   (uint8_t*)from_ptr - offset_b + block_offset_b,
                   block_offset_e - block_offset_b);
@@ -1028,12 +984,12 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uin
               pm_offset,
               block_offset_e - block_offset_b,
               MPI_UINT8_T,
-              mo.win);
+              mo.win());
     }
   });
 
   // ensure remote completion
-  MPI_Win_flush_all(mo.win);
+  MPI_Win_flush_all(mo.win());
 }
 
 PCAS_TEST_CASE("[pcas::pcas] get and put") {
@@ -1191,23 +1147,25 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
 
   try {
     for_each_block(ptr, size, [&](const auto& bi) {
-      if (!is_locally_accessible(bi.owner)) {
+      if (!mo.is_locally_accessible(bi.owner)) {
         uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
         uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
         for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
-          uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
+          uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + o;
           cache_block& cb = cache_.ensure_cached(vm_addr);
 
           if (!cb.mapped) {
             cb.vm_addr = vm_addr;
-            cb.obj_id = mo.id;
+            cb.owner = bi.owner;
+            cb.pm_offset = bi.pm_offset + o - bi.offset_b;
+            cb.win = mo.win();
             remap_cache_blocks_.push_back(&cb);
           }
 
           cb.transaction_id = transaction_id_;
 
           uint64_t pm_offset = bi.pm_offset + o - bi.offset_b;
-          PCAS_CHECK(pm_offset + block_size <= mo.mmapper->get_local_size(bi.owner));
+          PCAS_CHECK(pm_offset + block_size <= mo.mem_mapper().get_local_size(bi.owner));
           fetch_begin(mo, cb, bi.owner, pm_offset);
         }
       }
@@ -1257,9 +1215,9 @@ inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
   const uint64_t offset_b = ptr.offset();
   const uint64_t offset_e = offset_b + size;
 
-  PCAS_CHECK(offset_e <= mo.size);
+  PCAS_CHECK(offset_e <= mo.size());
 
-  uint8_t* raw_ptr = (uint8_t*)mo.vm.addr() + offset_b;
+  uint8_t* raw_ptr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + offset_b;
 
   // fast path for small requests using TLB
   {
@@ -1299,11 +1257,11 @@ inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
         if (Mode != access_mode::write &&
             *cb.partial_sections.begin() != section{0, block_size}) {
           // fetch the rest of the block
-          auto bi = mo.mmapper->get_block_info(offset_b);
+          auto bi = mo.mem_mapper().get_block_info(offset_b);
 
           uint64_t pm_offset = bi.pm_offset + offset_b / block_size * block_size - bi.offset_b;
-          PCAS_CHECK(pm_offset + block_size <= mo.mmapper->get_local_size(bi.owner));
-          fetch_begin(cb, bi.owner, pm_offset, mo.win);
+          PCAS_CHECK(pm_offset + block_size <= mo.mem_mapper().get_local_size(bi.owner));
+          fetch_begin(cb, bi.owner, pm_offset, mo.win());
 
           // Immediately wait for communication completion here because it is a fast path;
           // i.e., there is only one cache block to be checked out.
@@ -1323,37 +1281,23 @@ inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
   }
 
   uint64_t size_pf = size;
-  if (Mode != access_mode::write && n_prefetch_ > 0) {
-    block_num_t block_num_b = offset_b / block_size;
-    block_num_t block_num_e = (offset_e + block_size - 1) / block_size;
-    if (block_num_b <= mo.last_checkout_block_num + 1 &&
-        mo.last_checkout_block_num + 1 < block_num_e) {
-      // If it seems sequential access, do prefetch
-      size_pf = std::min(size + n_prefetch_ * block_size, mo.size - offset_b);
-    }
-    mo.last_checkout_block_num = block_num_e - 1;
+  if (Mode != access_mode::write) {
+    size_pf = mo.size_with_prefetch(offset_b, size);
   }
 
   std::vector<MPI_Request> reqs;
 
   for_each_block(ptr, size_pf, [&](const auto& bi) {
-    if (is_locally_accessible(bi.owner)) {
+    if (mo.is_locally_accessible(bi.owner)) {
       bool is_prefetch = bi.offset_b >= offset_e;
       if (!is_prefetch) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
+        uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + bi.offset_b;
 
-        home_block& hb = std::invoke([&]() -> home_block& {
-          try {
-            return mmap_cache_.ensure_cached((uintptr_t)vm_addr / block_size);
-          } catch (cache_full_exception& e) {
-            die("mmap cache is exhausted (too many objects are being checked out)");
-            throw;
-          }
-        });
+        home_block& hb = ensure_mmap_cached_strict(vm_addr);
 
         if (!hb.mapped) {
           int target_intra_rank = topo_.intra_rank(bi.owner);
-          hb.pm = &mo.home_pms[target_intra_rank];
+          hb.pm = &mo.home_pm(target_intra_rank);
           hb.pm_offset = bi.pm_offset;
           hb.vm_addr = vm_addr;
           hb.size = bi.offset_e - bi.offset_b;
@@ -1373,25 +1317,15 @@ inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
       uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
       uint64_t block_offset_e = std::min(bi.offset_e, offset_b + size_pf);
       for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
+        uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + o;
 
-        cache_block& cb = std::invoke([&]() -> cache_block& {
-          try {
-            return cache_.ensure_cached((uintptr_t)vm_addr / block_size);
-          } catch (cache_full_exception& e) {
-            ensure_all_cache_clean();
-            try {
-              return cache_.ensure_cached((uintptr_t)vm_addr / block_size);
-            } catch (cache_full_exception& e) {
-              die("cache is exhausted (too many objects are being checked out)");
-              throw;
-            }
-          }
-        });
+        cache_block& cb = ensure_cached_strict(vm_addr);
 
         if (!cb.mapped) {
           cb.vm_addr = vm_addr;
-          cb.obj_id = mo.id;
+          cb.owner = bi.owner;
+          cb.pm_offset = bi.pm_offset + o - bi.offset_b;
+          cb.win = mo.win();
           remap_cache_blocks_.push_back(&cb);
         }
 
@@ -1421,8 +1355,8 @@ inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
         // has been already fetched or not.
         if (Mode != access_mode::write) {
           uint64_t pm_offset = bi.pm_offset + o - bi.offset_b;
-          PCAS_CHECK(pm_offset + block_size <= mo.mmapper->get_local_size(bi.owner));
-          fetch_begin(cb, bi.owner, pm_offset, mo.win);
+          PCAS_CHECK(pm_offset + block_size <= mo.mem_mapper().get_local_size(bi.owner));
+          fetch_begin(cb, bi.owner, pm_offset, mo.win());
         }
 
         bool is_prefetch = o >= offset_e;
@@ -1466,7 +1400,7 @@ inline void* pcas_if<P>::checkout_impl_local(global_ptr<uint8_t> ptr, uint64_t s
   PCAS_CHECK(target_rank < nproc());
 
   if (target_rank == rank()) {
-    return (void*)ptr.offset();
+    return reinterpret_cast<void*>(ptr.offset());
   }
 
   const uint64_t remote_addr = ptr.offset();
@@ -1475,6 +1409,17 @@ inline void* pcas_if<P>::checkout_impl_local(global_ptr<uint8_t> ptr, uint64_t s
   uint64_t block_offset_b = remote_addr / block_size * block_size;
   uint64_t block_offset_e = remote_addr + size;
   for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
+    uint8_t* vm_addr = reinterpret_cast<uint8_t*>(o);
+
+    cache_block& cb = ensure_cached_strict(vm_addr);
+
+    if (!cb.mapped) {
+      cb.vm_addr = vm_addr;
+      cb.owner = allocator_.get_owner(reinterpret_cast<uint64_t>(vm_addr));
+      cb.pm_offset = reinterpret_cast<uint64_t>(vm_addr);
+      cb.win = allocator_.win();
+      remap_cache_blocks_.push_back(&cb);
+    }
   }
 }
 
@@ -1506,7 +1451,7 @@ inline void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, acc
   const uint64_t offset_b = ptr.offset();
   const uint64_t offset_e = offset_b + size;
 
-  uint8_t* raw_ptr = (uint8_t*)mo.vm.addr() + offset_b;
+  uint8_t* raw_ptr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + offset_b;
 
   // fast path for small requests using TLB
   {
@@ -1553,9 +1498,9 @@ inline void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, acc
   }
 
   for_each_block(ptr, size, [&](const auto& bi) {
-    if (is_locally_accessible(bi.owner)) {
+    if (mo.is_locally_accessible(bi.owner)) {
       if (DoCheckout) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + bi.offset_b;
+        uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + bi.offset_b;
         home_block& hb = mmap_cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
         hb.checkout_count--;
       }
@@ -1563,7 +1508,7 @@ inline void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, acc
       uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
       uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
       for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
-        uint8_t* vm_addr = (uint8_t*)mo.vm.addr() + o;
+        uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + o;
         cache_block& cb = cache_.template ensure_cached<false>((uintptr_t)vm_addr / block_size);
 
         if (mode != access_mode::read) {

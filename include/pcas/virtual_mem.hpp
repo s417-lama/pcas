@@ -17,13 +17,8 @@ class virtual_mem {
 
 public:
   virtual_mem() {}
-  virtual_mem(void* addr, uint64_t size) : size_(size) {
-    addr_ = mmap_no_physical_mem(addr, size);
-  }
-
-  virtual_mem(const virtual_mem&) = delete;
-
-  virtual_mem(virtual_mem&& vm) : addr_(vm.addr_), size_(vm.size_) { vm.addr_ = nullptr; }
+  virtual_mem(void* addr, uint64_t size, uint64_t alignment = alignof(max_align_t)) :
+    addr_(mmap_no_physical_mem(addr, size, alignment)), size_(size) {}
 
   ~virtual_mem() {
     if (addr_) {
@@ -31,8 +26,10 @@ public:
     }
   }
 
+  virtual_mem(const virtual_mem&) = delete;
   virtual_mem& operator=(const virtual_mem&) = delete;
 
+  virtual_mem(virtual_mem&& vm) : addr_(vm.addr_), size_(vm.size_) { vm.addr_ = nullptr; }
   virtual_mem& operator=(virtual_mem&& vm) {
     this->~virtual_mem();
     addr_ = vm.addr();
@@ -57,19 +54,44 @@ public:
   }
 
   // TODO: reconsider this abstraction...
-  static void* mmap_no_physical_mem(void* addr, uint64_t size) {
+  static void* mmap_no_physical_mem(void* addr, uint64_t size, uint64_t alignment = alignof(max_align_t)) {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-    if (addr != nullptr) flags |= MAP_FIXED;
-    void* ret = mmap(addr, size, PROT_NONE, flags, -1, 0);
-    if (ret == MAP_FAILED) {
-      perror("mmap");
-      die("[pcas::virtual_mem] mmap(%p, %lu, ...) failed", addr, size);
+
+    uint64_t reqsize;
+    if (addr == nullptr) {
+      reqsize = size + alignment;
+    } else {
+      PCAS_CHECK(reinterpret_cast<uintptr_t>(addr) % alignment == 0);
+      reqsize = size;
+      flags |= MAP_FIXED;
     }
-    return ret;
+
+    void* allocated_p = mmap(addr, reqsize, PROT_NONE, flags, -1, 0);
+    if (allocated_p == MAP_FAILED) {
+      perror("mmap");
+      die("[pcas::virtual_mem] mmap(%p, %lu, ...) failed", addr, reqsize);
+    }
+
+    if (addr == nullptr) {
+      uintptr_t allocated_addr = reinterpret_cast<uintptr_t>(allocated_p);
+      uintptr_t ret_addr = (allocated_addr + alignment - 1) / alignment * alignment;
+      uint8_t* ret_p = reinterpret_cast<uint8_t*>(ret_addr);
+
+      PCAS_CHECK(ret_addr >= allocated_addr);
+      unmap(allocated_p, ret_addr - allocated_addr);
+
+      PCAS_CHECK(reqsize >= ret_addr - allocated_addr + size);
+      unmap(ret_p + size, reqsize - (ret_addr - allocated_addr + size));
+
+      return ret_p;
+    } else {
+      PCAS_CHECK(addr == allocated_p);
+      return allocated_p;
+    }
   }
 
   static void unmap(void* addr, uint64_t size) {
-    if (munmap(addr, size) == -1) {
+    if (size > 0 && munmap(addr, size) == -1) {
       perror("munmap");
       die("[pcas::virtual_mem] munmap(%p, %lu) failed", addr, size);
     }

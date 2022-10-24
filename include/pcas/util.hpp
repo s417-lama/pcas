@@ -14,6 +14,7 @@
 #include <forward_list>
 #include <optional>
 #include <random>
+#include <mpi.h>
 
 #ifdef DOCTEST_LIBRARY_INCLUDED
 
@@ -53,8 +54,6 @@
 #endif
 
 namespace pcas {
-
-using obj_id_t = uint64_t;
 
 __attribute__((noinline))
 inline void die(const char* fmt, ...) {
@@ -135,6 +134,40 @@ PCAS_TEST_CASE("[pcas::util] next_pow2") {
   PCAS_CHECK(next_pow2(15) == 16);
   PCAS_CHECK(next_pow2(((uint64_t)1 << 38) - 100) == (uint64_t)1 << 38);
 }
+
+class win_manager {
+  MPI_Win win_ = MPI_WIN_NULL;
+public:
+  win_manager(MPI_Comm comm) {
+    MPI_Win_create_dynamic(MPI_INFO_NULL, comm, &win_);
+    MPI_Win_lock_all(0, win_);
+  }
+  win_manager(MPI_Comm comm, void* vm_addr, uint64_t size) {
+    MPI_Win_create(vm_addr,
+                   size,
+                   1,
+                   MPI_INFO_NULL,
+                   comm,
+                   &win_);
+    MPI_Win_lock_all(0, win_);
+  }
+  ~win_manager() {
+    if (win_ != MPI_WIN_NULL) {
+      MPI_Win_unlock_all(win_);
+      MPI_Win_free(&win_);
+    }
+  }
+  win_manager(const win_manager&) = delete;
+  win_manager& operator=(const win_manager&) = delete;
+  win_manager(win_manager&& wm) noexcept : win_(wm.win_) { wm.win_ = MPI_WIN_NULL; }
+  win_manager& operator=(win_manager&& wm) noexcept {
+    this->~win_manager();
+    this->win_ = wm.win_;
+    wm.win_ = MPI_WIN_NULL;
+    return *this;
+  }
+  MPI_Win win() const { return win_; }
+};
 
 // Section
 // -----------------------------------------------------------------------------
