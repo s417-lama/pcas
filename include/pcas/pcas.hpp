@@ -201,26 +201,23 @@ class pcas_if {
     epoch_t epoch; // current epoch of the owner
   };
 
-  struct release_manager {
-    release_remote_region* remote;
-    MPI_Win win;
+  class release_manager {
+    win_manager win_;
+    release_remote_region* remote_;
 
-    release_manager(MPI_Comm comm) {
-      MPI_Win_allocate(sizeof(release_remote_region),
-                       1,
-                       MPI_INFO_NULL,
-                       comm,
-                       &remote,
-                       &win);
-      MPI_Win_lock_all(0, win);
-
-      remote->request = 1;
-      remote->epoch = 1;
+  public:
+    release_manager(MPI_Comm comm) : win_(comm, sizeof(release_remote_region), (void**)&remote_) {
+      remote_->request = 1;
+      remote_->epoch = 1;
     }
 
-    ~release_manager() {
-      MPI_Win_unlock_all(win);
-      MPI_Win_free(&win);
+    MPI_Win win() const { return win_.win(); }
+
+    epoch_t request() const { return remote_->request; }
+    epoch_t epoch() const { return remote_->epoch; }
+
+    void increment_epoch() {
+      remote_->epoch++;
     }
   };
 
@@ -288,8 +285,6 @@ class pcas_if {
 
   topology topo_;
 
-  allocator allocator_;
-
   std::vector<std::optional<mem_obj>> objs_;
 
   std::vector<std::optional<checkout_entry>> checkouts_;
@@ -303,6 +298,8 @@ class pcas_if {
 
   tlb<home_block*> home_tlb_;
   tlb<cache_block*> cache_tlb_;
+
+  allocator allocator_;
 
   uint64_t transaction_id_ = 1;
 
@@ -546,7 +543,7 @@ class pcas_if {
 
     if (cache_dirty_) {
       cache_dirty_ = false;
-      rm_.remote->epoch++;
+      rm_.increment_epoch();
     }
   }
 
@@ -568,7 +565,7 @@ class pcas_if {
              offsetof(release_remote_region, epoch),
              sizeof(epoch_t),
              MPI_UINT8_T,
-             rm_.win,
+             rm_.win(),
              &req);
     MPI_Wait(&req, MPI_STATUS_IGNORE);
 
@@ -584,8 +581,8 @@ class pcas_if {
                            MPI_UINT64_T, // should match epoch_t
                            target_rank,
                            offsetof(release_remote_region, request),
-                           rm_.win);
-      MPI_Win_flush(target_rank, rm_.win);
+                           rm_.win());
+      MPI_Win_flush(target_rank, rm_.win());
       remote_epoch = prev;
     } while (remote_epoch < request_epoch);
     // FIXME: MPI_Fetch_and_op + MPI_MAX seems not offloaded to RDMA NICs,
@@ -597,8 +594,8 @@ class pcas_if {
     /*                  target_rank, */
     /*                  offsetof(release_remote_region, request), */
     /*                  MPI_MAX, */
-    /*                  rm_.win); */
-    /* MPI_Win_flush(target_rank, rm_.win); */
+    /*                  rm_.win()); */
+    /* MPI_Win_flush(target_rank, rm_.win()); */
   }
 
   template <access_mode Mode, bool DoCheckout>
@@ -684,11 +681,11 @@ template <typename P>
 inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
   : validate_dummy_(validate_input(cache_size, comm)),
     topo_(comm),
-    allocator_(comm),
     objs_(1), // objs_[0] = dummy
     mmap_cache_(get_home_mmap_limit(cache_size / block_size), *this),
     cache_(cache_size / block_size, *this),
     cache_pm_(cache_shmem_name(topo_.intra_rank()), cache_size, true, true),
+    allocator_(topo_),
     rm_(comm),
     max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, rank()) / block_size) {
 
@@ -795,7 +792,7 @@ inline void pcas_if<P>::free(global_ptr<T> ptr) {
 
 PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
   pcas pc;
-  int n = 10;
+  constexpr int n = 10;
   PCAS_SUBCASE("free immediately") {
     for (int i = 1; i < n; i++) {
       auto p = pc.malloc<int, mem_mapper::block>(i * 1234);
@@ -815,7 +812,7 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
 
 PCAS_TEST_CASE("[pcas::pcas] malloc and free with cyclic policy") {
   pcas pc;
-  int n = 10;
+  constexpr int n = 10;
   PCAS_SUBCASE("free immediately") {
     for (int i = 1; i < n; i++) {
       auto p = pc.malloc<int, mem_mapper::cyclic>(i * 123456);
@@ -829,6 +826,47 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with cyclic policy") {
     }
     for (int i = 1; i < n; i++) {
       pc.free(ptrs[i]);
+    }
+  }
+}
+
+PCAS_TEST_CASE("[pcas::pcas] malloc and free (local)") {
+  pcas pc;
+  constexpr int n = 10;
+  PCAS_SUBCASE("free immediately") {
+    for (int i = 0; i < n; i++) {
+      auto p = pc.malloc_local<int>((uint64_t)1 << i);
+      pc.free(p);
+    }
+  }
+  PCAS_SUBCASE("free after accumulation") {
+    global_ptr<int> ptrs[n];
+    for (int i = 0; i < n; i++) {
+      ptrs[i] = pc.malloc_local<int>((uint64_t)1 << i);
+    }
+    for (int i = 0; i < n; i++) {
+      pc.free(ptrs[i]);
+    }
+  }
+  PCAS_SUBCASE("remote free") {
+    int rank, nproc;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+
+    global_ptr<int> ptrs_send[n];
+    global_ptr<int> ptrs_recv[n];
+    for (int i = 0; i < n; i++) {
+      ptrs_send[i] = pc.malloc_local<int>((uint64_t)1 << i);
+    }
+
+    MPI_Request req_send, req_recv;
+    MPI_Isend(ptrs_send, sizeof(global_ptr<int>) * n, MPI_BYTE, (nproc + rank + 1) % nproc, 0, MPI_COMM_WORLD, &req_send);
+    MPI_Irecv(ptrs_recv, sizeof(global_ptr<int>) * n, MPI_BYTE, (nproc + rank - 1) % nproc, 0, MPI_COMM_WORLD, &req_recv);
+    MPI_Wait(&req_send, MPI_STATUS_IGNORE);
+    MPI_Wait(&req_recv, MPI_STATUS_IGNORE);
+
+    for (int i = 0; i < n; i++) {
+      pc.free(ptrs_recv[i]);
     }
   }
 }
@@ -1793,6 +1831,91 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
   pc.free(ps[1]);
 }
 
+PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (local)") {
+  pcas pc(16 * pcas::block_size);
+
+  int rank = pc.rank();
+  int nproc = pc.nproc();
+
+  PCAS_SUBCASE("list creation") {
+    int niter = 10000;
+    int n_alloc_iter = 100;
+
+    struct node_t {
+      global_ptr<node_t> next;
+      int value;
+    };
+
+    global_ptr<node_t> root_node = pc.malloc_local<node_t>(1);
+
+    {
+      node_t* n = pc.checkout<access_mode::write>(root_node, 1);
+      n->next = global_ptr<node_t>{};
+      n->value = rank;
+      pc.checkin(n, 1);
+    }
+
+    global_ptr<node_t> node = root_node;
+    for (int i = 0; i < niter; i++) {
+      for (int j = 0; j < n_alloc_iter; j++) {
+        // append a new node
+        global_ptr<node_t> new_node = pc.malloc_local<node_t>(1);
+
+        int val;
+        {
+          node_t* n = pc.checkout<access_mode::read_write>(node, 1);
+          val = n->value;
+          n->next = new_node;
+          pc.checkin(n, 1);
+        }
+
+        {
+          node_t* n = pc.checkout<access_mode::write>(new_node, 1);
+          n->next = global_ptr<node_t>{};
+          n->value = val + 1;
+          pc.checkin(n, 1);
+        }
+
+        node = new_node;
+      }
+
+      pc.release();
+
+      // exchange nodes across nodes
+      global_ptr<node_t> next_node;
+
+      MPI_Request req_send, req_recv;
+      MPI_Isend(&node     , sizeof(global_ptr<node_t>), MPI_BYTE, (nproc + rank + 1) % nproc, i, MPI_COMM_WORLD, &req_send);
+      MPI_Irecv(&next_node, sizeof(global_ptr<node_t>), MPI_BYTE, (nproc + rank - 1) % nproc, i, MPI_COMM_WORLD, &req_recv);
+      MPI_Wait(&req_send, MPI_STATUS_IGNORE);
+      MPI_Wait(&req_recv, MPI_STATUS_IGNORE);
+
+      node = next_node;
+
+      pc.acquire();
+    }
+
+    pc.barrier();
+
+    int count = 0;
+    node = root_node;
+    while (node != global_ptr<node_t>{}) {
+      const node_t* n = pc.checkout<access_mode::read>(node, 1);
+
+      PCAS_CHECK(n->value == rank + count);
+
+      global_ptr<node_t> prev_node = node;
+      node = n->next;
+
+      pc.checkin(n, 1);
+
+      pc.free(prev_node);
+
+      count++;
+    }
+  }
+}
+
 // TODO: add tests to below functions
 
 template <typename P>
@@ -1805,7 +1928,7 @@ template <typename P>
 inline void pcas_if<P>::release_lazy(release_handler* handler) {
   PCAS_CHECK(empty(checkouts_));
 
-  epoch_t next_epoch = cache_dirty_ ? rm_.remote->epoch + 1 : 0; // 0 means clean
+  epoch_t next_epoch = cache_dirty_ ? rm_.epoch() + 1 : 0; // 0 means clean
   *handler = {.rank = rank(), .epoch = next_epoch};
 }
 
@@ -1837,13 +1960,13 @@ inline void pcas_if<P>::barrier() {
 
 template <typename P>
 inline void pcas_if<P>::poll() {
-  if (rm_.remote->request > rm_.remote->epoch) {
+  if (rm_.request() > rm_.epoch()) {
     auto ev = logger::template record<logger_kind::ReleaseLazy>();
-    PCAS_CHECK(rm_.remote->request == rm_.remote->epoch + 1);
+    PCAS_CHECK(rm_.request() == rm_.epoch() + 1);
 
     ensure_all_cache_clean();
 
-    PCAS_CHECK(rm_.remote->request == rm_.remote->epoch);
+    PCAS_CHECK(rm_.request() == rm_.epoch());
   }
 }
 

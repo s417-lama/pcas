@@ -142,6 +142,10 @@ public:
     MPI_Win_create_dynamic(MPI_INFO_NULL, comm, &win_);
     MPI_Win_lock_all(0, win_);
   }
+  win_manager(MPI_Comm comm, uint64_t size, void** vm_addr) {
+    MPI_Win_allocate(size, 1, MPI_INFO_NULL, comm, vm_addr, &win_);
+    MPI_Win_lock_all(0, win_);
+  }
   win_manager(MPI_Comm comm, void* vm_addr, uint64_t size) {
     MPI_Win_create(vm_addr,
                    size,

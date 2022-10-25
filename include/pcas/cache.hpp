@@ -76,13 +76,6 @@ public:
     }
   }
 
-  ~cache_system() {
-    PCAS_CHECK(table_.empty());
-    for (auto& cb : entries_) {
-      PCAS_CHECK(!cb.allocated);
-    }
-  }
-
   cache_entry_num_t num_entries() const { return nentries_; }
 
   bool is_cached(Key key) const {
