@@ -42,6 +42,8 @@ struct policy_default {
   using logger_impl_t = logger::impl_dummy<P>;
   template <typename P>
   using allocator_impl_t = std_pool_resource_impl<P>;
+  template <uint64_t BlockSize>
+  using default_mem_mapper = mem_mapper::cyclic<BlockSize>;
   constexpr static uint64_t block_size = 65536;
   constexpr static bool enable_write_through = false;
 };
@@ -621,7 +623,10 @@ public:
   int rank() const { return topo_.global_rank(); }
   int nproc() const { return topo_.global_nproc(); }
 
-  template <typename T, template<uint64_t> typename MemMapper = mem_mapper::cyclic, typename... MemMapperArgs>
+  template <typename T>
+  global_ptr<T> malloc(uint64_t nelems);
+
+  template <typename T, template<uint64_t> typename MemMapper, typename... MemMapperArgs>
   global_ptr<T> malloc(uint64_t nelems, MemMapperArgs... mmargs);
 
   template <typename T>
@@ -700,6 +705,12 @@ PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
   for (int i = 0; i < 3; i++) {
     pcas pc;
   }
+}
+
+template <typename P>
+template <typename T>
+inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems) {
+  return malloc<T, P::template default_mem_mapper>(nelems);
 }
 
 template <typename P>
