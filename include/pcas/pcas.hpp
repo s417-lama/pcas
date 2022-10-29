@@ -36,6 +36,8 @@ struct release_handler {
 };
 
 struct policy_default {
+  template <typename GPtrT>
+  using global_ref = global_ref_base<GPtrT>;
   using wallclock_t = wallclock_native;
   using logger_kind_t = logger::kind;
   template <typename P>
@@ -57,6 +59,49 @@ template <typename P>
 class pcas_if {
   using this_t = pcas_if<P>;
 
+  // Policies
+  // -----------------------------------------------------------------------------
+
+  struct global_ptr_policy {
+    template <typename GPtrT>
+    using global_ref = typename P::template global_ref<GPtrT>;
+  };
+  template <typename T>
+  using global_ptr_ = global_ptr_if<global_ptr_policy, T>;
+
+  struct logger_policy {
+    static const char* outfile_prefix() { return "pcas"; }
+    using wallclock_t = typename P::wallclock_t;
+    using logger_kind_t = typename P::logger_kind_t;
+    template <typename P_>
+    using logger_impl_t = typename P::template logger_impl_t<P_>;
+  };
+  using logger_ = typename logger::template logger_if<logger_policy>;
+
+  struct allocator_policy {
+    constexpr static uint64_t block_size = P::block_size;
+    using logger = logger_;
+    template <typename P_>
+    using allocator_impl_t = typename P::template allocator_impl_t<P_>;
+  };
+  using allocator = allocator_if<allocator_policy>;
+
+  struct mem_obj_policy {
+    constexpr static uint64_t block_size = P::block_size;
+  };
+  using mem_obj = mem_obj_if<mem_obj_policy>;
+
+public:
+  template <typename T>
+  using global_ptr = global_ptr_<T>;
+  using logger = logger_;
+  using logger_kind = typename logger::kind::value;
+
+private:
+
+  // cache block
+  // -----------------------------------------------------------------------------
+
   using cache_key_t = uintptr_t;
 
   enum class cache_state {
@@ -65,55 +110,6 @@ class pcas_if {
     fetching,   // communication (read) is in-progress
     valid,      // the data is up-to-date
   };
-
-  struct home_block {
-    cache_entry_num_t   entry_num = std::numeric_limits<cache_entry_num_t>::max();
-    const physical_mem* pm;
-    uint64_t            pm_offset;
-    uint8_t*            vm_addr;
-    uint64_t            size;
-    uint64_t            transaction_id = 0;
-    int                 checkout_count = 0;
-    uint8_t*            prev_vm_addr   = nullptr;
-    bool                mapped         = false;
-    this_t&             outer;
-
-    home_block(this_t& outer_ref) : outer(outer_ref) {}
-
-    void map() {
-      pm->map(vm_addr, pm_offset, size);
-      mapped = true;
-    }
-
-    void unmap_prev() {
-      if (prev_vm_addr) {
-        virtual_mem::mmap_no_physical_mem(prev_vm_addr, size);
-        prev_vm_addr = nullptr;
-      }
-    }
-
-    /* Callback functions for cache_system class */
-
-    bool is_evictable() const {
-      return checkout_count == 0 && transaction_id != outer.transaction_id_;
-    }
-
-    void on_evict() {
-      PCAS_CHECK(is_evictable());
-      PCAS_CHECK(prev_vm_addr == nullptr);
-      prev_vm_addr = (uint8_t*)vm_addr;
-      mapped = false;
-
-      // for safety
-      outer.home_tlb_.clear();
-    }
-
-    void on_cache_map(cache_entry_num_t b) {
-      entry_num = b;
-    }
-  };
-
-  using mmap_cache_t = cache_system<cache_key_t, home_block>;
 
   struct cache_block {
     cache_entry_num_t entry_num      = std::numeric_limits<cache_entry_num_t>::max();
@@ -190,38 +186,60 @@ class pcas_if {
 
   using cache_t = cache_system<cache_key_t, cache_block>;
 
-  struct checkout_entry {
-    global_ptr<uint8_t> ptr;
-    void*               raw_ptr;
+  // mmap cache block
+  // -----------------------------------------------------------------------------
+
+  struct home_block {
+    cache_entry_num_t   entry_num = std::numeric_limits<cache_entry_num_t>::max();
+    const physical_mem* pm;
+    uint64_t            pm_offset;
+    uint8_t*            vm_addr;
     uint64_t            size;
-    access_mode         mode;
-    uint64_t            count;
-  };
+    uint64_t            transaction_id = 0;
+    int                 checkout_count = 0;
+    uint8_t*            prev_vm_addr   = nullptr;
+    bool                mapped         = false;
+    this_t&             outer;
 
-  struct release_remote_region {
-    epoch_t request; // requested epoch from remote
-    epoch_t epoch; // current epoch of the owner
-  };
+    home_block(this_t& outer_ref) : outer(outer_ref) {}
 
-  class release_manager {
-    win_manager win_;
-    release_remote_region* remote_;
-
-  public:
-    release_manager(MPI_Comm comm) : win_(comm, sizeof(release_remote_region), (void**)&remote_) {
-      remote_->request = 1;
-      remote_->epoch = 1;
+    void map() {
+      pm->map(vm_addr, pm_offset, size);
+      mapped = true;
     }
 
-    MPI_Win win() const { return win_.win(); }
+    void unmap_prev() {
+      if (prev_vm_addr) {
+        virtual_mem::mmap_no_physical_mem(prev_vm_addr, size);
+        prev_vm_addr = nullptr;
+      }
+    }
 
-    epoch_t request() const { return remote_->request; }
-    epoch_t epoch() const { return remote_->epoch; }
+    /* Callback functions for cache_system class */
 
-    void increment_epoch() {
-      remote_->epoch++;
+    bool is_evictable() const {
+      return checkout_count == 0 && transaction_id != outer.transaction_id_;
+    }
+
+    void on_evict() {
+      PCAS_CHECK(is_evictable());
+      PCAS_CHECK(prev_vm_addr == nullptr);
+      prev_vm_addr = (uint8_t*)vm_addr;
+      mapped = false;
+
+      // for safety
+      outer.home_tlb_.clear();
+    }
+
+    void on_cache_map(cache_entry_num_t b) {
+      entry_num = b;
     }
   };
+
+  using mmap_cache_t = cache_system<cache_key_t, home_block>;
+
+  // TLB
+  // -----------------------------------------------------------------------------
 
   template <typename T, int MaxEntries = 3>
   class tlb {
@@ -255,30 +273,41 @@ class pcas_if {
     }
   };
 
-  // Policies
+  // cache management
   // -----------------------------------------------------------------------------
 
-  struct logger_policy {
-    static const char* outfile_prefix() { return "pcas"; }
-    using wallclock_t = typename P::wallclock_t;
-    using logger_kind_t = typename P::logger_kind_t;
-    template <typename P_>
-    using logger_impl_t = typename P::template logger_impl_t<P_>;
+  struct checkout_entry {
+    global_ptr<uint8_t> ptr;
+    void*               raw_ptr;
+    uint64_t            size;
+    access_mode         mode;
+    uint64_t            count;
   };
-  using logger_ = typename logger::template logger_if<logger_policy>;
 
-  struct allocator_policy {
-    constexpr static uint64_t block_size = P::block_size;
-    using logger = logger_;
-    template <typename P_>
-    using allocator_impl_t = typename P::template allocator_impl_t<P_>;
+  struct release_remote_region {
+    epoch_t request; // requested epoch from remote
+    epoch_t epoch; // current epoch of the owner
   };
-  using allocator = allocator_if<allocator_policy>;
 
-  struct mem_obj_policy {
-    constexpr static uint64_t block_size = P::block_size;
+  class release_manager {
+    win_manager win_;
+    release_remote_region* remote_;
+
+  public:
+    release_manager(MPI_Comm comm) : win_(comm, sizeof(release_remote_region), (void**)&remote_) {
+      remote_->request = 1;
+      remote_->epoch = 1;
+    }
+
+    MPI_Win win() const { return win_.win(); }
+
+    epoch_t request() const { return remote_->request; }
+    epoch_t epoch() const { return remote_->epoch; }
+
+    void increment_epoch() {
+      remote_->epoch++;
+    }
   };
-  using mem_obj = mem_obj_if<mem_obj_policy>;
 
   // Member variables
   // -----------------------------------------------------------------------------
@@ -317,7 +346,7 @@ class pcas_if {
   // Initializaiton
   // -----------------------------------------------------------------------------
 
-  bool validate_input(uint64_t cache_size, MPI_Comm comm) {
+  bool validate_input(uint64_t cache_size, MPI_Comm comm) const {
     int mpi_initialized = 0;
     MPI_Initialized(&mpi_initialized);
     if (!mpi_initialized) {
@@ -340,8 +369,12 @@ class pcas_if {
     return true;
   }
 
-  // Misc
-  // -----------------------------------------------------------------------------
+  uint64_t calc_home_mmap_limit(uint64_t n_cache_blocks) const {
+    uint64_t sys_limit = sys_mmap_entry_limit();
+    uint64_t margin = 1000;
+    PCAS_CHECK(sys_limit > n_cache_blocks + margin);
+    return (sys_limit - n_cache_blocks - margin) / 2;
+  }
 
   std::string cache_shmem_name(int intra_rank) {
     std::stringstream ss;
@@ -349,15 +382,8 @@ class pcas_if {
     return ss.str();
   }
 
-  cache_key_t cache_key(void* vm_addr) {
-    PCAS_CHECK(reinterpret_cast<uintptr_t>(vm_addr) % block_size == 0);
-    return reinterpret_cast<uintptr_t>(vm_addr) / block_size;
-  }
-
-  mem_obj& get_mem_obj(mem_obj_id_t id) {
-    PCAS_CHECK(objs_[id].has_value());
-    return *objs_[id];
-  }
+  // Checkout entry
+  // -----------------------------------------------------------------------------
 
   std::optional<checkout_entry>* find_checkout_entry(void* raw_ptr, uint64_t size) {
     for (auto& c : checkouts_) {
@@ -383,12 +409,21 @@ class pcas_if {
     c->reset();
   }
 
-  uint64_t get_home_mmap_limit(uint64_t n_cache_blocks) {
-    uint64_t sys_limit = sys_mmap_entry_limit();
-    uint64_t margin = 1000;
-    PCAS_CHECK(sys_limit > n_cache_blocks + margin);
-    return (sys_limit - n_cache_blocks - margin) / 2;
+  // Misc functions
+  // -----------------------------------------------------------------------------
+
+  cache_key_t cache_key(void* vm_addr) {
+    PCAS_CHECK(reinterpret_cast<uintptr_t>(vm_addr) % block_size == 0);
+    return reinterpret_cast<uintptr_t>(vm_addr) / block_size;
   }
+
+  mem_obj& get_mem_obj(mem_obj_id_t id) {
+    PCAS_CHECK(objs_[id].has_value());
+    return *objs_[id];
+  }
+
+  // Memory mapping
+  // -----------------------------------------------------------------------------
 
   void ensure_remapped() {
     if (!remap_home_blocks_.empty()) {
@@ -433,6 +468,9 @@ class pcas_if {
       }
     }
   }
+
+  // Cached data management
+  // -----------------------------------------------------------------------------
 
   void fetch_begin(cache_block& cb) {
     PCAS_CHECK(cb.owner < topo_.global_nproc());
@@ -556,6 +594,9 @@ class pcas_if {
     cache_tlb_.clear();
   }
 
+  // Lazy release
+  // -----------------------------------------------------------------------------
+
   epoch_t get_remote_epoch(int target_rank) {
     epoch_t remote_epoch;
 
@@ -600,6 +641,9 @@ class pcas_if {
     /* MPI_Win_flush(target_rank, rm_.win()); */
   }
 
+  // Checkout/checkin impl
+  // -----------------------------------------------------------------------------
+
   template <access_mode Mode, bool DoCheckout>
   void* checkout_impl(global_ptr<uint8_t> ptr, uint64_t size);
 
@@ -613,9 +657,6 @@ class pcas_if {
   void checkin_impl_local(global_ptr<uint8_t> ptr, uint64_t size, access_mode mode);
 
 public:
-  using logger = logger_;
-  using logger_kind = typename logger::kind::value;
-
   constexpr static uint64_t block_size = P::block_size;
 
   pcas_if(uint64_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
@@ -626,7 +667,7 @@ public:
   template <typename T>
   global_ptr<T> malloc(uint64_t nelems);
 
-  template <typename T, template<uint64_t> typename MemMapper, typename... MemMapperArgs>
+  template <typename T, template <uint64_t> typename MemMapper, typename... MemMapperArgs>
   global_ptr<T> malloc(uint64_t nelems, MemMapperArgs... mmargs);
 
   template <typename T>
@@ -687,7 +728,7 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
   : validate_dummy_(validate_input(cache_size, comm)),
     topo_(comm),
     objs_(1), // objs_[0] = dummy
-    mmap_cache_(get_home_mmap_limit(cache_size / block_size), *this),
+    mmap_cache_(calc_home_mmap_limit(cache_size / block_size), *this),
     cache_(cache_size / block_size, *this),
     cache_pm_(cache_shmem_name(topo_.intra_rank()), cache_size, true, true),
     allocator_(topo_),
@@ -709,13 +750,15 @@ PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
 
 template <typename P>
 template <typename T>
-inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems) {
+inline typename pcas_if<P>::template global_ptr<T>
+pcas_if<P>::malloc(uint64_t nelems) {
   return malloc<T, P::template default_mem_mapper>(nelems);
 }
 
 template <typename P>
-template <typename T, template<uint64_t> typename MemMapper, typename... MemMapperArgs>
-inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs) {
+template <typename T, template <uint64_t> typename MemMapper, typename... MemMapperArgs>
+inline typename pcas_if<P>::template global_ptr<T>
+pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
@@ -732,7 +775,8 @@ inline global_ptr<T> pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs
 
 template <typename P>
 template <typename T>
-inline global_ptr<T> pcas_if<P>::malloc_local(uint64_t nelems) {
+inline typename pcas_if<P>::template global_ptr<T>
+pcas_if<P>::malloc_local(uint64_t nelems) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
@@ -811,7 +855,7 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with block policy") {
     }
   }
   PCAS_SUBCASE("free after accumulation") {
-    global_ptr<int> ptrs[n];
+    pcas::global_ptr<int> ptrs[n];
     for (int i = 1; i < n; i++) {
       ptrs[i] = pc.malloc<int, mem_mapper::block>(i * 2743);
     }
@@ -831,7 +875,7 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free with cyclic policy") {
     }
   }
   PCAS_SUBCASE("free after accumulation") {
-    global_ptr<int> ptrs[n];
+    pcas::global_ptr<int> ptrs[n];
     for (int i = 1; i < n; i++) {
       ptrs[i] = pc.malloc<int, mem_mapper::cyclic>(i * 27438, pcas::block_size * i);
     }
@@ -851,7 +895,7 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free (local)") {
     }
   }
   PCAS_SUBCASE("free after accumulation") {
-    global_ptr<int> ptrs[n];
+    pcas::global_ptr<int> ptrs[n];
     for (int i = 0; i < n; i++) {
       ptrs[i] = pc.malloc_local<int>((uint64_t)1 << i);
     }
@@ -864,15 +908,15 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free (local)") {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nproc);
 
-    global_ptr<int> ptrs_send[n];
-    global_ptr<int> ptrs_recv[n];
+    pcas::global_ptr<int> ptrs_send[n];
+    pcas::global_ptr<int> ptrs_recv[n];
     for (int i = 0; i < n; i++) {
       ptrs_send[i] = pc.malloc_local<int>((uint64_t)1 << i);
     }
 
     MPI_Request req_send, req_recv;
-    MPI_Isend(ptrs_send, sizeof(global_ptr<int>) * n, MPI_BYTE, (nproc + rank + 1) % nproc, 0, MPI_COMM_WORLD, &req_send);
-    MPI_Irecv(ptrs_recv, sizeof(global_ptr<int>) * n, MPI_BYTE, (nproc + rank - 1) % nproc, 0, MPI_COMM_WORLD, &req_recv);
+    MPI_Isend(ptrs_send, sizeof(pcas::global_ptr<int>) * n, MPI_BYTE, (nproc + rank + 1) % nproc, 0, MPI_COMM_WORLD, &req_send);
+    MPI_Irecv(ptrs_recv, sizeof(pcas::global_ptr<int>) * n, MPI_BYTE, (nproc + rank - 1) % nproc, 0, MPI_COMM_WORLD, &req_recv);
     MPI_Wait(&req_send, MPI_STATUS_IGNORE);
     MPI_Wait(&req_recv, MPI_STATUS_IGNORE);
 
@@ -1075,7 +1119,7 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
 
   int n = 1000000;
 
-  global_ptr<int> ps[2];
+  pcas::global_ptr<int> ps[2];
   ps[0] = pc.malloc<int, mem_mapper::block >(n);
   ps[1] = pc.malloc<int, mem_mapper::cyclic>(n);
 
@@ -1146,7 +1190,7 @@ PCAS_TEST_CASE("[pcas::pcas] get and put (nocache)") {
 
   int n = 1000000;
 
-  global_ptr<int> ps[2];
+  pcas::global_ptr<int> ps[2];
   ps[0] = pc.malloc<int, mem_mapper::block >(n);
   ps[1] = pc.malloc<int, mem_mapper::cyclic>(n);
 
@@ -1699,7 +1743,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
   int nproc = pc.nproc();
 
   int n = pcas::block_size * nproc;
-  global_ptr<uint8_t> ps[2];
+  pcas::global_ptr<uint8_t> ps[2];
   ps[0] = pc.malloc<uint8_t, mem_mapper::block >(n);
   ps[1] = pc.malloc<uint8_t, mem_mapper::cyclic>(n);
 
@@ -1766,7 +1810,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (large, not aligned)") {
 
   int n = 10000000;
 
-  global_ptr<int> ps[2];
+  pcas::global_ptr<int> ps[2];
   ps[0] = pc.malloc<int, mem_mapper::block >(n);
   ps[1] = pc.malloc<int, mem_mapper::cyclic>(n);
 
@@ -1853,36 +1897,41 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (local)") {
     int n_alloc_iter = 100;
 
     struct node_t {
-      global_ptr<node_t> next;
+      pcas::global_ptr<node_t> next;
       int value;
     };
 
-    global_ptr<node_t> root_node = pc.malloc_local<node_t>(1);
+    pcas::global_ptr<node_t> root_node = pc.malloc_local<node_t>(1);
 
     {
       node_t* n = pc.checkout<access_mode::write>(root_node, 1);
-      n->next = global_ptr<node_t>{};
+      n->next = pcas::global_ptr<node_t>{};
       n->value = rank;
       pc.checkin(n, 1);
     }
 
-    global_ptr<node_t> node = root_node;
+    pcas::global_ptr<node_t> node = root_node;
     for (int i = 0; i < niter; i++) {
       for (int j = 0; j < n_alloc_iter; j++) {
         // append a new node
-        global_ptr<node_t> new_node = pc.malloc_local<node_t>(1);
+        pcas::global_ptr<node_t> new_node = pc.malloc_local<node_t>(1);
 
-        int val;
         {
-          node_t* n = pc.checkout<access_mode::read_write>(node, 1);
-          val = n->value;
-          n->next = new_node;
-          pc.checkin(n, 1);
+          pcas::global_ptr<node_t>* next = pc.checkout<access_mode::write>(&(node->*(&node_t::next)), 1);
+          *next = new_node;
+          pc.checkin(next, 1);
         }
+
+        int val = std::invoke([&]() {
+          const node_t* n = pc.checkout<access_mode::read>(node, 1);
+          int val = n->value;
+          pc.checkin(n, 1);
+          return val;
+        });
 
         {
           node_t* n = pc.checkout<access_mode::write>(new_node, 1);
-          n->next = global_ptr<node_t>{};
+          n->next = pcas::global_ptr<node_t>{};
           n->value = val + 1;
           pc.checkin(n, 1);
         }
@@ -1893,11 +1942,11 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (local)") {
       pc.release();
 
       // exchange nodes across nodes
-      global_ptr<node_t> next_node;
+      pcas::global_ptr<node_t> next_node;
 
       MPI_Request req_send, req_recv;
-      MPI_Isend(&node     , sizeof(global_ptr<node_t>), MPI_BYTE, (nproc + rank + 1) % nproc, i, MPI_COMM_WORLD, &req_send);
-      MPI_Irecv(&next_node, sizeof(global_ptr<node_t>), MPI_BYTE, (nproc + rank - 1) % nproc, i, MPI_COMM_WORLD, &req_recv);
+      MPI_Isend(&node     , sizeof(pcas::global_ptr<node_t>), MPI_BYTE, (nproc + rank + 1) % nproc, i, MPI_COMM_WORLD, &req_send);
+      MPI_Irecv(&next_node, sizeof(pcas::global_ptr<node_t>), MPI_BYTE, (nproc + rank - 1) % nproc, i, MPI_COMM_WORLD, &req_recv);
       MPI_Wait(&req_send, MPI_STATUS_IGNORE);
       MPI_Wait(&req_recv, MPI_STATUS_IGNORE);
 
@@ -1910,12 +1959,12 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (local)") {
 
     int count = 0;
     node = root_node;
-    while (node != global_ptr<node_t>{}) {
+    while (node != pcas::global_ptr<node_t>{}) {
       const node_t* n = pc.checkout<access_mode::read>(node, 1);
 
       PCAS_CHECK(n->value == rank + count);
 
-      global_ptr<node_t> prev_node = node;
+      pcas::global_ptr<node_t> prev_node = node;
       node = n->next;
 
       pc.checkin(n, 1);

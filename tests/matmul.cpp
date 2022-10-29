@@ -7,13 +7,15 @@
 #include "pcas/pcas.hpp"
 
 using real_t = double;
+template <typename T>
+using global_ptr = pcas::pcas::global_ptr<T>;
 
 template <pcas::access_mode Mode, typename T>
-auto checkout_stride(pcas::global_ptr<T> ptr,
-                     uint64_t            bcount,
-                     uint64_t            blen,
-                     uint64_t            bstride,
-                     pcas::pcas&         pc) {
+auto checkout_stride(global_ptr<T> ptr,
+                     uint64_t      bcount,
+                     uint64_t      blen,
+                     uint64_t      bstride,
+                     pcas::pcas&   pc) {
   std::vector<std::conditional_t<Mode == pcas::access_mode::read, const T*, T*>> ret;
   for (uint64_t b = 0; b < bcount; b++) {
     ret.push_back(pc.checkout<Mode>(ptr + b * bstride, blen));
@@ -40,12 +42,12 @@ void matmul_seq(const real_t** A, const real_t** B, real_t** C, uint64_t n) {
   }
 }
 
-void matmul_par(pcas::global_ptr<real_t> A,
-                pcas::global_ptr<real_t> B,
-                pcas::global_ptr<real_t> C,
-                uint64_t                 n,
-                uint64_t                 bn,
-                pcas::pcas&              pc) {
+void matmul_par(global_ptr<real_t> A,
+                global_ptr<real_t> B,
+                global_ptr<real_t> C,
+                uint64_t           n,
+                uint64_t           bn,
+                pcas::pcas&        pc) {
   for (uint64_t bi = 0; bi < n / bn; bi++) {
     for (uint64_t bj = 0; bj < n / bn; bj++) {
       if ((int)(bi * (n / bn) + bj) % pc.nproc() == pc.rank()) {
@@ -65,11 +67,11 @@ void matmul_par(pcas::global_ptr<real_t> A,
   }
 }
 
-void matmul_init(pcas::global_ptr<real_t> A,
-                 pcas::global_ptr<real_t> B,
-                 pcas::global_ptr<real_t> C,
-                 uint64_t                 n,
-                 pcas::pcas&              pc) {
+void matmul_init(global_ptr<real_t> A,
+                 global_ptr<real_t> B,
+                 global_ptr<real_t> C,
+                 uint64_t           n,
+                 pcas::pcas&        pc) {
   static std::mt19937 engine(0);
   std::uniform_real_distribution<> dist(-1.0, 1.0);
 
@@ -92,11 +94,11 @@ void matmul_init(pcas::global_ptr<real_t> A,
   }
 }
 
-void matmul_check(pcas::global_ptr<real_t> A,
-                  pcas::global_ptr<real_t> B,
-                  pcas::global_ptr<real_t> C,
-                  uint64_t                 n,
-                  pcas::pcas&              pc) {
+void matmul_check(global_ptr<real_t> A,
+                  global_ptr<real_t> B,
+                  global_ptr<real_t> C,
+                  uint64_t           n,
+                  pcas::pcas&        pc) {
   static std::mt19937 engine(0);
   std::uniform_int_distribution<> dist(0, n - 1);
 
