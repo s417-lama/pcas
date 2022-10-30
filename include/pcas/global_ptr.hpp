@@ -101,7 +101,13 @@ public:
 
   template <typename U>
   explicit operator global_ptr_if<P, U>() const noexcept {
-    return global_ptr_if<P, U>(owner_, id_, offset_);
+    return {owner_, id_, offset_};
+  }
+
+  void swap(this_t& p) {
+    this_t tmp(*this);
+    *this = p;
+    p = tmp;
   }
 };
 
@@ -113,6 +119,35 @@ inline bool operator==(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>&
 template <typename P, typename T, typename U>
 inline bool operator!=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
   return !p1.is_equal(p2);
+}
+
+template <typename P, typename T, typename U>
+inline bool operator<(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
+  PCAS_CHECK(p1.belong_to_same_obj(p2));
+  return p1.offset() < p2.offset();
+}
+
+template <typename P, typename T, typename U>
+inline bool operator>(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
+  PCAS_CHECK(p1.belong_to_same_obj(p2));
+  return p1.offset() > p2.offset();
+}
+
+template <typename P, typename T, typename U>
+inline bool operator<=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
+  PCAS_CHECK(p1.belong_to_same_obj(p2));
+  return p1.offset() <= p2.offset();
+}
+
+template <typename P, typename T, typename U>
+inline bool operator>=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
+  PCAS_CHECK(p1.belong_to_same_obj(p2));
+  return p1.offset() >= p2.offset();
+}
+
+template <typename P, typename T>
+inline void swap(global_ptr_if<P, T>& p1, global_ptr_if<P, T>& p2) {
+  p1.swap(p2);
 }
 
 template <typename P, typename T, typename MemberT>
@@ -181,6 +216,21 @@ PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
     PCAS_CHECK(p3 != p1);
     PCAS_CHECK(p1 + 1 != p1);
     PCAS_CHECK((p1 + 1) - 1 == p1);
+  }
+
+  PCAS_SUBCASE("comparison") {
+    PCAS_CHECK(p1 < p1 + 1);
+    PCAS_CHECK(p1 <= p1 + 1);
+    PCAS_CHECK(p1 <= p1);
+    PCAS_CHECK(!(p1 < p1));
+    PCAS_CHECK(!(p1 + 1 < p1));
+    PCAS_CHECK(!(p1 + 1 <= p1));
+    PCAS_CHECK(p1 + 1 > p1);
+    PCAS_CHECK(p1 + 1 >= p1);
+    PCAS_CHECK(p1 >= p1);
+    PCAS_CHECK(!(p1 > p1));
+    PCAS_CHECK(!(p1 > p1 + 1));
+    PCAS_CHECK(!(p1 >= p1 + 1));
   }
 
   PCAS_SUBCASE("boolean") {
