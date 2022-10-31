@@ -23,7 +23,7 @@ class global_ptr_if {
 public:
   using difference_type   = std::ptrdiff_t;
   using value_type        = T;
-  using pointer           = T*;
+  using pointer           = void;
   using reference         = ref_t;
   using iterator_category = std::random_access_iterator_tag;
 
@@ -160,6 +160,15 @@ operator->*(global_ptr_if<P, T> ptr, MemberT T::* mp) {
   return global_ptr_if<P, MemberT>(ptr.owner(), ptr.id(), offset);
 }
 
+template <typename>
+struct is_global_ptr : public std::false_type {};
+
+template <typename P, typename T>
+struct is_global_ptr<global_ptr_if<P, T>> : public std::true_type {};
+
+template <typename T>
+inline constexpr bool is_global_ptr_v = is_global_ptr<T>::value;
+
 template <typename GPtrT>
 class global_ref_base {
 protected:
@@ -178,6 +187,9 @@ namespace test {
 
 template <typename T>
 using global_ptr = global_ptr_if<global_ptr_policy_default, T>;
+
+static_assert(is_global_ptr_v<global_ptr<int>>);
+static_assert(!is_global_ptr_v<int>);
 
 PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
   global_ptr<int> p1(0, 0, 0);
