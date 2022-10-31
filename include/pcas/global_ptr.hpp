@@ -14,7 +14,6 @@ using mem_obj_id_t = uint64_t;
 template <typename P, typename T>
 class global_ptr_if {
   using this_t = global_ptr_if<P, T>;
-  using ref_t = typename P::template global_ref<this_t>;
 
   int          owner_;
   mem_obj_id_t id_;
@@ -24,7 +23,7 @@ public:
   using difference_type   = std::ptrdiff_t;
   using value_type        = T;
   using pointer           = void;
-  using reference         = ref_t;
+  using reference         = typename P::template global_ref<this_t>;
   using iterator_category = std::random_access_iterator_tag;
 
   global_ptr_if() : owner_(-2), id_(0), offset_(0) {}
@@ -53,23 +52,20 @@ public:
   explicit operator bool() const noexcept { return !is_equal(this_t()); }
   bool operator!() const noexcept { return is_equal(this_t()); }
 
-  ref_t operator*() const noexcept {
+  reference operator*() const noexcept {
     return *this;
   }
 
-  template <typename Diff>
-  ref_t operator[](Diff diff) const noexcept {
+  reference operator[](difference_type diff) const noexcept {
     return this_t(owner_, id_, offset_ + diff * sizeof(T));
   }
 
-  template <typename Diff>
-  this_t& operator+=(Diff diff) {
+  this_t& operator+=(difference_type diff) {
     offset_ += diff * sizeof(T);
     return *this;
   }
 
-  template <typename Diff>
-  this_t& operator-=(Diff diff) {
+  this_t& operator-=(difference_type diff) {
     PCAS_CHECK(offset_ >= diff * sizeof(T));
     offset_ -= diff * sizeof(T);
     return *this;
@@ -81,18 +77,16 @@ public:
   this_t operator++(int) { this_t tmp(*this); ++(*this); return tmp; }
   this_t operator--(int) { this_t tmp(*this); --(*this); return tmp; }
 
-  template <typename Diff>
-  this_t operator+(Diff diff) const noexcept {
+  this_t operator+(difference_type diff) const noexcept {
     return {owner_, id_, offset_ + diff * sizeof(T)};
   }
 
-  template <typename Diff>
-  this_t operator-(Diff diff) const noexcept {
+  this_t operator-(difference_type diff) const noexcept {
     PCAS_CHECK(offset_ >= diff * sizeof(T));
     return {owner_, id_, offset_ - diff * sizeof(T)};
   }
 
-  std::ptrdiff_t operator-(const this_t& p) const noexcept {
+  difference_type operator-(const this_t& p) const noexcept {
     PCAS_CHECK(belong_to_same_obj(p));
     PCAS_CHECK(offset_ % sizeof(T) == 0);
     PCAS_CHECK(p.offset_ % sizeof(T) == 0);
