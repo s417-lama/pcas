@@ -50,7 +50,7 @@ public:
            id_    == p.id();
   }
 
-  operator bool() const noexcept { return !is_equal(this_t()); }
+  explicit operator bool() const noexcept { return !is_equal(this_t()); }
   bool operator!() const noexcept { return is_equal(this_t()); }
 
   ref_t operator*() const noexcept {
