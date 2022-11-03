@@ -353,6 +353,8 @@ inline std::optional<span> freelist_get(std::list<span>& fl, uint64_t size) {
 }
 
 inline void freelist_add(std::list<span>& fl, span s) {
+  if (s.size == 0) return;
+
   auto it = fl.begin();
   while (it != fl.end()) {
     if (s.addr + s.size == it->addr) {
@@ -407,10 +409,6 @@ PCAS_TEST_CASE("[pcas::util] freelist for span") {
 
   for (auto& s : got) {
     freelist_add(fl, s);
-  }
-
-  for (auto s : fl) {
-    printf("%ld %ld\n", s.addr, s.size);
   }
 
   PCAS_CHECK(fl.size() == 1);

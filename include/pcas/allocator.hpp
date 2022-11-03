@@ -139,6 +139,9 @@ public:
     // Align with block size
     std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
 
+    /* printf("%d -- Requested: %ld, Allocated: %ld\n", topo_.global_rank(), bytes, real_bytes); */
+    /* fflush(stdout); */
+
     // FIXME: assumption that freelist returns block-aligned address
     auto s = freelist_get(freelist_, real_bytes);
     if (!s.has_value()) {
@@ -157,6 +160,9 @@ public:
     std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
     span s {reinterpret_cast<uint64_t>(p), real_bytes};
 
+    /* printf("%d -- Deallocated: %ld\n", topo_.global_rank(), real_bytes); */
+    /* fflush(stdout); */
+
     MPI_Win_detach(win_, p);
 
     PCAS_CHECK(reinterpret_cast<uint64_t>(p) % P::block_size == 0);
@@ -174,11 +180,67 @@ public:
   }
 };
 
+class block_resource : public pmr::memory_resource {
+  const topology&       topo_;
+  pmr::memory_resource* upstream_mr_;
+  const std::size_t     block_size_;
+
+  std::list<span> freelist_;
+
+public:
+  block_resource(const topology&       topo,
+                 pmr::memory_resource* upstream_mr,
+                 std::size_t           block_size) :
+    topo_(topo),
+    upstream_mr_(upstream_mr),
+    block_size_(block_size) {}
+
+  void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+    if (bytes >= block_size_) {
+      return upstream_mr_->allocate(bytes, alignment);
+    }
+
+    std::size_t real_bytes = bytes + alignment;
+
+    auto s = freelist_get(freelist_, real_bytes);
+    if (!s.has_value()) {
+      void* new_block = upstream_mr_->allocate(block_size_);
+      freelist_add(freelist_, {reinterpret_cast<uint64_t>(new_block), block_size_});
+      s = freelist_get(freelist_, real_bytes);
+      PCAS_CHECK(s.has_value());
+    }
+    PCAS_CHECK(s->size == real_bytes);
+
+    auto addr = (s->addr + alignment - 1) / alignment * alignment;
+
+    PCAS_CHECK(addr >= s->addr);
+    PCAS_CHECK(s->addr + s->size >= addr + bytes);
+
+    freelist_add(freelist_, {s->addr, addr - s->addr});
+    freelist_add(freelist_, {addr + bytes, s->addr + s->size - (addr + bytes)});
+
+    return reinterpret_cast<void*>(addr);
+  }
+
+  void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
+    if (bytes >= block_size_) {
+      upstream_mr_->deallocate(p, bytes, alignment);
+    }
+
+    freelist_add(freelist_, {reinterpret_cast<uint64_t>(p), bytes});
+  }
+
+  bool do_is_equal(const pmr::memory_resource& other) const noexcept override {
+    return this == &other;
+  }
+};
+
 template <typename P>
 class std_pool_resource_impl {
   const topology&                   topo_;
   MPI_Win                           win_;
   mpi_win_resource<P>               win_mr_;
+  block_resource                    block_mr_;
   pmr::unsynchronized_pool_resource mr_;
 
   using logger = typename P::logger;
@@ -223,7 +285,8 @@ public:
     topo_(topo),
     win_(win),
     win_mr_(topo, local_base_addr, local_max_size, win),
-    mr_(my_pool_options(), &win_mr_) {}
+    block_mr_(topo, &win_mr_, (std::size_t)2 * 1024 * 1024),
+    mr_(my_pool_options(), &block_mr_) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
     auto ev = logger::template record<logger_kind::MemAlloc>(bytes);
