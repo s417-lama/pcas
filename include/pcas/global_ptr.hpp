@@ -145,13 +145,13 @@ inline void swap(global_ptr_if<P, T>& p1, global_ptr_if<P, T>& p2) {
 }
 
 template <typename P, typename T, typename MemberT>
-inline typename P::template global_ref<global_ptr_if<P, MemberT>>
+inline typename P::template global_ref<global_ptr_if<P, std::remove_extent_t<MemberT>>>
 operator->*(global_ptr_if<P, T> ptr, MemberT T::* mp) {
   static T t {};
   uint64_t offset_m = reinterpret_cast<uint64_t>(std::addressof(t.*mp))
                     - reinterpret_cast<uint64_t>(std::addressof(t));
   uint64_t offset = ptr.offset() + offset_m;
-  return global_ptr_if<P, MemberT>(ptr.owner(), ptr.id(), offset);
+  return global_ptr_if<P, std::remove_extent_t<MemberT>>(ptr.owner(), ptr.id(), offset);
 }
 
 template <typename>
@@ -254,11 +254,18 @@ PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
     PCAS_CHECK(&(*p1) == p1);
     PCAS_CHECK(&p1[0] == p1);
     PCAS_CHECK(&p1[10] == p1 + 10);
-    struct point { int x; int y; int z; };
-    global_ptr<point> px(0, 0, 0);
-    PCAS_CHECK(&(px->*(&point::x)) == global_ptr<int>(0, 0, offsetof(point, x)));
-    PCAS_CHECK(&(px->*(&point::y)) == global_ptr<int>(0, 0, offsetof(point, y)));
-    PCAS_CHECK(&(px->*(&point::z)) == global_ptr<int>(0, 0, offsetof(point, z)));
+    struct point1 { int x; int y; int z; };
+    global_ptr<point1> px1(0, 0, 0);
+    PCAS_CHECK(&(px1->*(&point1::x)) == global_ptr<int>(0, 0, offsetof(point1, x)));
+    PCAS_CHECK(&(px1->*(&point1::y)) == global_ptr<int>(0, 0, offsetof(point1, y)));
+    PCAS_CHECK(&(px1->*(&point1::z)) == global_ptr<int>(0, 0, offsetof(point1, z)));
+    struct point2 { int v[3]; };
+    global_ptr<point2> px2(0, 0, 0);
+    global_ptr<int> pv = &(px2->*(&point2::v));
+    PCAS_CHECK(pv == global_ptr<int>(0, 0, 0));
+    PCAS_CHECK(&pv[0] == global_ptr<int>(0, 0, 0));
+    PCAS_CHECK(&pv[1] == global_ptr<int>(0, 0, sizeof(int)));
+    PCAS_CHECK(&pv[2] == global_ptr<int>(0, 0, sizeof(int) * 2));
   }
 
   PCAS_SUBCASE("cast") {
