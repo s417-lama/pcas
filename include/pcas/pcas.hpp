@@ -376,9 +376,9 @@ private:
     return (sys_limit - n_cache_blocks - margin) / 2;
   }
 
-  std::string cache_shmem_name(int intra_rank) {
+  std::string cache_shmem_name(int global_rank) {
     std::stringstream ss;
-    ss << "/pcas_cache_" << intra_rank;
+    ss << "/pcas_cache_" << global_rank;
     return ss.str();
   }
 
@@ -730,7 +730,7 @@ inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
     objs_(1), // objs_[0] = dummy
     mmap_cache_(calc_home_mmap_limit(cache_size / block_size), *this),
     cache_(cache_size / block_size, *this),
-    cache_pm_(cache_shmem_name(topo_.intra_rank()), cache_size, true, true),
+    cache_pm_(cache_shmem_name(rank()), cache_size, true, true),
     allocator_(topo_),
     rm_(comm),
     max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, rank()) / block_size) {
@@ -1053,7 +1053,7 @@ pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems)
     uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
     uint64_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
 
-    if (mo.is_locally_accessible(bi.owner)) {
+    if (topo_.is_locally_accessible(bi.owner)) {
       int target_intra_rank = topo_.intra_rank(bi.owner);
       void* from_vm_addr = mo.home_pm(target_intra_rank).anon_vm_addr();
       std::memcpy((uint8_t*)to_ptr - offset_b + block_offset_b,
@@ -1099,7 +1099,7 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uin
     uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
     uint64_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
 
-    if (mo.is_locally_accessible(bi.owner)) {
+    if (topo_.is_locally_accessible(bi.owner)) {
       int target_intra_rank = topo_.intra_rank(bi.owner);
       void* to_vm_addr = mo.home_pm(target_intra_rank).anon_vm_addr();
       std::memcpy((uint8_t*)to_vm_addr + pm_offset,
@@ -1417,7 +1417,7 @@ inline void* pcas_if<P>::checkout_impl(global_ptr<uint8_t> ptr, uint64_t size) {
   std::vector<MPI_Request> reqs;
 
   for_each_block(ptr, size_pf, [&](const auto& bi) {
-    if (mo.is_locally_accessible(bi.owner)) {
+    if (topo_.is_locally_accessible(bi.owner)) {
       bool is_prefetch = bi.offset_b >= offset_e;
       if (!is_prefetch) {
         uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + bi.offset_b;
@@ -1529,7 +1529,7 @@ inline void* pcas_if<P>::checkout_impl_local(global_ptr<uint8_t> ptr, uint64_t s
   PCAS_CHECK(0 <= target_rank);
   PCAS_CHECK(target_rank < nproc());
 
-  if (target_rank == rank()) {
+  if (topo_.is_locally_accessible(target_rank)) {
     return reinterpret_cast<void*>(ptr.offset());
   }
 
@@ -1674,7 +1674,7 @@ inline void pcas_if<P>::checkin_impl(global_ptr<uint8_t> ptr, uint64_t size, acc
   }
 
   for_each_block(ptr, size, [&](const auto& bi) {
-    if (mo.is_locally_accessible(bi.owner)) {
+    if (topo_.is_locally_accessible(bi.owner)) {
       if (DoCheckout) {
         uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + bi.offset_b;
         home_block& hb = mmap_cache_.template ensure_cached<false>(cache_key(vm_addr));
@@ -1714,7 +1714,7 @@ inline void pcas_if<P>::checkin_impl_local(global_ptr<uint8_t> ptr, uint64_t siz
   PCAS_CHECK(0 <= target_rank);
   PCAS_CHECK(target_rank < nproc());
 
-  if (target_rank == rank()) {
+  if (topo_.is_locally_accessible(target_rank)) {
     return;
   }
 

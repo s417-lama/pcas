@@ -28,24 +28,19 @@ class mem_obj_if {
   win_manager                       win_;
   mem_block_num_t                   last_checkout_block_num_ = std::numeric_limits<mem_block_num_t>::max();
 
-  static bool shared_memory_enabled(topology::rank_t global_rank) {
-    static bool enabled_ = get_env("PCAS_ENABLE_SHARED_MEMORY", 1, global_rank);
-    return enabled_;
-  }
-
   static bool num_prefetch_blocks(topology::rank_t global_rank) {
     static bool n_prefetch_ = get_env("PCAS_PREFETCH_BLOCKS", 0, global_rank);
     return n_prefetch_;
   }
 
-  static std::string home_shmem_name(mem_obj_id_t id, int intra_rank) {
+  static std::string home_shmem_name(mem_obj_id_t id, int global_rank) {
     std::stringstream ss;
-    ss << "/pcas_" << id << "_" << intra_rank;
+    ss << "/pcas_" << id << "_" << global_rank;
     return ss.str();
   }
 
   std::vector<physical_mem> init_home_pms() const {
-    physical_mem pm_local(home_shmem_name(id_, topo_.intra_rank()), local_size_, true, true);
+    physical_mem pm_local(home_shmem_name(id_, topo_.global_rank()), local_size_, true, true);
 
     MPI_Barrier(topo_.intra_comm());
 
@@ -54,10 +49,10 @@ class mem_obj_if {
     for (int i = 0; i < topo_.intra_nproc(); i++) {
       if (i == topo_.intra_rank()) {
         home_pms[i] = std::move(pm_local);
-      } else if (shared_memory_enabled(topo_.global_rank())) {
+      } else {
         int target_rank = topo_.intra2global_rank(i);
         int target_local_size = mmapper_->get_local_size(target_rank);
-        physical_mem pm(home_shmem_name(id_, i), target_local_size, false, true);
+        physical_mem pm(home_shmem_name(id_, target_rank), target_local_size, false, true);
         home_pms[i] = std::move(pm);
       }
     }
@@ -93,16 +88,11 @@ public:
   }
 
   const physical_mem& home_pm(topology::rank_t intra_rank) const {
-    PCAS_CHECK((intra_rank == topo_.intra_rank() || shared_memory_enabled(topo_.global_rank())));
+    PCAS_CHECK(intra_rank < topo_.intra_nproc());
     return home_pms_[intra_rank];
   }
 
   MPI_Win win() const { return win_.win(); }
-
-  bool is_locally_accessible(topology::rank_t target_global_rank) const {
-    return target_global_rank == topo_.global_rank() ||
-           (shared_memory_enabled(topo_.global_rank()) && topo_.inter_rank(target_global_rank) == topo_.inter_rank());
-  }
 
   uint64_t size_with_prefetch(uint64_t offset, uint64_t size) {
     uint64_t size_pf = size;

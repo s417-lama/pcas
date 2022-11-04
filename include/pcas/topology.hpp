@@ -11,13 +11,13 @@ public:
   using rank_t = int;
 
 private:
-  template <bool OwnComm>
   struct comm_group {
     rank_t   rank  = -1;
     rank_t   nproc = -1;
     MPI_Comm comm  = MPI_COMM_NULL;
+    bool     own   = false;
 
-    comm_group(MPI_Comm c) : comm(c) {
+    comm_group(MPI_Comm c, bool own) : comm(c), own(own) {
       MPI_Comm_rank(c, &rank);
       MPI_Comm_size(c, &nproc);
       PCAS_CHECK(rank != -1);
@@ -25,15 +25,18 @@ private:
     }
 
     ~comm_group() {
-      if (OwnComm) {
+      if (own) {
         MPI_Comm_free(&comm);
       }
     }
   };
 
-  const comm_group<false> cg_global_;
-  const comm_group<true>  cg_intra_;
-  const comm_group<true>  cg_inter_;
+  const comm_group cg_global_;
+
+  const bool shared_memory_enabled_;
+
+  const comm_group cg_intra_;
+  const comm_group cg_inter_;
 
   struct map_entry {
     rank_t intra_rank;
@@ -43,15 +46,23 @@ private:
   const std::vector<rank_t> intra2global_rank_;
 
   MPI_Comm create_intra_comm() {
-    MPI_Comm h;
-    MPI_Comm_split_type(global_comm(), MPI_COMM_TYPE_SHARED, global_rank(), MPI_INFO_NULL, &h);
-    return h;
+    if (shared_memory_enabled_) {
+      MPI_Comm h;
+      MPI_Comm_split_type(global_comm(), MPI_COMM_TYPE_SHARED, global_rank(), MPI_INFO_NULL, &h);
+      return h;
+    } else {
+      return MPI_COMM_SELF;
+    }
   }
 
   MPI_Comm create_inter_comm() {
-    MPI_Comm h;
-    MPI_Comm_split(global_comm(), intra_rank(), global_rank(), &h);
-    return h;
+    if (shared_memory_enabled_) {
+      MPI_Comm h;
+      MPI_Comm_split(global_comm(), intra_rank(), global_rank(), &h);
+      return h;
+    } else {
+      return global_comm();
+    }
   }
 
   std::vector<map_entry> create_process_map() {
@@ -80,9 +91,10 @@ private:
 
 public:
   topology(MPI_Comm comm) :
-    cg_global_(comm),
-    cg_intra_(create_intra_comm()),
-    cg_inter_(create_inter_comm()),
+    cg_global_(comm, false),
+    shared_memory_enabled_(get_env("PCAS_ENABLE_SHARED_MEMORY", 1, global_rank())),
+    cg_intra_(create_intra_comm(), shared_memory_enabled_),
+    cg_inter_(create_inter_comm(), shared_memory_enabled_),
     process_map_(create_process_map()),
     intra2global_rank_(create_intra2global_rank()) {}
 
@@ -114,6 +126,10 @@ public:
     PCAS_CHECK(0 <= intra_rank);
     PCAS_CHECK(intra_rank < intra_nproc());
     return intra2global_rank_[intra_rank];
+  }
+
+  bool is_locally_accessible(topology::rank_t target_global_rank) const {
+    return inter_rank(target_global_rank) == inter_rank();
   }
 
 };

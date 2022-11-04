@@ -49,17 +49,23 @@ protected:
 
   typename P::template allocator_impl_t<P> allocator_;
 
+  static std::string allocator_shmem_name(int inter_rank) {
+    std::stringstream ss;
+    ss << "/pcas_allocator_" << inter_rank;
+    return ss.str();
+  }
+
   physical_mem init_pm() {
     physical_mem pm;
 
     if (topo_.intra_rank() == 0) {
-      pm = physical_mem("/pcas_allocator", global_max_size_, true, false);
+      pm = physical_mem(allocator_shmem_name(topo_.inter_rank()), global_max_size_, true, false);
     }
 
     MPI_Barrier(topo_.intra_comm());
 
     if (topo_.intra_rank() != 0) {
-      pm = physical_mem("/pcas_allocator", global_max_size_, false, false);
+      pm = physical_mem(allocator_shmem_name(topo_.inter_rank()), global_max_size_, false, false);
     }
 
     PCAS_CHECK(vm_.addr() == reinterpret_cast<void*>(global_base_addr_));
