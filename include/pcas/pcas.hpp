@@ -996,11 +996,13 @@ pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
 
-  if (from_ptr.owner() != -1) {
-    die("unimplemented");
+  T* raw_ptr;
+  if (from_ptr.owner() == -1) {
+    raw_ptr = (T*)checkout_impl<access_mode::read, false>(static_cast<global_ptr<uint8_t>>(from_ptr), size);
+  } else {
+    raw_ptr = (T*)checkout_impl_local<access_mode::read, false>(static_cast<global_ptr<uint8_t>>(from_ptr), size);
   }
 
-  T* raw_ptr = (T*)checkout_impl<access_mode::read, false>(static_cast<global_ptr<uint8_t>>(from_ptr), size);
   std::memcpy(to_ptr, raw_ptr, size);
 }
 
@@ -1012,13 +1014,20 @@ inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t ne
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Put>(size);
 
-  if (to_ptr.owner() != -1) {
-    die("unimplemented");
+  T* raw_ptr;
+  if (to_ptr.owner() == -1) {
+    raw_ptr = (T*)checkout_impl<access_mode::write, false>(static_cast<global_ptr<uint8_t>>(to_ptr), size);
+  } else {
+    raw_ptr = (T*)checkout_impl_local<access_mode::write, false>(static_cast<global_ptr<uint8_t>>(to_ptr), size);
   }
 
-  T* raw_ptr = (T*)checkout_impl<access_mode::write, false>(static_cast<global_ptr<uint8_t>>(to_ptr), size);
   std::memcpy(raw_ptr, from_ptr, size);
-  checkin_impl<false>(static_cast<global_ptr<uint8_t>>(to_ptr), size, access_mode::write);
+
+  if (to_ptr.owner() == -1) {
+    checkin_impl<false>(static_cast<global_ptr<uint8_t>>(to_ptr), size, access_mode::write);
+  } else {
+    checkin_impl_local<false>(static_cast<global_ptr<uint8_t>>(to_ptr), size, access_mode::write);
+  }
 }
 
 template <typename P>
