@@ -139,9 +139,6 @@ public:
     // Align with block size
     std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
 
-    /* printf("%d -- Requested: %ld, Allocated: %ld\n", topo_.global_rank(), bytes, real_bytes); */
-    /* fflush(stdout); */
-
     // FIXME: assumption that freelist returns block-aligned address
     auto s = freelist_get(freelist_, real_bytes);
     if (!s.has_value()) {
@@ -159,9 +156,6 @@ public:
   void do_deallocate(void* p, std::size_t bytes, [[maybe_unused]] std::size_t alignment) override {
     std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
     span s {reinterpret_cast<uint64_t>(p), real_bytes};
-
-    /* printf("%d -- Deallocated: %ld\n", topo_.global_rank(), real_bytes); */
-    /* fflush(stdout); */
 
     MPI_Win_detach(win_, p);
 
@@ -181,17 +175,14 @@ public:
 };
 
 class block_resource : public pmr::memory_resource {
-  const topology&       topo_;
   pmr::memory_resource* upstream_mr_;
   const std::size_t     block_size_;
 
   std::list<span> freelist_;
 
 public:
-  block_resource(const topology&       topo,
-                 pmr::memory_resource* upstream_mr,
+  block_resource(pmr::memory_resource* upstream_mr,
                  std::size_t           block_size) :
-    topo_(topo),
     upstream_mr_(upstream_mr),
     block_size_(block_size) {}
 
@@ -285,7 +276,7 @@ public:
     topo_(topo),
     win_(win),
     win_mr_(topo, local_base_addr, local_max_size, win),
-    block_mr_(topo, &win_mr_, (std::size_t)2 * 1024 * 1024),
+    block_mr_(&win_mr_, (std::size_t)2 * 1024 * 1024),
     mr_(my_pool_options(), &block_mr_) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
