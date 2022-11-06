@@ -937,7 +937,7 @@ pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
 
-  T* raw_ptr = from_ptr.raw_ptr();
+  auto raw_ptr = const_cast<std::remove_const_t<T>*>(from_ptr.raw_ptr());
 
   checkout_impl<access_mode::read, false>(raw_ptr, size);
 
@@ -1256,9 +1256,11 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkout>(size);
 
-  checkout_impl<Mode, true>(ptr.raw_ptr(), size);
+  auto raw_ptr = const_cast<std::remove_const_t<T>*>(ptr.raw_ptr());
 
-  return reinterpret_cast<std::remove_const_t<T>*>(ptr.raw_ptr());
+  checkout_impl<Mode, true>(raw_ptr, size);
+
+  return raw_ptr;
 }
 
 template <typename P>
