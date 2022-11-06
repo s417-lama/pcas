@@ -711,6 +711,8 @@ public:
 
   void poll();
 
+  void collect_deallocated() { allocator_.collect_deallocated(); }
+
   /* unsafe APIs for debugging */
 
   template <typename T>
