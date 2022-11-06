@@ -124,17 +124,17 @@ public:
 
 template <typename P>
 class mpi_win_resource final : public pmr::memory_resource {
-  const topology& topo_;
-  const uint64_t  local_base_addr_;
-  const uint64_t  local_max_size_;
-  const MPI_Win   win_;
+  const topology&   topo_;
+  const std::size_t local_base_addr_;
+  const std::size_t local_max_size_;
+  const MPI_Win     win_;
 
   std::list<span> freelist_;
 
 public:
   mpi_win_resource(const topology& topo,
-                   uint64_t        local_base_addr,
-                   uint64_t        local_max_size,
+                   std::size_t     local_base_addr,
+                   std::size_t     local_max_size,
                    MPI_Win         win) :
     topo_(topo),
     local_base_addr_(local_base_addr),
@@ -166,11 +166,11 @@ public:
 
   void do_deallocate(void* p, std::size_t bytes, [[maybe_unused]] std::size_t alignment) override {
     std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
-    span s {reinterpret_cast<uint64_t>(p), real_bytes};
+    span s {reinterpret_cast<std::size_t>(p), real_bytes};
 
     MPI_Win_detach(win_, p);
 
-    PCAS_CHECK(reinterpret_cast<uint64_t>(p) % P::block_size == 0);
+    PCAS_CHECK(reinterpret_cast<std::size_t>(p) % P::block_size == 0);
 
     if (madvise(p, real_bytes, MADV_REMOVE) == -1) {
       perror("madvise");
@@ -207,7 +207,7 @@ public:
     auto s = freelist_get(freelist_, real_bytes);
     if (!s.has_value()) {
       void* new_block = upstream_mr_->allocate(block_size_);
-      freelist_add(freelist_, {reinterpret_cast<uint64_t>(new_block), block_size_});
+      freelist_add(freelist_, {reinterpret_cast<std::size_t>(new_block), block_size_});
       s = freelist_get(freelist_, real_bytes);
       PCAS_CHECK(s.has_value());
     }
@@ -229,7 +229,7 @@ public:
       upstream_mr_->deallocate(p, bytes, alignment);
     }
 
-    freelist_add(freelist_, {reinterpret_cast<uint64_t>(p), bytes});
+    freelist_add(freelist_, {reinterpret_cast<std::size_t>(p), bytes});
   }
 
   bool do_is_equal(const pmr::memory_resource& other) const noexcept override {
@@ -281,13 +281,13 @@ class std_pool_resource_impl {
 
 public:
   std_pool_resource_impl(const topology& topo,
-                         uint64_t        local_base_addr,
-                         uint64_t        local_max_size,
+                         std::size_t     local_base_addr,
+                         std::size_t     local_max_size,
                          MPI_Win         win) :
     topo_(topo),
     win_(win),
     win_mr_(topo, local_base_addr, local_max_size, win),
-    block_mr_(&win_mr_, (std::size_t)2 * 1024 * 1024),
+    block_mr_(&win_mr_, std::size_t(2) * 1024 * 1024),
     mr_(my_pool_options(), &block_mr_) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
@@ -296,8 +296,8 @@ public:
     std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
     std::size_t real_bytes = bytes + n_pad * alignment;
 
-    uint8_t* p = (uint8_t*)mr_.allocate(real_bytes, alignment);
-    uint8_t* ret = p + n_pad * alignment;
+    std::byte* p = reinterpret_cast<std::byte*>(mr_.allocate(real_bytes, alignment));
+    std::byte* ret = p + n_pad * alignment;
 
     PCAS_CHECK(ret + bytes <= p + real_bytes);
     PCAS_CHECK(p + sizeof(header) <= ret);
@@ -318,17 +318,17 @@ public:
     std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
     std::size_t real_bytes = bytes + n_pad * alignment;
 
-    header* h = (header*)((uint8_t*)p - n_pad * alignment);
+    header* h = reinterpret_cast<header*>(reinterpret_cast<std::byte*>(p) - n_pad * alignment);
     remove_header_from_list(h);
 
-    mr_.deallocate((void*)h, real_bytes, alignment);
+    mr_.deallocate(h, real_bytes, alignment);
   }
 
   void remote_deallocate(void* p, std::size_t bytes [[maybe_unused]], int target_rank, std::size_t alignment) {
     PCAS_CHECK(topo_.global_rank() != target_rank);
 
     std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
-    header* h = (header*)((uint8_t*)p - n_pad * alignment);
+    header* h = reinterpret_cast<header*>(reinterpret_cast<std::byte*>(p) - n_pad * alignment);
     void* flag_addr = &h->freed;
 
     static constexpr int one = 1;
@@ -337,7 +337,7 @@ public:
                      &ret,
                      MPI_INT,
                      target_rank,
-                     (uint64_t)flag_addr,
+                     reinterpret_cast<std::size_t>(flag_addr),
                      MPI_REPLACE,
                      win_);
   }
@@ -367,7 +367,7 @@ public:
 // -----------------------------------------------------------------------------
 
 struct allocator_policy_default {
-  constexpr static uint64_t block_size = 65536;
+  constexpr static std::size_t block_size = 65536;
   using logger = logger::logger_if<logger::policy_default>;
   template <typename P>
   using allocator_impl_t = std_pool_resource_impl<P>;
@@ -387,7 +387,7 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
       for (int i = 0; i < N; i++) {
         ptrs[i] = allocator.allocate(size);
         for (std::size_t j = 0; j < size; j += 128) {
-          ((char*)ptrs[i])[j] = 0;
+          reinterpret_cast<char*>(ptrs[i])[j] = 0;
         }
       }
       for (int i = 0; i < N; i++) {
@@ -405,11 +405,11 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
     void* p = allocator.allocate(size);
 
     for (std::size_t i = 0; i < size; i++) {
-      ((uint8_t*)p)[i] = rank;
+      reinterpret_cast<uint8_t*>(p)[i] = rank;
     }
 
     std::vector<uint64_t> addrs(nproc);
-    addrs[rank] = (uint64_t)p;
+    addrs[rank] = reinterpret_cast<uint64_t>(p);
 
     // GET
     for (int target_rank = 0; target_rank < nproc; target_rank++) {
@@ -418,11 +418,11 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
         std::vector<uint8_t> buf(size);
         MPI_Get(buf.data(),
                 size,
-                MPI_UINT8_T,
+                MPI_BYTE,
                 target_rank,
                 addrs[target_rank],
                 size,
-                MPI_UINT8_T,
+                MPI_BYTE,
                 allocator.win());
         MPI_Win_flush(target_rank, allocator.win());
 
@@ -453,7 +453,7 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
     MPI_Barrier(MPI_COMM_WORLD);
 
     for (std::size_t i = 0; i < size; i++) {
-      PCAS_CHECK(((uint8_t*)p)[i] == (nproc + rank - 1) % nproc);
+      PCAS_CHECK(reinterpret_cast<uint8_t*>(p)[i] == (nproc + rank - 1) % nproc);
     }
 
     PCAS_SUBCASE("Local free") {
@@ -467,7 +467,7 @@ PCAS_TEST_CASE("[pcas::allocator] basic test") {
         MPI_Barrier(MPI_COMM_WORLD);
 
         int target_rank = (rank + 1) % nproc;
-        allocator.remote_deallocate((void*)addrs[target_rank], size, target_rank);
+        allocator.remote_deallocate(reinterpret_cast<void*>(addrs[target_rank]), size, target_rank);
 
         MPI_Win_flush_all(allocator.win());
         MPI_Barrier(MPI_COMM_WORLD);

@@ -14,16 +14,16 @@
 namespace pcas {
 
 using mem_obj_id_t = uint64_t;
-using mem_block_num_t = uint64_t;
+using mem_block_num_t = std::size_t;
 
 template <typename P>
 class mem_obj_if {
   std::unique_ptr<mem_mapper::base> mmapper_;
   mem_obj_id_t                      id_;
-  uint64_t                          size_;
+  std::size_t                       size_;
   const topology&                   topo_;
-  uint64_t                          local_size_;
-  uint64_t                          effective_size_;
+  std::size_t                       local_size_;
+  std::size_t                       effective_size_;
   virtual_mem                       vm_;
   std::vector<physical_mem>         home_pms_; // intra-rank -> pm
   win_manager                       win_;
@@ -64,7 +64,7 @@ class mem_obj_if {
 public:
   mem_obj_if(std::unique_ptr<mem_mapper::base> mmapper,
              mem_obj_id_t id,
-             uint64_t size,
+             std::size_t size,
              const topology& topo) :
     mmapper_(std::move(mmapper)),
     id_(id),
@@ -79,9 +79,9 @@ public:
   const mem_mapper::base& mem_mapper() const { return *mmapper_; }
 
   mem_obj_id_t id() const { return id_; }
-  uint64_t size() const { return size_; }
-  uint64_t local_size() const { return local_size_; }
-  uint64_t effective_size() const { return effective_size_; }
+  std::size_t size() const { return size_; }
+  std::size_t local_size() const { return local_size_; }
+  std::size_t effective_size() const { return effective_size_; }
 
   const virtual_mem& vm() const { return vm_; }
 
@@ -96,9 +96,9 @@ public:
 
   MPI_Win win() const { return win_.win(); }
 
-  uint64_t size_with_prefetch(uint64_t offset, uint64_t size) {
-    uint64_t size_pf = size;
-    uint64_t n_prefetch = num_prefetch_blocks(topo_.global_rank());
+  std::size_t size_with_prefetch(std::size_t offset, std::size_t size) {
+    std::size_t size_pf = size;
+    std::size_t n_prefetch = num_prefetch_blocks(topo_.global_rank());
     if (n_prefetch > 0) {
       mem_block_num_t block_num_b = offset / P::block_size;
       mem_block_num_t block_num_e = (offset + size + P::block_size - 1) / P::block_size;
@@ -115,7 +115,7 @@ public:
 };
 
 struct mem_obj_policy_default {
-  constexpr static uint64_t block_size = 65536;
+  constexpr static std::size_t block_size = 65536;
 };
 
 }

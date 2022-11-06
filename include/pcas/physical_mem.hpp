@@ -17,14 +17,14 @@ namespace pcas {
 class physical_mem {
   std::string shm_name_;
   int         fd_           = -1;
-  uint64_t    size_         = 0;
+  std::size_t size_         = 0;
   void*       anon_vm_addr_ = nullptr;
   bool        own_;
   bool        map_anon_;
 
 public:
   physical_mem() {}
-  physical_mem(std::string shm_name, uint64_t size, bool own, bool map_anon)
+  physical_mem(std::string shm_name, std::size_t size, bool own, bool map_anon)
     : shm_name_(shm_name), size_(size), own_(own), map_anon_(map_anon) {
     int oflag = O_RDWR;
     if (own) oflag |= O_CREAT | O_TRUNC;
@@ -76,7 +76,7 @@ public:
     return *this;
   }
 
-  void* map(void* addr, uint64_t offset, uint64_t size) const {
+  void* map(void* addr, std::size_t offset, std::size_t size) const {
     PCAS_CHECK(offset + size <= size_);
     int flags = MAP_SHARED;
     if (addr != nullptr) flags |= MAP_FIXED;
@@ -88,7 +88,7 @@ public:
     return ret;
   }
 
-  void unmap(void* addr, uint64_t size) const {
+  void unmap(void* addr, std::size_t size) const {
     if (munmap(addr, size) == -1) {
       perror("munmap");
       die("[pcas::physical_mem] munmap(%p, %lu) failed", addr, size);
@@ -103,7 +103,7 @@ public:
 };
 
 PCAS_TEST_CASE("[pcas::physical_mem] map two virtual addresses to the same physical address") {
-  uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
+  std::size_t pagesize = sysconf(_SC_PAGE_SIZE);
 
   std::stringstream ss;
   ss << "/pcas_test_" << getpid();

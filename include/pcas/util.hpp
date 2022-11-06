@@ -97,12 +97,12 @@ inline T get_env(const char* env_var, T default_val, int rank) {
   return val;
 }
 
-inline size_t sys_mmap_entry_limit() {
+inline std::size_t sys_mmap_entry_limit() {
   std::ifstream ifs("/proc/sys/vm/max_map_count");
   if (!ifs) {
     die("Cannot open /proc/sys/vm/max_map_count");
   }
-  size_t sys_limit;
+  std::size_t sys_limit;
   ifs >> sys_limit;
   return sys_limit;
 }
@@ -132,7 +132,7 @@ PCAS_TEST_CASE("[pcas::util] next_pow2") {
   PCAS_CHECK(next_pow2(4) == 4);
   PCAS_CHECK(next_pow2(5) == 8);
   PCAS_CHECK(next_pow2(15) == 16);
-  PCAS_CHECK(next_pow2(((uint64_t)1 << 38) - 100) == (uint64_t)1 << 38);
+  PCAS_CHECK(next_pow2((uint64_t(1) << 38) - 100) == uint64_t(1) << 38);
 }
 
 class win_manager {
@@ -142,11 +142,11 @@ public:
     MPI_Win_create_dynamic(MPI_INFO_NULL, comm, &win_);
     MPI_Win_lock_all(0, win_);
   }
-  win_manager(MPI_Comm comm, uint64_t size, void** vm_addr) {
+  win_manager(MPI_Comm comm, std::size_t size, void** vm_addr) {
     MPI_Win_allocate(size, 1, MPI_INFO_NULL, comm, vm_addr, &win_);
     MPI_Win_lock_all(0, win_);
   }
-  win_manager(MPI_Comm comm, void* vm_addr, uint64_t size) {
+  win_manager(MPI_Comm comm, void* vm_addr, std::size_t size) {
     MPI_Win_create(vm_addr,
                    size,
                    1,
@@ -330,11 +330,11 @@ PCAS_TEST_CASE("[pcas::util] sections inverse") {
 // -----------------------------------------------------------------------------
 
 struct span {
-  uint64_t addr;
-  uint64_t size;
+  std::size_t addr;
+  std::size_t size;
 };
 
-inline std::optional<span> freelist_get(std::list<span>& fl, uint64_t size) {
+inline std::optional<span> freelist_get(std::list<span>& fl, std::size_t size) {
   auto it = fl.begin();
   while (it != fl.end()) {
     if (it->size == size) {
@@ -384,8 +384,8 @@ PCAS_TEST_CASE("[pcas::util] freelist for span") {
   std::list<span> fl(1, s0);
   std::vector<span> got;
 
-  uint64_t n = 100;
-  for (uint64_t i = 0; i < s0.size / n; i++) {
+  std::size_t n = 100;
+  for (std::size_t i = 0; i < s0.size / n; i++) {
     auto s = freelist_get(fl, n);
     PCAS_CHECK(s.has_value());
     got.push_back(*s);
@@ -393,8 +393,8 @@ PCAS_TEST_CASE("[pcas::util] freelist for span") {
   PCAS_CHECK(!freelist_get(fl, n).has_value());
 
   // check for no overlap
-  for (uint64_t i = 0; i < got.size(); i++) {
-    for (uint64_t j = 0; j < got.size(); j++) {
+  for (std::size_t i = 0; i < got.size(); i++) {
+    for (std::size_t j = 0; j < got.size(); j++) {
       if (i != j) {
         PCAS_CHECK((got[i].addr + got[i].size <= got[j].addr ||
                     got[j].addr + got[j].size <= got[i].addr));
@@ -407,7 +407,7 @@ PCAS_TEST_CASE("[pcas::util] freelist for span") {
   std::mt19937 engine(seed_gen());
   std::shuffle(got.begin(), got.end(), engine);
 
-  for (auto& s : got) {
+  for (auto&& s : got) {
     freelist_add(fl, s);
   }
 

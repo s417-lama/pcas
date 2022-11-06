@@ -14,11 +14,11 @@ namespace pcas {
 
 class virtual_mem {
   void* addr_ = nullptr;
-  uint64_t size_;
+  std::size_t size_;
 
 public:
   virtual_mem() {}
-  virtual_mem(void* addr, uint64_t size, uint64_t alignment = alignof(max_align_t)) :
+  virtual_mem(void* addr, std::size_t size, std::size_t alignment = alignof(max_align_t)) :
     addr_(mmap_no_physical_mem(addr, size, alignment)), size_(size) {}
 
   ~virtual_mem() {
@@ -40,25 +40,25 @@ public:
   }
 
   void* addr() const { return addr_; }
-  uint64_t size() const { return size_; }
+  std::size_t size() const { return size_; }
 
-  void* map_physical_mem(uint64_t vm_offset, uint64_t pm_offset, uint64_t size, physical_mem& pm) const {
+  void* map_physical_mem(std::size_t vm_offset, std::size_t pm_offset, std::size_t size, physical_mem& pm) const {
     PCAS_CHECK(vm_offset + size <= size_);
-    void* ret = pm.map((uint8_t*)addr_ + vm_offset, pm_offset, size);
-    PCAS_CHECK(ret == (uint8_t*)addr_ + vm_offset);
+    void* ret = pm.map(reinterpret_cast<std::byte*>(addr_) + vm_offset, pm_offset, size);
+    PCAS_CHECK(ret == reinterpret_cast<std::byte*>(addr_) + vm_offset);
     return ret;
   }
 
-  void unmap_physical_mem(uint64_t vm_offset, uint64_t size) const {
-    void* ret = mmap_no_physical_mem((uint8_t*)addr_ + vm_offset, size);
-    PCAS_CHECK(ret == (uint8_t*)addr_ + vm_offset);
+  void unmap_physical_mem(std::size_t vm_offset, std::size_t size) const {
+    void* ret = mmap_no_physical_mem(reinterpret_cast<std::byte*>(addr_) + vm_offset, size);
+    PCAS_CHECK(ret == reinterpret_cast<std::byte*>(addr_) + vm_offset);
   }
 
   // TODO: reconsider this abstraction...
-  static void* mmap_no_physical_mem(void* addr, uint64_t size, uint64_t alignment = alignof(max_align_t)) {
+  static void* mmap_no_physical_mem(void* addr, std::size_t size, std::size_t alignment = alignof(max_align_t)) {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 
-    uint64_t reqsize;
+    std::size_t reqsize;
     if (addr == nullptr) {
       reqsize = size + alignment;
     } else {
@@ -76,7 +76,7 @@ public:
     if (addr == nullptr) {
       uintptr_t allocated_addr = reinterpret_cast<uintptr_t>(allocated_p);
       uintptr_t ret_addr = (allocated_addr + alignment - 1) / alignment * alignment;
-      uint8_t* ret_p = reinterpret_cast<uint8_t*>(ret_addr);
+      std::byte* ret_p = reinterpret_cast<std::byte*>(ret_addr);
 
       PCAS_CHECK(ret_addr >= allocated_addr);
       unmap(allocated_p, ret_addr - allocated_addr);
@@ -91,7 +91,7 @@ public:
     }
   }
 
-  static void unmap(void* addr, uint64_t size) {
+  static void unmap(void* addr, std::size_t size) {
     if (size > 0 && munmap(addr, size) == -1) {
       perror("munmap");
       die("[pcas::virtual_mem] munmap(%p, %lu) failed", addr, size);
@@ -101,7 +101,7 @@ public:
 };
 
 PCAS_TEST_CASE("[pcas::virtual_mem] allocate virtual memory") {
-  uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
+  std::size_t pagesize = sysconf(_SC_PAGE_SIZE);
 
   void* addr = nullptr;
   {
@@ -116,7 +116,7 @@ PCAS_TEST_CASE("[pcas::virtual_mem] allocate virtual memory") {
 }
 
 PCAS_TEST_CASE("[pcas::virtual_mem] map physical memory to virtual memory") {
-  uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
+  std::size_t pagesize = sysconf(_SC_PAGE_SIZE);
 
   std::stringstream ss;
   ss << "/pcas_test_" << getpid();
@@ -137,12 +137,12 @@ virtual_mem reserve_same_vm_coll(MPI_Comm comm, std::size_t size, std::size_t al
   int rank;
   MPI_Comm_rank(comm, &rank);
 
-  uint64_t vm_addr;
+  std::size_t vm_addr;
   virtual_mem vm;
 
   if (rank == 0) {
     vm = virtual_mem(nullptr, size, alignment);
-    vm_addr = reinterpret_cast<uint64_t>(vm.addr());
+    vm_addr = reinterpret_cast<std::size_t>(vm.addr());
   }
 
   MPI_Bcast(&vm_addr, 1, MPI_UINT64_T, 0, comm);

@@ -44,9 +44,9 @@ struct policy_default {
   using logger_impl_t = logger::impl_dummy<P>;
   template <typename P>
   using allocator_impl_t = std_pool_resource_impl<P>;
-  template <uint64_t BlockSize>
+  template <std::size_t BlockSize>
   using default_mem_mapper = mem_mapper::cyclic<BlockSize>;
-  constexpr static uint64_t block_size = 65536;
+  constexpr static std::size_t block_size = 65536;
   constexpr static bool enable_write_through = false;
 };
 
@@ -79,7 +79,7 @@ class pcas_if {
   using logger_ = typename logger::template logger_if<logger_policy>;
 
   struct allocator_policy {
-    constexpr static uint64_t block_size = P::block_size;
+    constexpr static std::size_t block_size = P::block_size;
     using logger = logger_;
     template <typename P_>
     using allocator_impl_t = typename P::template allocator_impl_t<P_>;
@@ -87,7 +87,7 @@ class pcas_if {
   using allocator = allocator_if<allocator_policy>;
 
   struct mem_obj_policy {
-    constexpr static uint64_t block_size = P::block_size;
+    constexpr static std::size_t block_size = P::block_size;
   };
   using mem_obj = mem_obj_if<mem_obj_policy>;
 
@@ -338,14 +338,14 @@ private:
   // Initializaiton
   // -----------------------------------------------------------------------------
 
-  bool validate_input(uint64_t cache_size, MPI_Comm comm) const {
+  bool validate_input(std::size_t cache_size, MPI_Comm comm) const {
     int mpi_initialized = 0;
     MPI_Initialized(&mpi_initialized);
     if (!mpi_initialized) {
       die("Please call MPI_Init() before initializing PCAS.");
     }
 
-    uint64_t pagesize = sysconf(_SC_PAGE_SIZE);
+    std::size_t pagesize = sysconf(_SC_PAGE_SIZE);
     if (block_size == 0 || block_size % pagesize != 0) {
       die("The block size (%ld) must be a multiple of the system page size (%ld).", block_size, pagesize);
     }
@@ -361,9 +361,9 @@ private:
     return true;
   }
 
-  uint64_t calc_home_mmap_limit(uint64_t n_cache_blocks) const {
-    uint64_t sys_limit = sys_mmap_entry_limit();
-    uint64_t margin = 1000;
+  std::size_t calc_home_mmap_limit(std::size_t n_cache_blocks) const {
+    std::size_t sys_limit = sys_mmap_entry_limit();
+    std::size_t margin = 1000;
     PCAS_CHECK(sys_limit > n_cache_blocks + margin);
     return (sys_limit - n_cache_blocks - margin) / 2;
   }
@@ -660,46 +660,46 @@ private:
   void checkin_impl_local(void* ptr, std::size_t size);
 
 public:
-  constexpr static uint64_t block_size = P::block_size;
+  constexpr static std::size_t block_size = P::block_size;
 
-  pcas_if(uint64_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
+  pcas_if(std::size_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
 
   topology::rank_t rank() const { return topo_.global_rank(); }
   topology::rank_t nproc() const { return topo_.global_nproc(); }
 
   template <typename T>
-  global_ptr<T> malloc(uint64_t nelems);
+  global_ptr<T> malloc(std::size_t nelems);
 
-  template <typename T, template <uint64_t> typename MemMapper, typename... MemMapperArgs>
-  global_ptr<T> malloc(uint64_t nelems, MemMapperArgs... mmargs);
-
-  template <typename T>
-  global_ptr<T> malloc_local(uint64_t nelems);
+  template <typename T, template <std::size_t> typename MemMapper, typename... MemMapperArgs>
+  global_ptr<T> malloc(std::size_t nelems, MemMapperArgs... mmargs);
 
   template <typename T>
-  void free(global_ptr<T> ptr, uint64_t nelems = 0);
+  global_ptr<T> malloc_local(std::size_t nelems);
+
+  template <typename T>
+  void free(global_ptr<T> ptr, std::size_t nelems = 0);
 
   template <typename ConstT, typename T>
-  void get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems);
+  void get(global_ptr<ConstT> from_ptr, T* to_ptr, std::size_t nelems);
 
   template <typename T>
-  void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
+  void put(const T* from_ptr, global_ptr<T> to_ptr, std::size_t nelems);
 
   template <typename ConstT, typename T>
-  void get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems);
+  void get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std::size_t nelems);
 
   template <typename T>
-  void put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
+  void put_nocache(const T* from_ptr, global_ptr<T> to_ptr, std::size_t nelems);
 
   template <typename T>
-  void willread(global_ptr<T> ptr, uint64_t nelems);
+  void willread(global_ptr<T> ptr, std::size_t nelems);
 
   template <access_mode Mode, typename T>
   std::conditional_t<Mode == access_mode::read, const T*, T*>
-  checkout(global_ptr<T> ptr, uint64_t nelems);
+  checkout(global_ptr<T> ptr, std::size_t nelems);
 
   template <access_mode Mode, typename T>
-  void checkin(T* raw_ptr, uint64_t nelems);
+  void checkin(T* raw_ptr, std::size_t nelems);
 
   void release();
 
@@ -724,7 +724,7 @@ public:
 };
 
 template <typename P>
-inline pcas_if<P>::pcas_if(uint64_t cache_size, MPI_Comm comm)
+inline pcas_if<P>::pcas_if(std::size_t cache_size, MPI_Comm comm)
   : validate_dummy_(validate_input(cache_size, comm)),
     topo_(comm),
     mmap_cache_(calc_home_mmap_limit(cache_size / block_size), *this),
@@ -750,14 +750,14 @@ PCAS_TEST_CASE("[pcas::pcas] initialize and finalize PCAS") {
 template <typename P>
 template <typename T>
 inline typename pcas_if<P>::template global_ptr<T>
-pcas_if<P>::malloc(uint64_t nelems) {
+pcas_if<P>::malloc(std::size_t nelems) {
   return malloc<T, P::template default_mem_mapper>(nelems);
 }
 
 template <typename P>
-template <typename T, template <uint64_t> typename MemMapper, typename... MemMapperArgs>
+template <typename T, template <std::size_t> typename MemMapper, typename... MemMapperArgs>
 inline typename pcas_if<P>::template global_ptr<T>
-pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs) {
+pcas_if<P>::malloc(std::size_t nelems, MemMapperArgs... mmargs) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
@@ -778,7 +778,7 @@ pcas_if<P>::malloc(uint64_t nelems, MemMapperArgs... mmargs) {
 template <typename P>
 template <typename T>
 inline typename pcas_if<P>::template global_ptr<T>
-pcas_if<P>::malloc_local(uint64_t nelems) {
+pcas_if<P>::malloc_local(std::size_t nelems) {
   if (nelems == 0) {
     die("nelems cannot be 0");
   }
@@ -791,7 +791,7 @@ pcas_if<P>::malloc_local(uint64_t nelems) {
 
 template <typename P>
 template <typename T>
-inline void pcas_if<P>::free(global_ptr<T> ptr, uint64_t nelems) {
+inline void pcas_if<P>::free(global_ptr<T> ptr, std::size_t nelems) {
   if (!ptr) {
     die("null pointer was passed to pcas::free()");
   }
@@ -906,17 +906,17 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free (local)") {
   constexpr int n = 10;
   PCAS_SUBCASE("free immediately") {
     for (int i = 0; i < n; i++) {
-      auto p = pc.malloc_local<int>((uint64_t)1 << i);
-      pc.free(p, (uint64_t)1 << i);
+      auto p = pc.malloc_local<int>(std::size_t(1) << i);
+      pc.free(p, std::size_t(1) << i);
     }
   }
   PCAS_SUBCASE("free after accumulation") {
     pcas::global_ptr<int> ptrs[n];
     for (int i = 0; i < n; i++) {
-      ptrs[i] = pc.malloc_local<int>((uint64_t)1 << i);
+      ptrs[i] = pc.malloc_local<int>(std::size_t(1) << i);
     }
     for (int i = 0; i < n; i++) {
-      pc.free(ptrs[i], (uint64_t)1 << i);
+      pc.free(ptrs[i], std::size_t(1) << i);
     }
   }
   PCAS_SUBCASE("remote free") {
@@ -927,7 +927,7 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free (local)") {
     pcas::global_ptr<int> ptrs_send[n];
     pcas::global_ptr<int> ptrs_recv[n];
     for (int i = 0; i < n; i++) {
-      ptrs_send[i] = pc.malloc_local<int>((uint64_t)1 << i);
+      ptrs_send[i] = pc.malloc_local<int>(std::size_t(1) << i);
     }
 
     MPI_Request req_send, req_recv;
@@ -937,14 +937,14 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free (local)") {
     MPI_Wait(&req_recv, MPI_STATUS_IGNORE);
 
     for (int i = 0; i < n; i++) {
-      pc.free(ptrs_recv[i], (uint64_t)1 << i);
+      pc.free(ptrs_recv[i], std::size_t(1) << i);
     }
   }
 }
 
 template <typename P>
 template <typename ConstT, typename T>
-inline void pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, std::size_t nelems) {
   static_assert(std::is_same_v<std::remove_const_t<ConstT>, T>,
                 "from_ptr must be of the same type as to_ptr ignoring const");
 
@@ -960,10 +960,10 @@ inline void pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nel
 
 template <typename P>
 template <typename T>
-inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, std::size_t nelems) {
   static_assert(!std::is_const_v<T>, "to_ptr should not be const");
 
-  uint64_t size = nelems * sizeof(T);
+  std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Put>(size);
 
   T* raw_ptr = to_ptr.raw_ptr();
@@ -1048,7 +1048,7 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
 
 template <typename P>
 template <typename ConstT, typename T>
-inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std::size_t nelems) {
   static_assert(std::is_same_v<std::remove_const_t<ConstT>, T>,
                 "from_ptr must be of the same type as to_ptr ignoring const");
   static_assert(std::is_trivially_copyable_v<T>, "get_nocache requires trivially copyable types");
@@ -1120,7 +1120,7 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint
 
 template <typename P>
 template <typename T>
-inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, std::size_t nelems) {
   static_assert(!std::is_const_v<T>, "to_ptr should not be const");
   static_assert(std::is_trivially_copyable_v<T>, "put_nocache requires trivially copyable types");
 
@@ -1255,8 +1255,8 @@ PCAS_TEST_CASE("[pcas::pcas] get and put (nocache)") {
 
 template <typename P>
 template <typename T>
-inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
-  uint64_t size = nelems * sizeof(T);
+inline void pcas_if<P>::willread(global_ptr<T> ptr, std::size_t nelems) {
+  std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Willread>(size);
 
   void* raw_ptr = ptr.raw_ptr();
@@ -1270,10 +1270,10 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
   try {
     for_each_mem_block(mo, raw_ptr, size, [&](const auto& bi) {
       if (!mo.is_locally_accessible(bi.owner)) {
-        uint64_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
-        uint64_t block_offset_e = std::min(bi.offset_e, offset_e);
-        for (uint64_t o = block_offset_b; o < block_offset_e; o += block_size) {
-          uint8_t* vm_addr = reinterpret_cast<uint8_t*>(mo.vm().addr()) + o;
+        const std::size_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+        const std::size_t block_offset_e = std::min(bi.offset_e, offset_e);
+        for (std::size_t o = block_offset_b; o < block_offset_e; o += block_size) {
+          std::byte* vm_addr = reinterpret_cast<std::byte*>(mo.vm().addr()) + o;
           cache_block& cb = cache_.ensure_cached(cache_key(vm_addr));
 
           if (!cb.mapped) {
@@ -1302,7 +1302,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, uint64_t nelems) {
 template <typename P>
 template <access_mode Mode, typename T>
 inline std::conditional_t<Mode == access_mode::read, const T*, T*>
-pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
+pcas_if<P>::checkout(global_ptr<T> ptr, std::size_t nelems) {
   static_assert(!std::is_const_v<T> || Mode == access_mode::read,
                 "Const pointers cannot be checked out with write access mode");
 
@@ -1604,7 +1604,7 @@ inline void pcas_if<P>::checkout_impl_local(void* ptr, std::size_t size) {
 
 template <typename P>
 template <access_mode Mode, typename T>
-inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
+inline void pcas_if<P>::checkin(T* raw_ptr, std::size_t nelems) {
   static_assert((std::is_const_v<T> && Mode == access_mode::read) ||
                 (!std::is_const_v<T> && Mode != access_mode::read),
                 "Only const pointers should be checked in with read access mode");
@@ -1663,8 +1663,8 @@ inline bool pcas_if<P>::checkin_impl_tlb(void* ptr, std::size_t size) {
       if constexpr (Mode != access_mode::read) {
         bool is_new_dirty_block = cb.dirty_sections.empty();
 
-        uint64_t offset_in_block_b = raw_ptr - cb.vm_addr;
-        uint64_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
+        std::size_t offset_in_block_b = raw_ptr - cb.vm_addr;
+        std::size_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
         sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
 
         if (is_new_dirty_block) {
@@ -1777,7 +1777,7 @@ PCAS_TEST_CASE("[pcas::pcas] checkout and checkin (small, aligned)") {
 
   for (auto p : ps) {
     uint8_t* home_ptr = (uint8_t*)pc.get_physical_mem(p);
-    for (uint64_t i = 0; i < pcas::block_size; i++) {
+    for (std::size_t i = 0; i < pcas::block_size; i++) {
       home_ptr[i] = rank;
     }
 
