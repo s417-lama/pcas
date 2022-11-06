@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <mpi.h>
 
 #include "pcas/util.hpp"
 #include "pcas/physical_mem.hpp"
@@ -130,6 +131,28 @@ PCAS_TEST_CASE("[pcas::virtual_mem] map physical memory to virtual memory") {
   PCAS_CHECK(mapped_addr[0] == 17);
   mapped_addr[1] = 32;
   PCAS_CHECK(pm_vals[5 * pagesize + 1] == 32);
+}
+
+virtual_mem reserve_same_vm_coll(MPI_Comm comm, std::size_t size, std::size_t alignment = alignof(max_align_t)) {
+  int rank;
+  MPI_Comm_rank(comm, &rank);
+
+  uint64_t vm_addr;
+  virtual_mem vm;
+
+  if (rank == 0) {
+    vm = virtual_mem(nullptr, size, alignment);
+    vm_addr = reinterpret_cast<uint64_t>(vm.addr());
+  }
+
+  MPI_Bcast(&vm_addr, 1, MPI_UINT64_T, 0, comm);
+
+  // FIXME: the virtual address allocated on rank 0 might not be available on different processes
+  if (rank != 0) {
+    vm = virtual_mem(reinterpret_cast<void*>(vm_addr), size, alignment);
+  }
+
+  return vm;
 }
 
 }
