@@ -458,6 +458,11 @@ private:
   // Cached data management
   // -----------------------------------------------------------------------------
 
+  bool needs_fetch(const cache_block& cb) {
+    return cb.partial_sections.empty() ||
+           *cb.partial_sections.begin() != section{0, block_size};
+  }
+
   void fetch_begin(cache_block& cb) {
     PCAS_CHECK(cb.owner < topo_.global_nproc());
 
@@ -633,6 +638,9 @@ private:
   void checkout_impl(void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
+  bool checkout_impl_tlb(void* ptr, std::size_t size);
+
+  template <access_mode Mode, bool DoCheckout>
   void checkout_impl_coll(void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
@@ -640,6 +648,9 @@ private:
 
   template <access_mode Mode, bool DoCheckout>
   void checkin_impl(void* ptr, std::size_t size);
+
+  template <access_mode Mode, bool DoCheckout>
+  bool checkin_impl_tlb(void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
   void checkin_impl_coll(void* ptr, std::size_t size);
@@ -1266,11 +1277,85 @@ pcas_if<P>::checkout(global_ptr<T> ptr, uint64_t nelems) {
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
 inline void pcas_if<P>::checkout_impl(void* ptr, std::size_t size) {
+  if (checkout_impl_tlb<Mode, DoCheckout>(ptr, size)) {
+    return;
+  }
+
   if (allocator::belongs_to(ptr)) {
     checkout_impl_local<Mode, DoCheckout>(ptr, size);
   } else {
     checkout_impl_coll<Mode, DoCheckout>(ptr, size);
   }
+}
+
+template <typename P>
+template <access_mode Mode, bool DoCheckout>
+inline bool pcas_if<P>::checkout_impl_tlb(void* ptr, std::size_t size) {
+  std::byte* raw_ptr = reinterpret_cast<std::byte*>(ptr);
+
+  // fast path for small requests using TLB
+  std::optional<home_block*> hbe = home_tlb_.find([&](const home_block* hb) {
+    return hb->vm_addr <= raw_ptr && raw_ptr + size <= hb->vm_addr + hb->size;
+  });
+  if (hbe.has_value()) {
+    home_block& hb = **hbe;
+    PCAS_ASSERT(hb.mapped);
+
+    if constexpr (DoCheckout) {
+      hb.checkout_count++;
+    }
+
+    return true;
+  }
+
+  bool is_within_block = reinterpret_cast<uintptr_t>(raw_ptr) / block_size ==
+                         reinterpret_cast<uintptr_t>(raw_ptr + size - 1) / block_size;
+  if (is_within_block) { // TLB works only for requests within each cache block
+    std::optional<cache_block*> cbe = cache_tlb_.find([&](const cache_block* cb) {
+      return cb->vm_addr <= raw_ptr && raw_ptr + size <= cb->vm_addr + block_size;
+    });
+    if (cbe.has_value()) {
+      cache_block& cb = **cbe;
+      PCAS_ASSERT(cb.cstate == cache_state::valid);
+      PCAS_ASSERT(cb.mapped);
+
+      if constexpr (Mode != access_mode::read) {
+        if (cb.flushing) {
+          auto ev2 = logger::template record<logger_kind::FlushConflicted>();
+          complete_flush();
+        }
+      }
+
+      if constexpr (Mode == access_mode::write) {
+        std::size_t offset_in_block_b = raw_ptr - cb.vm_addr;
+        std::size_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
+        sections_insert(cb.partial_sections, {offset_in_block_b, offset_in_block_e});
+      }
+
+      if constexpr (Mode != access_mode::write) {
+        if (needs_fetch(cb)) {
+          // fetch the rest of the block
+          fetch_begin(cb);
+
+          // Immediately wait for communication completion here because it is a fast path;
+          // i.e., there is only one cache block to be checked out.
+          PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
+          MPI_Wait(&cb.req, MPI_STATUS_IGNORE);
+          PCAS_CHECK(cb.req == MPI_REQUEST_NULL);
+
+          cb.cstate = cache_state::valid;
+        }
+      }
+
+      if constexpr (DoCheckout) {
+        cb.checkout_count++;
+      }
+
+      return true;
+    }
+  }
+
+  return false;
 }
 
 template <typename P>
@@ -1283,68 +1368,6 @@ inline void pcas_if<P>::checkout_impl_coll(void* ptr, std::size_t size) {
   const std::size_t offset_e = offset_b + size;
 
   PCAS_CHECK(offset_e <= mo.size());
-
-  std::byte* raw_ptr = reinterpret_cast<std::byte*>(ptr);
-
-  // fast path for small requests using TLB
-  {
-    std::optional<home_block*> hbe = home_tlb_.find([&](const home_block* hb) {
-      return hb->vm_addr <= raw_ptr && raw_ptr + size <= hb->vm_addr + hb->size;
-    });
-    if (hbe.has_value()) {
-      home_block& hb = **hbe;
-      PCAS_ASSERT(hb.mapped);
-      if constexpr (DoCheckout) {
-        hb.checkout_count++;
-      }
-      return;
-    }
-
-    bool is_within_block = offset_b / block_size == (offset_e - 1) / block_size;
-    if (is_within_block) { // TLB works only for requests within each cache block
-      std::optional<cache_block*> cbe = cache_tlb_.find([&](const cache_block* cb) {
-        return cb->vm_addr <= raw_ptr && raw_ptr + size <= cb->vm_addr + block_size;
-      });
-      if (cbe.has_value()) {
-        cache_block& cb = **cbe;
-        PCAS_ASSERT(cb.cstate == cache_state::valid);
-        PCAS_ASSERT(cb.mapped);
-
-        if constexpr (Mode != access_mode::read) {
-          if (cb.flushing) {
-            auto ev2 = logger::template record<logger_kind::FlushConflicted>();
-            complete_flush();
-          }
-        }
-
-        if constexpr (Mode == access_mode::write) {
-          std::size_t offset_in_block_b = raw_ptr - cb.vm_addr;
-          std::size_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
-          sections_insert(cb.partial_sections, {offset_in_block_b, offset_in_block_e});
-        }
-
-        if constexpr (Mode != access_mode::write) {
-          if (*cb.partial_sections.begin() != section{0, block_size}) {
-            // fetch the rest of the block
-            fetch_begin(cb);
-
-            // Immediately wait for communication completion here because it is a fast path;
-            // i.e., there is only one cache block to be checked out.
-            PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
-            MPI_Wait(&cb.req, MPI_STATUS_IGNORE);
-            PCAS_CHECK(cb.req == MPI_REQUEST_NULL);
-
-            cb.cstate = cache_state::valid;
-          }
-        }
-
-        if constexpr (DoCheckout) {
-          cb.checkout_count++;
-        }
-        return;
-      }
-    }
-  }
 
   std::size_t size_pf = size;
   if constexpr (Mode != access_mode::write) {
@@ -1424,7 +1447,9 @@ inline void pcas_if<P>::checkout_impl_coll(void* ptr, std::size_t size) {
         // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
         // has been already fetched or not.
         if constexpr (Mode != access_mode::write) {
-          fetch_begin(cb);
+        if (needs_fetch(cb)) {
+            fetch_begin(cb);
+          }
         }
 
         bool is_prefetch = o >= offset_e;
@@ -1506,7 +1531,9 @@ inline void pcas_if<P>::checkout_impl_local(void* ptr, std::size_t size) {
     }
 
     if constexpr (Mode != access_mode::write) {
-      fetch_begin(cb);
+      if (needs_fetch(cb)) {
+        fetch_begin(cb);
+      }
     }
 
     if constexpr (DoCheckout) {
@@ -1520,6 +1547,8 @@ inline void pcas_if<P>::checkout_impl_local(void* ptr, std::size_t size) {
     }
 
     cb.cstate = cache_state::valid;
+
+    cache_tlb_.add(&cb);
   }
 
   transaction_id_++;
@@ -1547,11 +1576,69 @@ inline void pcas_if<P>::checkin(T* raw_ptr, uint64_t nelems) {
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
 inline void pcas_if<P>::checkin_impl(void* ptr, std::size_t size) {
+  if (checkin_impl_tlb<Mode, DoCheckout>(ptr, size)) {
+    return;
+  }
+
   if (allocator::belongs_to(ptr)) {
     checkin_impl_local<Mode, DoCheckout>(ptr, size);
   } else {
     checkin_impl_coll<Mode, DoCheckout>(ptr, size);
   }
+}
+
+template <typename P>
+template <access_mode Mode, bool DoCheckout>
+inline bool pcas_if<P>::checkin_impl_tlb(void* ptr, std::size_t size) {
+  std::byte* raw_ptr = reinterpret_cast<std::byte*>(ptr);
+
+  // fast path for small requests using TLB
+  std::optional<home_block*> hbe = home_tlb_.find([&](const home_block* hb) {
+    return hb->vm_addr <= raw_ptr && raw_ptr + size <= hb->vm_addr + hb->size;
+  });
+  if (hbe.has_value()) {
+    home_block& hb = **hbe;
+    PCAS_ASSERT(hb.mapped);
+
+    if constexpr (DoCheckout) {
+      hb.checkout_count--;
+    }
+
+    return true;
+  }
+
+  bool is_within_block = reinterpret_cast<uintptr_t>(raw_ptr) / block_size ==
+                         reinterpret_cast<uintptr_t>(raw_ptr + size - 1) / block_size;
+  if (is_within_block) {
+    std::optional<cache_block*> cbe = cache_tlb_.find([&](const cache_block* cb) {
+      return cb->vm_addr <= raw_ptr && raw_ptr + size <= cb->vm_addr + block_size;
+    });
+    if (cbe.has_value()) {
+      cache_block& cb = **cbe;
+      PCAS_ASSERT(cb.cstate == cache_state::valid);
+      PCAS_ASSERT(cb.mapped);
+
+      if constexpr (Mode != access_mode::read) {
+        bool is_new_dirty_block = cb.dirty_sections.empty();
+
+        uint64_t offset_in_block_b = raw_ptr - cb.vm_addr;
+        uint64_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
+        sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+
+        if (is_new_dirty_block) {
+          add_dirty_cache_block(cb);
+        }
+      }
+
+      if constexpr (DoCheckout) {
+        cb.checkout_count--;
+      }
+
+      return true;
+    }
+  }
+
+  return false;
 }
 
 template <typename P>
@@ -1562,52 +1649,6 @@ inline void pcas_if<P>::checkin_impl_coll(void* ptr, std::size_t size) {
   const std::size_t offset_b = reinterpret_cast<std::size_t>(ptr) -
                                reinterpret_cast<std::size_t>(mo.vm().addr());
   const std::size_t offset_e = offset_b + size;
-
-  std::byte* raw_ptr = reinterpret_cast<std::byte*>(ptr);
-
-  // fast path for small requests using TLB
-  {
-    std::optional<home_block*> hbe = home_tlb_.find([&](const home_block* hb) {
-      return hb->vm_addr <= raw_ptr && raw_ptr + size <= hb->vm_addr + hb->size;
-    });
-    if (hbe.has_value()) {
-      home_block& hb = **hbe;
-      PCAS_ASSERT(hb.mapped);
-      if constexpr (DoCheckout) {
-        hb.checkout_count--;
-      }
-      return;
-    }
-
-    bool is_within_block = offset_b / block_size == (offset_e - 1) / block_size;
-    if (is_within_block) {
-      std::optional<cache_block*> cbe = cache_tlb_.find([&](const cache_block* cb) {
-        return cb->vm_addr <= raw_ptr && raw_ptr + size <= cb->vm_addr + block_size;
-      });
-      if (cbe.has_value()) {
-        cache_block& cb = **cbe;
-        PCAS_ASSERT(cb.cstate == cache_state::valid);
-        PCAS_ASSERT(cb.mapped);
-
-        if constexpr (Mode != access_mode::read) {
-          bool is_new_dirty_block = cb.dirty_sections.empty();
-
-          uint64_t offset_in_block_b = raw_ptr - cb.vm_addr;
-          uint64_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
-          sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
-
-          if (is_new_dirty_block) {
-            add_dirty_cache_block(cb);
-          }
-        }
-
-        if constexpr (DoCheckout) {
-          cb.checkout_count--;
-        }
-        return;
-      }
-    }
-  }
 
   for_each_mem_block(mo, ptr, size, [&](const auto& bi) {
     if (topo_.is_locally_accessible(bi.owner)) {
