@@ -33,14 +33,14 @@ protected:
   const topology& topo_;
 
   // FIXME: make them configurable
-  static constexpr uint64_t global_max_size_ = (uint64_t)1 << 44;
-  static constexpr uint64_t global_base_addr_ = 0x100000000000;
+  static constexpr std::size_t global_max_size_ = std::size_t(1) << 44;
+  static constexpr std::size_t global_base_addr_ = 0x100000000000;
 
   static_assert(global_base_addr_ % P::block_size == 0);
   static_assert(global_max_size_ % P::block_size == 0);
 
-  const uint64_t local_max_size_;
-  const uint64_t local_base_addr_;
+  const std::size_t local_max_size_;
+  const std::size_t local_base_addr_;
 
   virtual_mem vm_;
   physical_mem pm_;
@@ -87,8 +87,13 @@ public:
 
   MPI_Win win() const { return dwin_.win(); }
 
-  topology::rank_t get_owner(uint64_t vm_addr) const {
-    return (vm_addr - global_base_addr_) / local_max_size_;
+  static bool belongs_to(void* p) {
+    return global_base_addr_ <= reinterpret_cast<uintptr_t>(p) &&
+           reinterpret_cast<uintptr_t>(p) < global_base_addr_ + global_max_size_;
+  }
+
+  topology::rank_t get_owner(void* p) const {
+    return (reinterpret_cast<uintptr_t>(p) - global_base_addr_) / local_max_size_;
   }
 
   void* do_allocate(std::size_t bytes, std::size_t alignment = alignof(max_align_t)) override {

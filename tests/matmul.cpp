@@ -23,12 +23,12 @@ auto checkout_stride(global_ptr<T> ptr,
   return ret;
 }
 
-template <typename T>
+template <pcas::access_mode Mode, typename T>
 void checkin_stride(std::vector<T> vec,
                     uint64_t       blen,
                     pcas::pcas&    pc) {
   for (auto p : vec) {
-    pc.checkin(p, blen);
+    pc.checkin<Mode>(p, blen);
   }
 }
 
@@ -58,10 +58,10 @@ void matmul_par(global_ptr<real_t> A,
 
           matmul_seq(A_.data(), B_.data(), C_.data(), bn);
 
-          checkin_stride(A_, bn, pc);
-          checkin_stride(B_, bn, pc);
+          checkin_stride<pcas::access_mode::read>(A_, bn, pc);
+          checkin_stride<pcas::access_mode::read>(B_, bn, pc);
         }
-        checkin_stride(C_, bn, pc);
+        checkin_stride<pcas::access_mode::read_write>(C_, bn, pc);
       }
     }
   }
@@ -88,9 +88,9 @@ void matmul_init(global_ptr<real_t> A,
       B_[j] = dist(engine);
       C_[j] = 0.0;
     }
-    pc.checkin(A_, s);
-    pc.checkin(B_, s);
-    pc.checkin(C_, s);
+    pc.checkin<pcas::access_mode::write>(A_, s);
+    pc.checkin<pcas::access_mode::write>(B_, s);
+    pc.checkin<pcas::access_mode::write>(C_, s);
   }
 }
 
@@ -115,7 +115,7 @@ void matmul_check(global_ptr<real_t> A,
       pc.get(B + k * n + j, &b, 1);
       c_ans += A_[k] * b;
     }
-    pc.checkin(A_, n);
+    pc.checkin<pcas::access_mode::read>(A_, n);
 
     real_t c_computed;
     pc.get(C + i * n + j, &c_computed, 1);

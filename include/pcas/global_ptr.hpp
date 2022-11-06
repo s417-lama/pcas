@@ -9,15 +9,11 @@
 
 namespace pcas {
 
-using mem_obj_id_t = uint64_t;
-
 template <typename P, typename T>
 class global_ptr_if {
   using this_t = global_ptr_if<P, T>;
 
-  int          owner_;
-  mem_obj_id_t id_;
-  uint64_t     offset_;
+  T* raw_ptr_ = nullptr;
 
 public:
   using difference_type   = std::ptrdiff_t;
@@ -26,48 +22,35 @@ public:
   using reference         = typename P::template global_ref<this_t>;
   using iterator_category = std::random_access_iterator_tag;
 
-  global_ptr_if() : owner_(-2), id_(0), offset_(0) {}
-  global_ptr_if(int owner, mem_obj_id_t id, uint64_t offset) : owner_(owner), id_(id), offset_(offset) {}
+  global_ptr_if() {}
+  explicit global_ptr_if(T* ptr) : raw_ptr_(ptr) {}
 
   global_ptr_if(const this_t&) = default;
   this_t& operator=(const this_t&) = default;
 
-  int owner() const noexcept { return owner_; }
-  mem_obj_id_t id() const noexcept { return id_; }
-  uint64_t offset() const noexcept { return offset_; }
+  global_ptr_if(std::nullptr_t) {}
+  this_t& operator=(std::nullptr_t) { raw_ptr_ = nullptr; }
 
-  template<typename U>
-  bool is_equal(const global_ptr_if<P, U>& p) const noexcept {
-    return owner_  == p.owner() &&
-           id_     == p.id()    &&
-           offset_ == p.offset();
-  }
+  T* raw_ptr() const noexcept { return raw_ptr_; }
 
-  template<typename U>
-  bool belong_to_same_obj(const global_ptr_if<P, U>& p) const noexcept {
-    return owner_ == p.owner() &&
-           id_    == p.id();
-  }
-
-  explicit operator bool() const noexcept { return !is_equal(this_t()); }
-  bool operator!() const noexcept { return is_equal(this_t()); }
+  explicit operator bool() const noexcept { return raw_ptr_ != nullptr; }
+  bool operator!() const noexcept { return raw_ptr_ == nullptr; }
 
   reference operator*() const noexcept {
     return *this;
   }
 
   reference operator[](difference_type diff) const noexcept {
-    return this_t(owner_, id_, offset_ + diff * sizeof(T));
+    return this_t(raw_ptr_ + diff);
   }
 
   this_t& operator+=(difference_type diff) {
-    offset_ += diff * sizeof(T);
+    raw_ptr_ += diff;
     return *this;
   }
 
   this_t& operator-=(difference_type diff) {
-    PCAS_CHECK(offset_ >= diff * sizeof(T));
-    offset_ -= diff * sizeof(T);
+    raw_ptr_ -= diff;
     return *this;
   }
 
@@ -78,65 +61,75 @@ public:
   this_t operator--(int) { this_t tmp(*this); --(*this); return tmp; }
 
   this_t operator+(difference_type diff) const noexcept {
-    return {owner_, id_, offset_ + diff * sizeof(T)};
+    return this_t(raw_ptr_ + diff);
   }
 
   this_t operator-(difference_type diff) const noexcept {
-    PCAS_CHECK(offset_ >= diff * sizeof(T));
-    return {owner_, id_, offset_ - diff * sizeof(T)};
+    return this_t(raw_ptr_ - diff);
   }
 
   difference_type operator-(const this_t& p) const noexcept {
-    PCAS_CHECK(belong_to_same_obj(p));
-    PCAS_CHECK(offset_ % sizeof(T) == 0);
-    PCAS_CHECK(p.offset_ % sizeof(T) == 0);
-    return offset_ / sizeof(T) - p.offset_ / sizeof(T);
+    return raw_ptr_ - p.raw_ptr();
   }
 
   template <typename U>
   explicit operator global_ptr_if<P, U>() const noexcept {
-    return {owner_, id_, offset_};
+    return global_ptr_if<P, U>(reinterpret_cast<U*>(raw_ptr_));
   }
 
   void swap(this_t& p) {
-    this_t tmp(*this);
-    *this = p;
-    p = tmp;
+    std::swap(raw_ptr_, p.raw_ptr_);
   }
 };
 
-template <typename P, typename T, typename U>
-inline bool operator==(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
-  return p1.is_equal(p2);
+template <typename P, typename T>
+inline bool operator==(const global_ptr_if<P, T>& p1, const global_ptr_if<P, T>& p2) noexcept {
+  return p1.raw_ptr() == p2.raw_ptr();
 }
 
-template <typename P, typename T, typename U>
-inline bool operator!=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
-  return !p1.is_equal(p2);
+template <typename P, typename T>
+inline bool operator==(const global_ptr_if<P, T>& p, std::nullptr_t) noexcept {
+  return !p;
 }
 
-template <typename P, typename T, typename U>
-inline bool operator<(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
-  PCAS_CHECK(p1.belong_to_same_obj(p2));
-  return p1.offset() < p2.offset();
+template <typename P, typename T>
+inline bool operator==(std::nullptr_t, const global_ptr_if<P, T>& p) noexcept {
+  return !p;
 }
 
-template <typename P, typename T, typename U>
-inline bool operator>(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
-  PCAS_CHECK(p1.belong_to_same_obj(p2));
-  return p1.offset() > p2.offset();
+template <typename P, typename T>
+inline bool operator!=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, T>& p2) noexcept {
+  return p1.raw_ptr() != p2.raw_ptr();
 }
 
-template <typename P, typename T, typename U>
-inline bool operator<=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
-  PCAS_CHECK(p1.belong_to_same_obj(p2));
-  return p1.offset() <= p2.offset();
+template <typename P, typename T>
+inline bool operator!=(const global_ptr_if<P, T>& p, std::nullptr_t) noexcept {
+  return bool(p);
 }
 
-template <typename P, typename T, typename U>
-inline bool operator>=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, U>& p2) noexcept {
-  PCAS_CHECK(p1.belong_to_same_obj(p2));
-  return p1.offset() >= p2.offset();
+template <typename P, typename T>
+inline bool operator!=(std::nullptr_t, const global_ptr_if<P, T>& p) noexcept {
+  return bool(p);
+}
+
+template <typename P, typename T>
+inline bool operator<(const global_ptr_if<P, T>& p1, const global_ptr_if<P, T>& p2) noexcept {
+  return p1.raw_ptr() < p2.raw_ptr();
+}
+
+template <typename P, typename T>
+inline bool operator>(const global_ptr_if<P, T>& p1, const global_ptr_if<P, T>& p2) noexcept {
+  return p1.raw_ptr() > p2.raw_ptr();
+}
+
+template <typename P, typename T>
+inline bool operator<=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, T>& p2) noexcept {
+  return p1.raw_ptr() <= p2.raw_ptr();
+}
+
+template <typename P, typename T>
+inline bool operator>=(const global_ptr_if<P, T>& p1, const global_ptr_if<P, T>& p2) noexcept {
+  return p1.raw_ptr() >= p2.raw_ptr();
 }
 
 template <typename P, typename T>
@@ -147,11 +140,9 @@ inline void swap(global_ptr_if<P, T>& p1, global_ptr_if<P, T>& p2) {
 template <typename P, typename T, typename MemberT>
 inline typename P::template global_ref<global_ptr_if<P, std::remove_extent_t<MemberT>>>
 operator->*(global_ptr_if<P, T> ptr, MemberT T::* mp) {
-  static T t {};
-  uint64_t offset_m = reinterpret_cast<uint64_t>(std::addressof(t.*mp))
-                    - reinterpret_cast<uint64_t>(std::addressof(t));
-  uint64_t offset = ptr.offset() + offset_m;
-  return global_ptr_if<P, std::remove_extent_t<MemberT>>(ptr.owner(), ptr.id(), offset);
+  using member_t = std::remove_extent_t<MemberT>;
+  member_t* member_ptr = reinterpret_cast<member_t*>(std::addressof(ptr.raw_ptr()->*mp));
+  return global_ptr_if<P, member_t>(member_ptr);
 }
 
 template <typename>
@@ -186,28 +177,33 @@ static_assert(is_global_ptr_v<global_ptr<int>>);
 static_assert(!is_global_ptr_v<int>);
 
 PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
-  global_ptr<int> p1(0, 0, 0);
-  global_ptr<int> p2(1, 0, 0);
-  global_ptr<int> p3(1, 1, 0);
+  int* a1 = reinterpret_cast<int*>(0x00100000);
+  int* a2 = reinterpret_cast<int*>(0x01000000);
+  int* a3 = reinterpret_cast<int*>(0x10000000);
+  global_ptr<int> p1(a1);
+  global_ptr<int> p2(a2);
+  global_ptr<int> p3(a3);
 
   PCAS_SUBCASE("initialization") {
     global_ptr<int> p1_(p1);
-    global_ptr<int> p2_(p1.owner(), p1.id(), p1.offset());
+    global_ptr<int> p2_ = p1;
     PCAS_CHECK(p1_ == p2_);
+    int v = 0;
+    global_ptr<int> p3_(&v);
   }
 
   PCAS_SUBCASE("addition and subtraction") {
     auto p = p1 + 4;
-    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 4));
-    PCAS_CHECK(p - 2  == global_ptr<int>(0, 0, sizeof(int) * 2));
+    PCAS_CHECK(p      == global_ptr<int>(a1 + 4));
+    PCAS_CHECK(p - 2  == global_ptr<int>(a1 + 2));
     p++;
-    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 5));
+    PCAS_CHECK(p      == global_ptr<int>(a1 + 5));
     p--;
-    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 4));
+    PCAS_CHECK(p      == global_ptr<int>(a1 + 4));
     p += 10;
-    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 14));
+    PCAS_CHECK(p      == global_ptr<int>(a1 + 14));
     p -= 5;
-    PCAS_CHECK(p      == global_ptr<int>(0, 0, sizeof(int) * 9));
+    PCAS_CHECK(p      == global_ptr<int>(a1 + 9));
     PCAS_CHECK(p - p1 == 9);
     PCAS_CHECK(p1 - p == -9);
     PCAS_CHECK(p - p  == 0);
@@ -247,7 +243,15 @@ PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
     PCAS_CHECK(!!p1);
     global_ptr<void> nullp;
     PCAS_CHECK(!nullp);
-    PCAS_CHECK(!global_ptr<void>());
+    PCAS_CHECK(nullp == global_ptr<void>(nullptr));
+    PCAS_CHECK(nullp == nullptr);
+    PCAS_CHECK(nullptr == nullp);
+    PCAS_CHECK(!(nullp != nullptr));
+    PCAS_CHECK(!(nullptr != nullp));
+    PCAS_CHECK(p1 != nullptr);
+    PCAS_CHECK(nullptr != p1);
+    PCAS_CHECK(!(p1 == nullptr));
+    PCAS_CHECK(!(nullptr == p1));
   }
 
   PCAS_SUBCASE("dereference") {
@@ -255,22 +259,23 @@ PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
     PCAS_CHECK(&p1[0] == p1);
     PCAS_CHECK(&p1[10] == p1 + 10);
     struct point1 { int x; int y; int z; };
-    global_ptr<point1> px1(0, 0, 0);
-    PCAS_CHECK(&(px1->*(&point1::x)) == global_ptr<int>(0, 0, offsetof(point1, x)));
-    PCAS_CHECK(&(px1->*(&point1::y)) == global_ptr<int>(0, 0, offsetof(point1, y)));
-    PCAS_CHECK(&(px1->*(&point1::z)) == global_ptr<int>(0, 0, offsetof(point1, z)));
+    uintptr_t base_addr = 0x00300000;
+    global_ptr<point1> px1(reinterpret_cast<point1*>(base_addr));
+    PCAS_CHECK(&(px1->*(&point1::x)) == global_ptr<int>(reinterpret_cast<int*>(base_addr + offsetof(point1, x))));
+    PCAS_CHECK(&(px1->*(&point1::y)) == global_ptr<int>(reinterpret_cast<int*>(base_addr + offsetof(point1, y))));
+    PCAS_CHECK(&(px1->*(&point1::z)) == global_ptr<int>(reinterpret_cast<int*>(base_addr + offsetof(point1, z))));
     struct point2 { int v[3]; };
-    global_ptr<point2> px2(0, 0, 0);
+    global_ptr<point2> px2(reinterpret_cast<point2*>(base_addr));
     global_ptr<int> pv = &(px2->*(&point2::v));
-    PCAS_CHECK(pv == global_ptr<int>(0, 0, 0));
-    PCAS_CHECK(&pv[0] == global_ptr<int>(0, 0, 0));
-    PCAS_CHECK(&pv[1] == global_ptr<int>(0, 0, sizeof(int)));
-    PCAS_CHECK(&pv[2] == global_ptr<int>(0, 0, sizeof(int) * 2));
+    PCAS_CHECK(pv == global_ptr<int>(reinterpret_cast<int*>(base_addr)));
+    PCAS_CHECK(&pv[0] == global_ptr<int>(reinterpret_cast<int*>(base_addr) + 0));
+    PCAS_CHECK(&pv[1] == global_ptr<int>(reinterpret_cast<int*>(base_addr) + 1));
+    PCAS_CHECK(&pv[2] == global_ptr<int>(reinterpret_cast<int*>(base_addr) + 2));
   }
 
   PCAS_SUBCASE("cast") {
-    PCAS_CHECK(p1 == static_cast<global_ptr<char>>(p1));
-    PCAS_CHECK(p1 + 4 == static_cast<global_ptr<char>>(p1) + 4 * sizeof(int));
+    PCAS_CHECK(global_ptr<char>(reinterpret_cast<char*>(p1.raw_ptr())) == static_cast<global_ptr<char>>(p1));
+    PCAS_CHECK(static_cast<global_ptr<char>>(p1 + 4) == static_cast<global_ptr<char>>(p1) + 4 * sizeof(int));
   }
 }
 

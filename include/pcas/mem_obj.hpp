@@ -13,6 +13,7 @@
 
 namespace pcas {
 
+using mem_obj_id_t = uint64_t;
 using mem_block_num_t = uint64_t;
 
 template <typename P>
@@ -77,6 +78,7 @@ public:
 
   const mem_mapper::base& mem_mapper() const { return *mmapper_; }
 
+  mem_obj_id_t id() const { return id_; }
   uint64_t size() const { return size_; }
   uint64_t local_size() const { return local_size_; }
   uint64_t effective_size() const { return effective_size_; }
