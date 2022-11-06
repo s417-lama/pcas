@@ -466,20 +466,20 @@ private:
   void fetch_begin(cache_block& cb) {
     PCAS_CHECK(cb.owner < topo_.global_nproc());
 
-    void* cache_block_ptr = cache_pm_.anon_vm_addr();
+    std::byte* cache_block_ptr = reinterpret_cast<std::byte*>(cache_pm_.anon_vm_addr());
     int count = 0;
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
          sections_inverse(cb.partial_sections, {0, block_size})) {
       PCAS_CHECK(cb.entry_num < cache_.num_entries());
       MPI_Request req;
-      MPI_Rget((uint8_t*)cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
+      MPI_Rget(cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
                offset_in_block_e - offset_in_block_b,
-               MPI_UINT8_T,
+               MPI_BYTE,
                cb.owner,
                cb.pm_offset + offset_in_block_b,
                offset_in_block_e - offset_in_block_b,
-               MPI_UINT8_T,
+               MPI_BYTE,
                cb.win,
                &req);
       cb.cstate = cache_state::fetching;
@@ -513,18 +513,19 @@ private:
   void flush_dirty_cache_block(cache_block& cb) {
     PCAS_CHECK(!cb.flushing);
 
-    void* cache_block_ptr = cache_pm_.anon_vm_addr();
+    std::byte* cache_block_ptr = reinterpret_cast<std::byte*>(cache_pm_.anon_vm_addr());
 
     for (auto [offset_in_block_b, offset_in_block_e] : cb.dirty_sections) {
-      MPI_Put((uint8_t*)cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
+      MPI_Put(cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
               offset_in_block_e - offset_in_block_b,
-              MPI_UINT8_T,
+              MPI_BYTE,
               cb.owner,
               cb.pm_offset + offset_in_block_b,
               offset_in_block_e - offset_in_block_b,
-              MPI_UINT8_T,
+              MPI_BYTE,
               cb.win);
     }
+
     cb.dirty_sections.clear();
     cb.flushing = true;
 
@@ -593,11 +594,11 @@ private:
     MPI_Request req;
     MPI_Rget(&remote_epoch,
              sizeof(epoch_t),
-             MPI_UINT8_T,
+             MPI_BYTE,
              target_rank,
              offsetof(release_remote_region, epoch),
              sizeof(epoch_t),
-             MPI_UINT8_T,
+             MPI_BYTE,
              rm_.win(),
              &req);
     MPI_Wait(&req, MPI_STATUS_IGNORE);
@@ -679,15 +680,13 @@ public:
   void free(global_ptr<T> ptr, uint64_t nelems = 0);
 
   template <typename ConstT, typename T>
-  std::enable_if_t<std::is_same_v<std::remove_const_t<ConstT>, T>>
-  get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems);
+  void get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems);
 
   template <typename T>
   void put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
 
   template <typename ConstT, typename T>
-  std::enable_if_t<std::is_same_v<std::remove_const_t<ConstT>, T>>
-  get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems);
+  void get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems);
 
   template <typename T>
   void put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems);
@@ -943,8 +942,10 @@ PCAS_TEST_CASE("[pcas::pcas] malloc and free (local)") {
 
 template <typename P>
 template <typename ConstT, typename T>
-inline std::enable_if_t<std::is_same_v<std::remove_const_t<ConstT>, T>>
-pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
+  static_assert(std::is_same_v<std::remove_const_t<ConstT>, T>,
+                "from_ptr must be of the same type as to_ptr ignoring const");
+
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
 
@@ -958,7 +959,7 @@ pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::put(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
-  static_assert(!std::is_const_v<T>);
+  static_assert(!std::is_const_v<T>, "to_ptr should not be const");
 
   uint64_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Put>(size);
@@ -1045,50 +1046,72 @@ PCAS_TEST_CASE("[pcas::pcas] get and put") {
 
 template <typename P>
 template <typename ConstT, typename T>
-inline std::enable_if_t<std::is_same_v<std::remove_const_t<ConstT>, T>>
-pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
+inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems) {
+  static_assert(std::is_same_v<std::remove_const_t<ConstT>, T>,
+                "from_ptr must be of the same type as to_ptr ignoring const");
+  static_assert(std::is_trivially_copyable_v<T>, "get_nocache requires trivially copyable types");
+
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
+
+  std::vector<MPI_Request> reqs;
 
   void* raw_ptr = from_ptr.raw_ptr();
 
   if (allocator::belongs_to(raw_ptr)) {
-    die("unimplemented");
-  }
+    const topology::rank_t target_rank = allocator_.get_owner(raw_ptr);
+    PCAS_CHECK(0 <= target_rank);
+    PCAS_CHECK(target_rank < nproc());
 
-  mem_obj& mo = get_mem_obj(raw_ptr);
-
-  const std::size_t offset_b = reinterpret_cast<std::size_t>(raw_ptr) -
-                               reinterpret_cast<std::size_t>(mo.vm().addr());
-  const std::size_t offset_e = offset_b + size;
-
-  std::vector<MPI_Request> reqs;
-
-  for_each_mem_block(mo, raw_ptr, size, [&](const auto& bi) {
-    std::size_t block_offset_b = std::max(bi.offset_b, offset_b);
-    std::size_t block_offset_e = std::min(bi.offset_e, offset_e);
-    std::size_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
-
-    if (topo_.is_locally_accessible(bi.owner)) {
-      int target_intra_rank = topo_.intra_rank(bi.owner);
-      void* from_vm_addr = mo.home_pm(target_intra_rank).anon_vm_addr();
-      std::memcpy((uint8_t*)to_ptr - offset_b + block_offset_b,
-                  (uint8_t*)from_vm_addr + pm_offset,
-                  block_offset_e - block_offset_b);
+    if (topo_.is_locally_accessible(target_rank)) {
+      std::memcpy(to_ptr, raw_ptr, size);
     } else {
       MPI_Request req;
-      MPI_Rget((uint8_t*)to_ptr - offset_b + block_offset_b,
-               block_offset_e - block_offset_b,
-               MPI_UINT8_T,
-               bi.owner,
-               pm_offset,
-               block_offset_e - block_offset_b,
-               MPI_UINT8_T,
-               mo.win(),
+      MPI_Rget(reinterpret_cast<std::byte*>(to_ptr),
+               size,
+               MPI_BYTE,
+               target_rank,
+               reinterpret_cast<std::size_t>(raw_ptr),
+               size,
+               MPI_BYTE,
+               allocator_.win(),
                &req);
       reqs.push_back(req);
     }
-  });
+
+  } else {
+    mem_obj& mo = get_mem_obj(raw_ptr);
+
+    const std::size_t offset_b = reinterpret_cast<std::size_t>(raw_ptr) -
+                                 reinterpret_cast<std::size_t>(mo.vm().addr());
+    const std::size_t offset_e = offset_b + size;
+
+    for_each_mem_block(mo, raw_ptr, size, [&](const auto& bi) {
+      std::size_t block_offset_b = std::max(bi.offset_b, offset_b);
+      std::size_t block_offset_e = std::min(bi.offset_e, offset_e);
+      std::size_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
+
+      if (topo_.is_locally_accessible(bi.owner)) {
+        int target_intra_rank = topo_.intra_rank(bi.owner);
+        void* from_vm_addr = mo.home_pm(target_intra_rank).anon_vm_addr();
+        std::memcpy(reinterpret_cast<std::byte*>(to_ptr) - offset_b + block_offset_b,
+                    reinterpret_cast<const std::byte*>(from_vm_addr) + pm_offset,
+                    block_offset_e - block_offset_b);
+      } else {
+        MPI_Request req;
+        MPI_Rget(reinterpret_cast<std::byte*>(to_ptr) - offset_b + block_offset_b,
+                 block_offset_e - block_offset_b,
+                 MPI_BYTE,
+                 bi.owner,
+                 pm_offset,
+                 block_offset_e - block_offset_b,
+                 MPI_BYTE,
+                 mo.win(),
+                 &req);
+        reqs.push_back(req);
+      }
+    });
+  }
 
   MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
 }
@@ -1096,7 +1119,8 @@ pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, uint64_t nelems)
 template <typename P>
 template <typename T>
 inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uint64_t nelems) {
-  static_assert(!std::is_const_v<T>);
+  static_assert(!std::is_const_v<T>, "to_ptr should not be const");
+  static_assert(std::is_trivially_copyable_v<T>, "put_nocache requires trivially copyable types");
 
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Put>(size);
@@ -1104,40 +1128,56 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, uin
   void* raw_ptr = to_ptr.raw_ptr();
 
   if (allocator::belongs_to(raw_ptr)) {
-    die("unimplemented");
-  }
+    const topology::rank_t target_rank = allocator_.get_owner(raw_ptr);
+    PCAS_CHECK(0 <= target_rank);
+    PCAS_CHECK(target_rank < nproc());
 
-  mem_obj& mo = get_mem_obj(raw_ptr);
-
-  const std::size_t offset_b = reinterpret_cast<std::size_t>(raw_ptr) -
-                               reinterpret_cast<std::size_t>(mo.vm().addr());
-  const std::size_t offset_e = offset_b + size;
-
-  for_each_mem_block(mo, raw_ptr, size, [&](const auto& bi) {
-    std::size_t block_offset_b = std::max(bi.offset_b, offset_b);
-    std::size_t block_offset_e = std::min(bi.offset_e, offset_e);
-    std::size_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
-
-    if (topo_.is_locally_accessible(bi.owner)) {
-      int target_intra_rank = topo_.intra_rank(bi.owner);
-      void* to_vm_addr = mo.home_pm(target_intra_rank).anon_vm_addr();
-      std::memcpy((uint8_t*)to_vm_addr + pm_offset,
-                  (uint8_t*)from_ptr - offset_b + block_offset_b,
-                  block_offset_e - block_offset_b);
+    if (topo_.is_locally_accessible(target_rank)) {
+      std::memcpy(raw_ptr, from_ptr, size);
     } else {
-      MPI_Put((uint8_t*)from_ptr - offset_b + block_offset_b,
-              block_offset_e - block_offset_b,
-              MPI_UINT8_T,
-              bi.owner,
-              pm_offset,
-              block_offset_e - block_offset_b,
-              MPI_UINT8_T,
-              mo.win());
+      MPI_Put(reinterpret_cast<const std::byte*>(from_ptr),
+              size,
+              MPI_BYTE,
+              target_rank,
+              reinterpret_cast<std::size_t>(raw_ptr),
+              size,
+              MPI_BYTE,
+              allocator_.win());
     }
-  });
 
-  // ensure remote completion
-  MPI_Win_flush_all(mo.win());
+  } else {
+    mem_obj& mo = get_mem_obj(raw_ptr);
+
+    const std::size_t offset_b = reinterpret_cast<std::size_t>(raw_ptr) -
+                                 reinterpret_cast<std::size_t>(mo.vm().addr());
+    const std::size_t offset_e = offset_b + size;
+
+    for_each_mem_block(mo, raw_ptr, size, [&](const auto& bi) {
+      std::size_t block_offset_b = std::max(bi.offset_b, offset_b);
+      std::size_t block_offset_e = std::min(bi.offset_e, offset_e);
+      std::size_t pm_offset = bi.pm_offset + block_offset_b - bi.offset_b;
+
+      if (topo_.is_locally_accessible(bi.owner)) {
+        int target_intra_rank = topo_.intra_rank(bi.owner);
+        void* to_vm_addr = mo.home_pm(target_intra_rank).anon_vm_addr();
+        std::memcpy(reinterpret_cast<std::byte*>(to_vm_addr) + pm_offset,
+                    reinterpret_cast<const std::byte*>(from_ptr) - offset_b + block_offset_b,
+                    block_offset_e - block_offset_b);
+      } else {
+        MPI_Put(reinterpret_cast<const std::byte*>(from_ptr) - offset_b + block_offset_b,
+                block_offset_e - block_offset_b,
+                MPI_BYTE,
+                bi.owner,
+                pm_offset,
+                block_offset_e - block_offset_b,
+                MPI_BYTE,
+                mo.win());
+      }
+    });
+
+    // ensure remote completion
+    MPI_Win_flush_all(mo.win());
+  }
 }
 
 PCAS_TEST_CASE("[pcas::pcas] get and put (nocache)") {
