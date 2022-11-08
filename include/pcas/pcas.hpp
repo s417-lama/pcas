@@ -67,7 +67,7 @@ class pcas_if {
     using global_ref = typename P::template global_ref<GPtrT>;
   };
   template <typename T>
-  using global_ptr_ = global_ptr_if<global_ptr_policy, T>;
+  using global_ptr_ = typename global_ptr_if<global_ptr_policy>::template global_ptr<T>;
 
   struct logger_policy {
     static const char* outfile_prefix() { return "pcas"; }
