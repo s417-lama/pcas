@@ -20,7 +20,7 @@ struct global_ptr_if {
   public:
     using difference_type   = std::ptrdiff_t;
     using value_type        = T;
-    using pointer           = void;
+    using pointer           = T*;
     using reference         = typename P::template global_ref<this_t>;
     using iterator_category = std::random_access_iterator_tag;
 
