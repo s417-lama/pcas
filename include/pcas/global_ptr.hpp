@@ -275,6 +275,17 @@ PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
     PCAS_CHECK(global_ptr<char>(reinterpret_cast<char*>(p1.raw_ptr())) == static_cast<global_ptr<char>>(p1));
     PCAS_CHECK(static_cast<global_ptr<char>>(p1 + 4) == static_cast<global_ptr<char>>(p1) + 4 * sizeof(int));
   }
+
+  PCAS_SUBCASE("swap") {
+    auto p1_copy = p1;
+    auto p2_copy = p2;
+    swap(p1, p2);
+    PCAS_CHECK(p1 == p2_copy);
+    PCAS_CHECK(p2 == p1_copy);
+    p1.swap(p2);
+    PCAS_CHECK(p1 == p1_copy);
+    PCAS_CHECK(p2 == p2_copy);
+  }
 }
 
 }
