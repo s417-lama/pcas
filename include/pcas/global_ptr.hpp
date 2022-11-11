@@ -18,8 +18,9 @@ struct global_ptr_if {
     T* raw_ptr_ = nullptr;
 
   public:
+    using element_type      = T;
+    using value_type        = std::remove_cv_t<T>;
     using difference_type   = std::ptrdiff_t;
-    using value_type        = T;
     using pointer           = T*;
     using reference         = typename P::template global_ref<this_t>;
     using iterator_category = std::random_access_iterator_tag;
@@ -82,7 +83,7 @@ struct global_ptr_if {
       return global_ptr<U>(reinterpret_cast<U*>(raw_ptr_));
     }
 
-    void swap(this_t& p) {
+    void swap(this_t& p) noexcept {
       std::swap(raw_ptr_, p.raw_ptr_);
     }
 
@@ -94,39 +95,39 @@ struct global_ptr_if {
       return !p;
     }
 
-    friend inline bool operator==(std::nullptr_t, const global_ptr<T>& p) noexcept {
+    friend bool operator==(std::nullptr_t, const global_ptr<T>& p) noexcept {
       return !p;
     }
 
-    friend inline bool operator!=(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
+    friend bool operator!=(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
       return p1.raw_ptr() != p2.raw_ptr();
     }
 
-    friend inline bool operator!=(const global_ptr<T>& p, std::nullptr_t) noexcept {
+    friend bool operator!=(const global_ptr<T>& p, std::nullptr_t) noexcept {
       return bool(p);
     }
 
-    friend inline bool operator!=(std::nullptr_t, const global_ptr<T>& p) noexcept {
+    friend bool operator!=(std::nullptr_t, const global_ptr<T>& p) noexcept {
       return bool(p);
     }
 
-    friend inline bool operator<(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
+    friend bool operator<(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
       return p1.raw_ptr() < p2.raw_ptr();
     }
 
-    friend inline bool operator>(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
+    friend bool operator>(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
       return p1.raw_ptr() > p2.raw_ptr();
     }
 
-    friend inline bool operator<=(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
+    friend bool operator<=(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
       return p1.raw_ptr() <= p2.raw_ptr();
     }
 
-    friend inline bool operator>=(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
+    friend bool operator>=(const global_ptr<T>& p1, const global_ptr<T>& p2) noexcept {
       return p1.raw_ptr() >= p2.raw_ptr();
     }
 
-    friend void swap(global_ptr<T>& p1, global_ptr<T>& p2) {
+    friend void swap(global_ptr<T>& p1, global_ptr<T>& p2) noexcept {
       p1.swap(p2);
     }
 
@@ -274,6 +275,8 @@ PCAS_TEST_CASE("[pcas::global_ptr] global pointer manipulation") {
   PCAS_SUBCASE("cast") {
     PCAS_CHECK(global_ptr<char>(reinterpret_cast<char*>(p1.raw_ptr())) == static_cast<global_ptr<char>>(p1));
     PCAS_CHECK(static_cast<global_ptr<char>>(p1 + 4) == static_cast<global_ptr<char>>(p1) + 4 * sizeof(int));
+    global_ptr<const int> p1_const(p1);
+    PCAS_CHECK(static_cast<global_ptr<const int>>(p1) == p1_const);
   }
 
   PCAS_SUBCASE("swap") {
