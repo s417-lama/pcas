@@ -87,12 +87,12 @@ public:
 
   MPI_Win win() const { return dwin_.win(); }
 
-  static bool belongs_to(void* p) {
+  static bool belongs_to(const void* p) {
     return global_base_addr_ <= reinterpret_cast<uintptr_t>(p) &&
            reinterpret_cast<uintptr_t>(p) < global_base_addr_ + global_max_size_;
   }
 
-  topology::rank_t get_owner(void* p) const {
+  topology::rank_t get_owner(const void* p) const {
     return (reinterpret_cast<uintptr_t>(p) - global_base_addr_) / local_max_size_;
   }
 

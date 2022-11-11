@@ -377,12 +377,12 @@ private:
   // Misc functions
   // -----------------------------------------------------------------------------
 
-  cache_key_t cache_key(void* vm_addr) {
+  cache_key_t cache_key(const void* vm_addr) {
     PCAS_CHECK(reinterpret_cast<uintptr_t>(vm_addr) % block_size == 0);
     return reinterpret_cast<uintptr_t>(vm_addr) / block_size;
   }
 
-  mem_obj& get_mem_obj(void* vm_addr) {
+  mem_obj& get_mem_obj(const void* vm_addr) {
     for (auto [begin_p, end_p, id] : mem_obj_indices_) {
       if (begin_p <= vm_addr && vm_addr < end_p) {
         return *mem_objs_[id];
@@ -393,7 +393,7 @@ private:
   }
 
   template <typename Fn>
-  void for_each_mem_block(const mem_obj& mo, void* ptr, std::size_t size, Fn f) {
+  void for_each_mem_block(const mem_obj& mo, const void* ptr, std::size_t size, Fn f) {
     std::size_t offset_min = reinterpret_cast<std::size_t>(ptr) -
                              reinterpret_cast<std::size_t>(mo.vm().addr());
     std::size_t offset_max = offset_min + size;
@@ -500,7 +500,7 @@ private:
     dirty_cache_blocks_.push_back(&cb);
     cache_dirty_ = true;
 
-    if (P::enable_write_through) {
+    if constexpr (P::enable_write_through) {
       flush_dirty_cache_block(cb);
     } else if (dirty_cache_blocks_.size() >= max_dirty_cache_blocks_) {
       auto ev = logger::template record<logger_kind::FlushEarly>();
@@ -636,28 +636,28 @@ private:
   // -----------------------------------------------------------------------------
 
   template <access_mode Mode, bool DoCheckout>
-  void checkout_impl(void* ptr, std::size_t size);
+  void checkout_impl(const void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
-  bool checkout_impl_tlb(void* ptr, std::size_t size);
+  bool checkout_impl_tlb(const void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
-  void checkout_impl_coll(void* ptr, std::size_t size);
+  void checkout_impl_coll(const void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
-  void checkout_impl_local(void* ptr, std::size_t size);
+  void checkout_impl_local(const void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
-  void checkin_impl(void* ptr, std::size_t size);
+  void checkin_impl(const void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
-  bool checkin_impl_tlb(void* ptr, std::size_t size);
+  bool checkin_impl_tlb(const void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
-  void checkin_impl_coll(void* ptr, std::size_t size);
+  void checkin_impl_coll(const void* ptr, std::size_t size);
 
   template <access_mode Mode, bool DoCheckout>
-  void checkin_impl_local(void* ptr, std::size_t size);
+  void checkin_impl_local(const void* ptr, std::size_t size);
 
 public:
   constexpr static std::size_t block_size = P::block_size;
@@ -951,7 +951,7 @@ inline void pcas_if<P>::get(global_ptr<ConstT> from_ptr, T* to_ptr, std::size_t 
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
 
-  auto raw_ptr = const_cast<std::remove_const_t<T>*>(from_ptr.raw_ptr());
+  auto raw_ptr = from_ptr.raw_ptr();
 
   checkout_impl<access_mode::read, false>(raw_ptr, size);
 
@@ -1058,7 +1058,7 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
 
   std::vector<MPI_Request> reqs;
 
-  void* raw_ptr = from_ptr.raw_ptr();
+  const void* raw_ptr = from_ptr.raw_ptr();
 
   if (allocator::belongs_to(raw_ptr)) {
     const topology::rank_t target_rank = allocator_.get_owner(raw_ptr);
@@ -1309,7 +1309,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, std::size_t nelems) {
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkout>(size);
 
-  auto raw_ptr = const_cast<std::remove_const_t<T>*>(ptr.raw_ptr());
+  auto raw_ptr = ptr.raw_ptr();
 
   checkout_impl<Mode, true>(raw_ptr, size);
 
@@ -1318,7 +1318,7 @@ pcas_if<P>::checkout(global_ptr<T> ptr, std::size_t nelems) {
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-inline void pcas_if<P>::checkout_impl(void* ptr, std::size_t size) {
+inline void pcas_if<P>::checkout_impl(const void* ptr, std::size_t size) {
   if (checkout_impl_tlb<Mode, DoCheckout>(ptr, size)) {
     return;
   }
@@ -1332,8 +1332,8 @@ inline void pcas_if<P>::checkout_impl(void* ptr, std::size_t size) {
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-inline bool pcas_if<P>::checkout_impl_tlb(void* ptr, std::size_t size) {
-  std::byte* raw_ptr = reinterpret_cast<std::byte*>(ptr);
+inline bool pcas_if<P>::checkout_impl_tlb(const void* ptr, std::size_t size) {
+  auto raw_ptr = reinterpret_cast<const std::byte*>(ptr);
 
   // fast path for small requests using TLB
   std::optional<home_block*> hbe = home_tlb_.find([&](const home_block* hb) {
@@ -1402,7 +1402,7 @@ inline bool pcas_if<P>::checkout_impl_tlb(void* ptr, std::size_t size) {
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-inline void pcas_if<P>::checkout_impl_coll(void* ptr, std::size_t size) {
+inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
   mem_obj& mo = get_mem_obj(ptr);
 
   const std::size_t offset_b = reinterpret_cast<std::size_t>(ptr) -
@@ -1528,7 +1528,7 @@ inline void pcas_if<P>::checkout_impl_coll(void* ptr, std::size_t size) {
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-inline void pcas_if<P>::checkout_impl_local(void* ptr, std::size_t size) {
+inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
   const topology::rank_t target_rank = allocator_.get_owner(ptr);
   PCAS_CHECK(0 <= target_rank);
   PCAS_CHECK(target_rank < nproc());
@@ -1612,12 +1612,12 @@ inline void pcas_if<P>::checkin(T* raw_ptr, std::size_t nelems) {
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Checkin>(size);
 
-  checkin_impl<Mode, true>(const_cast<std::remove_const_t<T>*>(raw_ptr), size);
+  checkin_impl<Mode, true>(raw_ptr, size);
 }
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-inline void pcas_if<P>::checkin_impl(void* ptr, std::size_t size) {
+inline void pcas_if<P>::checkin_impl(const void* ptr, std::size_t size) {
   if (checkin_impl_tlb<Mode, DoCheckout>(ptr, size)) {
     return;
   }
@@ -1631,8 +1631,8 @@ inline void pcas_if<P>::checkin_impl(void* ptr, std::size_t size) {
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-inline bool pcas_if<P>::checkin_impl_tlb(void* ptr, std::size_t size) {
-  std::byte* raw_ptr = reinterpret_cast<std::byte*>(ptr);
+inline bool pcas_if<P>::checkin_impl_tlb(const void* ptr, std::size_t size) {
+  auto raw_ptr = reinterpret_cast<const std::byte*>(ptr);
 
   // fast path for small requests using TLB
   std::optional<home_block*> hbe = home_tlb_.find([&](const home_block* hb) {
@@ -1685,7 +1685,7 @@ inline bool pcas_if<P>::checkin_impl_tlb(void* ptr, std::size_t size) {
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-inline void pcas_if<P>::checkin_impl_coll(void* ptr, std::size_t size) {
+inline void pcas_if<P>::checkin_impl_coll(const void* ptr, std::size_t size) {
   mem_obj& mo = get_mem_obj(ptr);
 
   const std::size_t offset_b = reinterpret_cast<std::size_t>(ptr) -
@@ -1728,7 +1728,7 @@ inline void pcas_if<P>::checkin_impl_coll(void* ptr, std::size_t size) {
 
 template <typename P>
 template <access_mode Mode, bool DoCheckout>
-inline void pcas_if<P>::checkin_impl_local(void* ptr, std::size_t size) {
+inline void pcas_if<P>::checkin_impl_local(const void* ptr, std::size_t size) {
   const topology::rank_t target_rank = allocator_.get_owner(ptr);
   PCAS_CHECK(0 <= target_rank);
   PCAS_CHECK(target_rank < nproc());
