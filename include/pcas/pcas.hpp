@@ -335,6 +335,9 @@ private:
   uint64_t max_dirty_cache_blocks_;
   std::vector<cache_block*> dirty_cache_blocks_;
 
+  int lazy_release_check_interval_;
+  bool make_mpi_progress_in_busy_loop_;
+
   // Initializaiton
   // -----------------------------------------------------------------------------
 
@@ -732,7 +735,9 @@ inline pcas_if<P>::pcas_if(std::size_t cache_size, MPI_Comm comm)
     cache_pm_(cache_shmem_name(rank()), cache_size, true, true),
     allocator_(topo_),
     rm_(comm),
-    max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, rank()) / block_size) {
+    max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, rank()) / block_size),
+    lazy_release_check_interval_(get_env("PCAS_LAZY_RELEASE_CHECK_INTERVAL", 10, rank())),
+    make_mpi_progress_in_busy_loop_(get_env("PCAS_MAKE_MPI_PROGRESS_IN_BUSY_LOOP", true, rank())) {
 
   logger::init(rank(), nproc());
 
@@ -2029,8 +2034,12 @@ inline void pcas_if<P>::acquire(release_handler handler) {
       send_release_request(handler.rank, remote_epoch, handler.epoch);
       // need to wait for the execution of a release by the remote worker
       while (get_remote_epoch(handler.rank) < handler.epoch) {
-        usleep(10); // TODO: better interval?
-      };
+        usleep(lazy_release_check_interval_);
+        if (make_mpi_progress_in_busy_loop_) {
+          int flag;
+          MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, MPI_STATUS_IGNORE);
+        }
+      }
     }
   }
 
