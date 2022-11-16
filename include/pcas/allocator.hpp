@@ -275,7 +275,7 @@ class std_pool_resource_impl {
   // Ideally: pmr::pool_options{.max_blocks_per_chunk = (std::size_t)16 * 1024 * 1024 * 1024}
   pmr::pool_options my_pool_options() {
     pmr::pool_options opts;
-    opts.max_blocks_per_chunk = (std::size_t)16 * 1024 * 1024 * 1024;
+    opts.max_blocks_per_chunk = std::size_t(16) * 1024 * 1024 * 1024;
     return opts;
   }
 
@@ -287,7 +287,7 @@ public:
     topo_(topo),
     win_(win),
     win_mr_(topo, local_base_addr, local_max_size, win),
-    block_mr_(&win_mr_, std::size_t(2) * 1024 * 1024),
+    block_mr_(&win_mr_, std::size_t(get_env("PCAS_ALLOCATOR_BLOCK_SIZE", 2, topo_.global_rank())) * 1024 * 1024),
     mr_(my_pool_options(), &block_mr_) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
