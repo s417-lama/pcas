@@ -244,6 +244,7 @@ class std_pool_resource_impl {
   mpi_win_resource<P>               win_mr_;
   block_resource                    block_mr_;
   pmr::unsynchronized_pool_resource mr_;
+  int                               max_unflushed_free_objs_;
 
   using logger = typename P::logger;
   using logger_kind = typename P::logger::kind::value;
@@ -288,7 +289,8 @@ public:
     win_(win),
     win_mr_(topo, local_base_addr, local_max_size, win),
     block_mr_(&win_mr_, std::size_t(get_env("PCAS_ALLOCATOR_BLOCK_SIZE", 2, topo_.global_rank())) * 1024 * 1024),
-    mr_(my_pool_options(), &block_mr_) {}
+    mr_(my_pool_options(), &block_mr_),
+    max_unflushed_free_objs_(get_env("PCAS_ALLOCATOR_MAX_UNFLUSHED_FREE_OBJS", 10, topo_.global_rank())) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
     auto ev = logger::template record<logger_kind::MemAlloc>(bytes);
@@ -340,6 +342,13 @@ public:
                      reinterpret_cast<std::size_t>(flag_addr),
                      MPI_REPLACE,
                      win_);
+
+    static int count = 0;
+    count++;
+    if (count >= max_unflushed_free_objs_) {
+      MPI_Win_flush_all(win_);
+      count = 0;
+    }
   }
 
   void collect_deallocated() {
