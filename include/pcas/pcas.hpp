@@ -1137,7 +1137,9 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
     });
   }
 
-  MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+  if (!reqs.empty()) {
+    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+  }
 }
 
 template <typename P>
