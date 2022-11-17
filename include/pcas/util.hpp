@@ -66,8 +66,9 @@ inline void die(const char* fmt, ...) {
   va_end(args);
 
   fprintf(stderr, "\x1b[31m%s\x1b[39m\n", msg);
+  fflush(stderr);
 
-  exit(1);
+  std::abort();
 }
 
 template <typename T>
@@ -77,8 +78,7 @@ inline T get_env_(const char* env_var, T default_val) {
     std::stringstream ss(val_str);
     ss >> val;
     if (ss.fail()) {
-      fprintf(stderr, "Environment variable '%s' is invalid.\n", env_var);
-      exit(1);
+      die("Environment variable '%s' is invalid.\n", env_var);
     }
     return val;
   } else {
