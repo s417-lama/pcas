@@ -1177,6 +1177,7 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, std
                                  reinterpret_cast<std::size_t>(mo.vm().addr());
     const std::size_t offset_e = offset_b + size;
 
+    bool needs_flush = false;
     for_each_mem_block(mo, raw_ptr, size, [&](const auto& bi) {
       std::size_t block_offset_b = std::max(bi.offset_b, offset_b);
       std::size_t block_offset_e = std::min(bi.offset_e, offset_e);
@@ -1197,11 +1198,14 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, std
                 block_offset_e - block_offset_b,
                 MPI_BYTE,
                 mo.win());
+        needs_flush = true;
       }
     });
 
-    // ensure remote completion
-    MPI_Win_flush_all(mo.win());
+    if (needs_flush) {
+      // ensure remote completion
+      MPI_Win_flush_all(mo.win());
+    }
   }
 }
 
