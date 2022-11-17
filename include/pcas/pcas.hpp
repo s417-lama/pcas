@@ -115,13 +115,14 @@ private:
     cache_entry_num_t entry_num      = std::numeric_limits<cache_entry_num_t>::max();
     cache_state       cstate         = cache_state::unmapped;
     uint64_t          transaction_id = 0;
+    bool              mapped         = false;
     bool              flushing       = false;
     int               checkout_count = 0;
     std::byte*        vm_addr        = nullptr;
     std::byte*        prev_vm_addr   = nullptr;
-    bool              mapped         = false;
     topology::rank_t  owner          = -1;
     std::size_t       pm_offset      = 0;
+    mem_obj_id_t      mem_obj_id     = 0;
     MPI_Win           win            = MPI_WIN_NULL;
     MPI_Request       req            = MPI_REQUEST_NULL;
     sections          dirty_sections;
@@ -329,7 +330,7 @@ private:
   bool cache_dirty_ = false;
   release_manager rm_;
 
-  std::vector<MPI_Win> flushing_wins_;
+  std::vector<bool> flushing_flags_;
   bool early_flushing_ = false;
 
   uint64_t max_dirty_cache_blocks_;
@@ -532,10 +533,7 @@ private:
     cb.dirty_sections.clear();
     cb.flushing = true;
 
-    auto w = std::find(flushing_wins_.begin(), flushing_wins_.end(), cb.win);
-    if (w == flushing_wins_.end()) {
-      flushing_wins_.push_back(cb.win);
-    }
+    flushing_flags_[cb.mem_obj_id] = true;
   }
 
   void flush_dirty_cache() {
@@ -547,7 +545,18 @@ private:
   }
 
   void complete_flush() {
-    if (!flushing_wins_.empty()) {
+    std::vector<MPI_Win> flushing_wins;
+    for (std::size_t i = 0; i < flushing_flags_.size(); i++) {
+      if (flushing_flags_[i]) {
+        if (i == 0) {
+          flushing_wins.push_back(allocator_.win());
+        } else {
+          flushing_wins.push_back(mem_objs_[i]->win());
+        }
+      }
+    }
+
+    if (!flushing_wins.empty()) {
       if (early_flushing_) {
         // When early flush happened, dirty_cache_blocks_ was cleared, so we cannot make
         // assumption on which cache blocks are possibly flushing here
@@ -562,10 +571,11 @@ private:
         }
       }
 
-      for (auto win : flushing_wins_) {
+      for (auto win : flushing_wins) {
         MPI_Win_flush_all(win);
       }
-      flushing_wins_.clear();
+
+      std::fill(flushing_flags_.begin(), flushing_flags_.end(), false);
     }
   }
 
@@ -730,11 +740,13 @@ template <typename P>
 inline pcas_if<P>::pcas_if(std::size_t cache_size, MPI_Comm comm)
   : validate_dummy_(validate_input(cache_size, comm)),
     topo_(comm),
+    mem_objs_(1), // mem_obj_id = 0 should be empty
     mmap_cache_(calc_home_mmap_limit(cache_size / block_size), *this),
     cache_(cache_size / block_size, *this),
     cache_pm_(cache_shmem_name(rank()), cache_size, true, true),
     allocator_(topo_),
     rm_(comm),
+    flushing_flags_(1, false),
     max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, rank()) / block_size),
     lazy_release_check_interval_(get_env("PCAS_LAZY_RELEASE_CHECK_INTERVAL", 10, rank())),
     make_mpi_progress_in_busy_loop_(get_env("PCAS_MAKE_MPI_PROGRESS_IN_BUSY_LOOP", true, rank())) {
@@ -776,6 +788,7 @@ pcas_if<P>::malloc(std::size_t nelems, MemMapperArgs... mmargs) {
   std::byte* raw_ptr = reinterpret_cast<std::byte*>(mo.vm().addr());
 
   mem_obj_indices_.emplace_back(std::make_tuple(raw_ptr, raw_ptr + size, obj_id));
+  flushing_flags_.resize(mem_objs_.size(), false);
 
   return global_ptr<T>(reinterpret_cast<T*>(raw_ptr));
 }
@@ -838,6 +851,10 @@ inline void pcas_if<P>::free(global_ptr<T> ptr, std::size_t nelems) {
       }
 
       allocator_.remote_deallocate(raw_ptr, size, owner_rank);
+
+      // Call MPI_Win_flush_all() for the allocator window at the next release fence
+      // so as not to generate too many ongoing (unfinished) requests for freeing memory
+      flushing_flags_[0] = true;
     }
 
   } else { // Collective memory object
@@ -1150,6 +1167,7 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, std
               size,
               MPI_BYTE,
               allocator_.win());
+      MPI_Win_flush(target_rank, allocator_.win());
     }
 
   } else {
@@ -1285,6 +1303,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, std::size_t nelems) {
             cb.vm_addr = vm_addr;
             cb.owner = bi.owner;
             cb.pm_offset = bi.pm_offset + o - bi.offset_b;
+            cb.mem_obj_id = mo.id();
             cb.win = mo.win();
             remap_cache_blocks_.push_back(&cb);
 
@@ -1461,6 +1480,7 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
           cb.vm_addr = vm_addr;
           cb.owner = bi.owner;
           cb.pm_offset = bi.pm_offset + o - bi.offset_b;
+          cb.mem_obj_id = mo.id();
           cb.win = mo.win();
           remap_cache_blocks_.push_back(&cb);
 
@@ -1558,6 +1578,7 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
       cb.vm_addr = vm_addr;
       cb.owner = target_rank;
       cb.pm_offset = reinterpret_cast<std::size_t>(vm_addr);
+      cb.mem_obj_id = 0; // id = 0 means local allocator
       cb.win = allocator_.win();
       remap_cache_blocks_.push_back(&cb);
     }
