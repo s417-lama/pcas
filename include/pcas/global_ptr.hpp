@@ -35,7 +35,7 @@ struct global_ptr_if {
     this_t& operator=(const this_t&) = default;
 
     global_ptr(std::nullptr_t) {}
-    this_t& operator=(std::nullptr_t) { raw_ptr_ = nullptr; }
+    this_t& operator=(std::nullptr_t) { raw_ptr_ = nullptr; return *this; }
 
     T* raw_ptr() const noexcept { return raw_ptr_; }
 
