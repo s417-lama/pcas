@@ -48,6 +48,7 @@ struct policy_default {
   using default_mem_mapper = mem_mapper::cyclic<BlockSize>;
   constexpr static std::size_t block_size = 65536;
   constexpr static bool enable_write_through = false;
+  constexpr static bool use_mpi_win_dynamic = true;
 };
 
 template <typename P>
@@ -80,6 +81,7 @@ class pcas_if {
 
   struct allocator_policy {
     constexpr static std::size_t block_size = P::block_size;
+    constexpr static bool use_mpi_win_dynamic = P::use_mpi_win_dynamic;
     using logger = logger_;
     template <typename P_>
     using allocator_impl_t = typename P::template allocator_impl_t<P_>;
@@ -1095,7 +1097,7 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
                size,
                MPI_BYTE,
                target_rank,
-               reinterpret_cast<std::size_t>(raw_ptr),
+               allocator_.get_disp(raw_ptr),
                size,
                MPI_BYTE,
                allocator_.win(),
@@ -1165,7 +1167,7 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, std
               size,
               MPI_BYTE,
               target_rank,
-              reinterpret_cast<std::size_t>(raw_ptr),
+              allocator_.get_disp(raw_ptr),
               size,
               MPI_BYTE,
               allocator_.win());
@@ -1583,7 +1585,7 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
     if (!cb.mapped) {
       cb.vm_addr = vm_addr;
       cb.owner = target_rank;
-      cb.pm_offset = reinterpret_cast<std::size_t>(vm_addr);
+      cb.pm_offset = allocator_.get_disp(vm_addr);
       cb.mem_obj_id = 0; // id = 0 means local allocator
       cb.win = allocator_.win();
       remap_cache_blocks_.push_back(&cb);

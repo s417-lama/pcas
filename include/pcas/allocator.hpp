@@ -45,9 +45,23 @@ protected:
   virtual_mem vm_;
   physical_mem pm_;
 
-  win_manager dwin_;
+  win_manager win_;
 
   typename P::template allocator_impl_t<P> allocator_;
+
+  std::size_t get_local_max_size() const {
+    std::size_t upper_limit = global_max_size_ / next_pow2(topo_.global_nproc());
+    std::size_t default_local_size;
+    if constexpr (P::use_mpi_win_dynamic) {
+      default_local_size = upper_limit;
+    } else {
+      default_local_size = std::size_t(128) * 1024 * 1024;
+    }
+
+    auto ret = std::size_t(get_env("PCAS_ALLOCATOR_MAX_LOCAL_SIZE", default_local_size / 1024 / 1024, topo_.global_rank())) * 1024 * 1024; // MB
+    PCAS_CHECK(ret <= upper_limit);
+    return ret;
+  }
 
   static std::string allocator_shmem_name(int inter_rank) {
     std::stringstream ss;
@@ -55,7 +69,7 @@ protected:
     return ss.str();
   }
 
-  physical_mem init_pm() {
+  physical_mem init_pm() const {
     physical_mem pm;
 
     if (topo_.intra_rank() == 0) {
@@ -75,17 +89,25 @@ protected:
     return pm;
   }
 
+  win_manager create_win() const {
+    if constexpr (P::use_mpi_win_dynamic) {
+      return win_manager{topo_.global_comm()};
+    } else {
+      return win_manager{topo_.global_comm(), reinterpret_cast<void*>(local_base_addr_), local_max_size_};
+    }
+  }
+
 public:
   allocator_if(const topology& topo) :
     topo_(topo),
-    local_max_size_(global_max_size_ / next_pow2(topo_.global_nproc())),
+    local_max_size_(get_local_max_size()),
     local_base_addr_(global_base_addr_ + local_max_size_ * topo_.global_rank()),
     vm_(reinterpret_cast<void*>(global_base_addr_), global_max_size_),
     pm_(init_pm()),
-    dwin_(topo_.global_comm()),
-    allocator_(topo_, local_base_addr_, local_max_size_, dwin_.win()) {}
+    win_(create_win()),
+    allocator_(topo_, global_base_addr_, local_base_addr_, local_max_size_, win_.win()) {}
 
-  MPI_Win win() const { return dwin_.win(); }
+  MPI_Win win() const { return win_.win(); }
 
   static bool belongs_to(const void* p) {
     return global_base_addr_ <= reinterpret_cast<uintptr_t>(p) &&
@@ -94,6 +116,14 @@ public:
 
   topology::rank_t get_owner(const void* p) const {
     return (reinterpret_cast<uintptr_t>(p) - global_base_addr_) / local_max_size_;
+  }
+
+  std::size_t get_disp(const void* p) const {
+    if constexpr (P::use_mpi_win_dynamic) {
+      return reinterpret_cast<uintptr_t>(p);
+    } else {
+      return (reinterpret_cast<uintptr_t>(p) - global_base_addr_) % local_max_size_;
+    }
   }
 
   void* do_allocate(std::size_t bytes, std::size_t alignment = alignof(max_align_t)) override {
@@ -159,7 +189,10 @@ public:
     PCAS_CHECK(s->addr % P::block_size == 0);
 
     void* ret = reinterpret_cast<void*>(s->addr);
-    MPI_Win_attach(win_, ret, s->size);
+
+    if constexpr (P::use_mpi_win_dynamic) {
+      MPI_Win_attach(win_, ret, s->size);
+    }
 
     return ret;
   }
@@ -168,13 +201,15 @@ public:
     std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
     span s {reinterpret_cast<std::size_t>(p), real_bytes};
 
-    MPI_Win_detach(win_, p);
-
     PCAS_CHECK(reinterpret_cast<std::size_t>(p) % P::block_size == 0);
 
-    if (madvise(p, real_bytes, MADV_REMOVE) == -1) {
-      perror("madvise");
-      die("madvise() failed");
+    if constexpr (P::use_mpi_win_dynamic) {
+      MPI_Win_detach(win_, p);
+
+      if (madvise(p, real_bytes, MADV_REMOVE) == -1) {
+        perror("madvise");
+        die("madvise() failed");
+      }
     }
 
     freelist_add(freelist_, s);
@@ -240,6 +275,9 @@ public:
 template <typename P>
 class std_pool_resource_impl {
   const topology&                   topo_;
+  const std::size_t                 global_base_addr_;
+  const std::size_t                 local_base_addr_;
+  const std::size_t                 local_max_size_;
   MPI_Win                           win_;
   mpi_win_resource<P>               win_mr_;
   block_resource                    block_mr_;
@@ -272,6 +310,18 @@ class std_pool_resource_impl {
     }
   }
 
+  std::size_t get_header_disp(const void* p, std::size_t alignment) const {
+    std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
+    auto h = reinterpret_cast<const header*>(reinterpret_cast<const std::byte*>(p) - n_pad * alignment);
+    const void* flag_addr = &h->freed;
+
+    if constexpr (P::use_mpi_win_dynamic) {
+      return reinterpret_cast<uintptr_t>(flag_addr);
+    } else {
+      return (reinterpret_cast<uintptr_t>(flag_addr) - global_base_addr_) % local_max_size_;
+    }
+  }
+
   // FIXME: workaround for boost
   // Ideally: pmr::pool_options{.max_blocks_per_chunk = (std::size_t)16 * 1024 * 1024 * 1024}
   pmr::pool_options my_pool_options() {
@@ -282,12 +332,16 @@ class std_pool_resource_impl {
 
 public:
   std_pool_resource_impl(const topology& topo,
+                         std::size_t     global_base_addr,
                          std::size_t     local_base_addr,
                          std::size_t     local_max_size,
                          MPI_Win         win) :
     topo_(topo),
+    global_base_addr_(global_base_addr),
+    local_base_addr_(local_base_addr),
+    local_max_size_(local_max_size),
     win_(win),
-    win_mr_(topo, local_base_addr, local_max_size, win),
+    win_mr_(topo, local_base_addr_, local_max_size_, win),
     block_mr_(&win_mr_, std::size_t(get_env("PCAS_ALLOCATOR_BLOCK_SIZE", 2, topo_.global_rank())) * 1024 * 1024),
     mr_(my_pool_options(), &block_mr_),
     max_unflushed_free_objs_(get_env("PCAS_ALLOCATOR_MAX_UNFLUSHED_FREE_OBJS", 10, topo_.global_rank())) {}
@@ -329,17 +383,13 @@ public:
   void remote_deallocate(void* p, std::size_t bytes [[maybe_unused]], int target_rank, std::size_t alignment) {
     PCAS_CHECK(topo_.global_rank() != target_rank);
 
-    std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
-    header* h = reinterpret_cast<header*>(reinterpret_cast<std::byte*>(p) - n_pad * alignment);
-    void* flag_addr = &h->freed;
-
     static constexpr int one = 1;
     static int ret; // dummy value; passing NULL to result_addr causes segfault on some MPI
     MPI_Fetch_and_op(&one,
                      &ret,
                      MPI_INT,
                      target_rank,
-                     reinterpret_cast<std::size_t>(flag_addr),
+                     get_header_disp(p, alignment),
                      MPI_REPLACE,
                      win_);
 
@@ -376,6 +426,7 @@ public:
 // -----------------------------------------------------------------------------
 
 struct allocator_policy_default {
+  constexpr static bool use_mpi_win_dynamic = true;
   constexpr static std::size_t block_size = 65536;
   using logger = logger::logger_if<logger::policy_default>;
   template <typename P>
