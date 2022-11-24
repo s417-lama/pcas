@@ -79,6 +79,8 @@ public:
   void* map(void* addr, std::size_t offset, std::size_t size) const {
     PCAS_CHECK(offset + size <= size_);
     int flags = MAP_SHARED;
+    // MAP_FIXED_NOREPLACE is never set here, as this map method is used to
+    // map to physical memory a given virtual address, which is already reserved by mmap.
     if (addr != nullptr) flags |= MAP_FIXED;
     void* ret = mmap(addr, size, PROT_READ | PROT_WRITE, flags, fd_, offset);
     if (ret == MAP_FAILED) {

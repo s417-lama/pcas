@@ -12,6 +12,8 @@
 
 namespace pcas {
 
+class mmap_noreplace_exception : public std::exception {};
+
 class virtual_mem {
   void* addr_ = nullptr;
   std::size_t size_;
@@ -19,7 +21,7 @@ class virtual_mem {
 public:
   virtual_mem() {}
   virtual_mem(void* addr, std::size_t size, std::size_t alignment = alignof(max_align_t)) :
-    addr_(mmap_no_physical_mem(addr, size, alignment)), size_(size) {}
+    addr_(mmap_no_physical_mem(addr, size, false, alignment)), size_(size) {}
 
   ~virtual_mem() {
     if (addr_) {
@@ -55,7 +57,10 @@ public:
   }
 
   // TODO: reconsider this abstraction...
-  static void* mmap_no_physical_mem(void* addr, std::size_t size, std::size_t alignment = alignof(max_align_t)) {
+  static void* mmap_no_physical_mem(void*       addr,
+                                    std::size_t size,
+                                    bool        replace   = true,
+                                    std::size_t alignment = alignof(max_align_t)) {
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 
     std::size_t reqsize;
@@ -64,13 +69,22 @@ public:
     } else {
       PCAS_CHECK(reinterpret_cast<uintptr_t>(addr) % alignment == 0);
       reqsize = size;
-      flags |= MAP_FIXED;
+      if (!replace) {
+        flags |= MAP_FIXED_NOREPLACE;
+      } else {
+        flags |= MAP_FIXED;
+      }
     }
 
     void* allocated_p = mmap(addr, reqsize, PROT_NONE, flags, -1, 0);
     if (allocated_p == MAP_FAILED) {
-      perror("mmap");
-      die("[pcas::virtual_mem] mmap(%p, %lu, ...) failed", addr, reqsize);
+      if (errno == EEXIST) {
+        // MAP_FIXED_NOREPLACE error
+        throw mmap_noreplace_exception{};
+      } else {
+        perror("mmap");
+        die("[pcas::virtual_mem] mmap(%p, %lu, ...) failed", addr, reqsize);
+      }
     }
 
     if (addr == nullptr) {
@@ -137,22 +151,47 @@ virtual_mem reserve_same_vm_coll(MPI_Comm comm, std::size_t size, std::size_t al
   int rank;
   MPI_Comm_rank(comm, &rank);
 
-  std::size_t vm_addr;
+  uintptr_t vm_addr;
   virtual_mem vm;
 
-  if (rank == 0) {
-    vm = virtual_mem(nullptr, size, alignment);
-    vm_addr = reinterpret_cast<std::size_t>(vm.addr());
+  std::vector<virtual_mem> prev_vms;
+  int max_trial = 100;
+
+  // Repeat until the same virtual memory address is allocated
+  // TODO: smarter allocation using `pmap` result?
+  for (int n_trial = 0; n_trial <= max_trial; n_trial++) {
+    if (rank == 0) {
+      vm = virtual_mem(nullptr, size, alignment);
+      vm_addr = reinterpret_cast<uintptr_t>(vm.addr());
+    }
+
+    MPI_Bcast(&vm_addr, 1, MPI_UINT64_T, 0, comm);
+
+    int status = 0; // 0: OK, 1: failed
+    if (rank != 0) {
+      try {
+        vm = virtual_mem(reinterpret_cast<void*>(vm_addr), size, alignment);
+      } catch (mmap_noreplace_exception& e) {
+        status = 1;
+      }
+    }
+
+    int status_all = 0;
+    MPI_Allreduce(&status, &status_all, 1, MPI_INT, MPI_SUM, comm);
+
+    if (status_all == 0) {
+      // prev_vms are automatically freed
+      return vm;
+    }
+
+    if (status == 0) {
+      // Defer the deallocation of previous virtual addresses to prevent
+      // the same address from being allocated next
+      prev_vms.push_back(std::move(vm));
+    }
   }
 
-  MPI_Bcast(&vm_addr, 1, MPI_UINT64_T, 0, comm);
-
-  // FIXME: the virtual address allocated on rank 0 might not be available on different processes
-  if (rank != 0) {
-    vm = virtual_mem(reinterpret_cast<void*>(vm_addr), size, alignment);
-  }
-
-  return vm;
+  die("Reservation of virtual memory address failed (max_trial=%d)", max_trial);
 }
 
 }
