@@ -144,6 +144,7 @@ private:
         PCAS_CHECK(req == MPI_REQUEST_NULL);
       }
       PCAS_CHECK(dirty_sections.empty());
+      PCAS_CHECK(!flushing);
       partial_sections.clear();
       cstate = cache_state::invalid;
       PCAS_CHECK(is_evictable());
@@ -507,7 +508,8 @@ private:
     cache_dirty_ = true;
 
     if constexpr (P::enable_write_through) {
-      flush_dirty_cache_block(cb);
+      ensure_all_cache_clean();
+
     } else if (dirty_cache_blocks_.size() >= max_dirty_cache_blocks_) {
       auto ev = logger::template record<logger_kind::FlushEarly>();
       flush_dirty_cache();
