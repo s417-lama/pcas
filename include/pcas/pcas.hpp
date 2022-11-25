@@ -336,6 +336,11 @@ private:
   std::vector<bool> flushing_flags_;
   bool early_flushing_ = false;
 
+  // When the number of dirty cache blocks reaches max_dirty_cache_blocks_, we start to
+  // flush dirty sections to their home and forget which blocks were dirty. At the same time,
+  // early_flushing_ is set to true and dirty_cache_blocks_ is cleared.
+  // Otherwise, dirty_cache_blocks_ is not cleared when we start to flush and reuse it
+  // when completing flush to avoid iterating over all cache entries.
   uint64_t max_dirty_cache_blocks_;
   std::vector<cache_block*> dirty_cache_blocks_;
 
@@ -535,6 +540,8 @@ private:
     }
 
     cb.dirty_sections.clear();
+
+    PCAS_CHECK(!cb.flushing);
     cb.flushing = true;
 
     flushing_flags_[cb.mem_obj_id] = true;
@@ -572,7 +579,9 @@ private:
         // We can reduce the number of iterations if early flush did not happen
         for (auto& cb : dirty_cache_blocks_) {
           cb->flushing = false;
+          PCAS_CHECK(cb->dirty_sections.empty());
         }
+        dirty_cache_blocks_.clear();
       }
 
       for (auto win : flushing_wins) {
@@ -586,8 +595,6 @@ private:
   void ensure_all_cache_clean() {
     flush_dirty_cache();
     complete_flush();
-
-    dirty_cache_blocks_.clear();
 
     if (cache_dirty_) {
       cache_dirty_ = false;
@@ -1398,6 +1405,7 @@ inline bool pcas_if<P>::checkout_impl_tlb(const void* ptr, std::size_t size) {
       if constexpr (Mode != access_mode::read) {
         if (cb.flushing) {
           auto ev2 = logger::template record<logger_kind::FlushConflicted>();
+          PCAS_CHECK(early_flushing_);
           complete_flush();
         }
       }
@@ -1505,6 +1513,7 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
             // As overlapping MPI_Put calls for the same location will cause undefined behaviour,
             // we need to insert MPI_Win_flush between overlapping MPI_Put calls here.
             auto ev2 = logger::template record<logger_kind::FlushConflicted>();
+            PCAS_CHECK(early_flushing_);
             complete_flush();
           }
         }
@@ -1598,6 +1607,7 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
     if constexpr (Mode != access_mode::read) {
       if (cb.flushing) {
         auto ev2 = logger::template record<logger_kind::FlushConflicted>();
+        PCAS_CHECK(early_flushing_);
         complete_flush();
       }
     }

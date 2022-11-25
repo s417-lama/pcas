@@ -192,6 +192,7 @@ virtual_mem reserve_same_vm_coll(MPI_Comm comm, std::size_t size, std::size_t al
   }
 
   die("Reservation of virtual memory address failed (max_trial=%d)", max_trial);
+  throw;
 }
 
 }
