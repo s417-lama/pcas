@@ -47,6 +47,7 @@ struct policy_default {
   template <std::size_t BlockSize>
   using default_mem_mapper = mem_mapper::cyclic<BlockSize>;
   constexpr static std::size_t block_size = 65536;
+  constexpr static std::size_t sub_block_size = 4096;
   constexpr static bool enable_write_through = false;
   constexpr static bool use_mpi_win_dynamic = true;
 };
@@ -114,37 +115,41 @@ private:
   };
 
   struct cache_block {
-    cache_entry_num_t entry_num      = std::numeric_limits<cache_entry_num_t>::max();
-    cache_state       cstate         = cache_state::unmapped;
-    uint64_t          transaction_id = 0;
-    bool              mapped         = false;
-    bool              flushing       = false;
-    int               checkout_count = 0;
-    std::byte*        vm_addr        = nullptr;
-    std::byte*        prev_vm_addr   = nullptr;
-    topology::rank_t  owner          = -1;
-    std::size_t       pm_offset      = 0;
-    mem_obj_id_t      mem_obj_id     = 0;
-    MPI_Win           win            = MPI_WIN_NULL;
-    MPI_Request       req            = MPI_REQUEST_NULL;
-    sections          dirty_sections;
-    sections          partial_sections; // for write-only update
-    this_t&           outer;
+    cache_entry_num_t        entry_num      = std::numeric_limits<cache_entry_num_t>::max();
+    cache_state              cstate         = cache_state::unmapped;
+    uint64_t                 transaction_id = 0;
+    bool                     mapped         = false;
+    bool                     flushing       = false;
+    int                      checkout_count = 0;
+    std::byte*               vm_addr        = nullptr;
+    std::byte*               prev_vm_addr   = nullptr;
+    topology::rank_t         owner          = -1;
+    std::size_t              pm_offset      = 0;
+    mem_obj_id_t             mem_obj_id     = 0;
+    MPI_Win                  win            = MPI_WIN_NULL;
+    std::vector<MPI_Request> reqs;
+    sections                 dirty_sections;
+    sections                 partial_sections; // for write-only update
+    this_t&                  outer;
 
     cache_block(this_t& outer_ref) : outer(outer_ref) {}
 
     void invalidate() {
       if (cstate == cache_state::fetching) {
         // Only for prefetching blocks
-        PCAS_CHECK(req != MPI_REQUEST_NULL);
-        // FIXME: MPI_Cancel causes segfault
-        /* MPI_Cancel(&req); */
-        /* MPI_Request_free(&req); */
-        MPI_Wait(&req, MPI_STATUS_IGNORE);
-        PCAS_CHECK(req == MPI_REQUEST_NULL);
+        PCAS_CHECK(!reqs.empty());
+        for (auto&& req : reqs) {
+          // FIXME: MPI_Cancel causes segfault
+          /* MPI_Cancel(&req); */
+          /* MPI_Request_free(&req); */
+          MPI_Wait(&req, MPI_STATUS_IGNORE);
+          PCAS_CHECK(req == MPI_REQUEST_NULL);
+        }
+        reqs.clear();
       }
-      PCAS_CHECK(dirty_sections.empty());
       PCAS_CHECK(!flushing);
+      PCAS_CHECK(reqs.empty());
+      PCAS_CHECK(dirty_sections.empty());
       partial_sections.clear();
       cstate = cache_state::invalid;
       PCAS_CHECK(is_evictable());
@@ -470,19 +475,32 @@ private:
   // Cached data management
   // -----------------------------------------------------------------------------
 
-  bool needs_fetch(const cache_block& cb) {
-    return cb.partial_sections.empty() ||
-           *cb.partial_sections.begin() != section{0, block_size};
+  section pad_fetch_section(section s) {
+    static_assert(block_size >= sub_block_size);
+    static_assert(sub_block_size > 0);
+    static_assert(block_size % sub_block_size == 0);
+
+    return {s.first / sub_block_size * sub_block_size,
+            (s.second + sub_block_size - 1) / sub_block_size * sub_block_size};
   }
 
-  void fetch_begin(cache_block& cb) {
+  // return true if fetch is actually issued
+  bool fetch_begin(cache_block& cb, section s) {
     PCAS_CHECK(cb.owner < topo_.global_nproc());
 
+    if (!cb.partial_sections.empty() &&
+        *cb.partial_sections.begin() == section{0, block_size}) {
+      // fast path (the entire block is already fetched)
+      return false;
+    }
+
+    section s_pd = pad_fetch_section(s);
+
     std::byte* cache_block_ptr = reinterpret_cast<std::byte*>(cache_pm_.anon_vm_addr());
-    int count = 0;
+
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
-         sections_inverse(cb.partial_sections, {0, block_size})) {
+         sections_inverse(cb.partial_sections, s_pd)) {
       PCAS_CHECK(cb.entry_num < cache_.num_entries());
       MPI_Request req;
       MPI_Rget(cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
@@ -494,18 +512,16 @@ private:
                MPI_BYTE,
                cb.win,
                &req);
-      cb.cstate = cache_state::fetching;
-      // FIXME
-      if (count == 0) {
-        PCAS_CHECK(cb.req == MPI_REQUEST_NULL);
-        cb.req = req;
-      } else {
-        MPI_Wait(&req, MPI_STATUS_IGNORE);
-      }
-      count++;
+      cb.reqs.push_back(req);
     }
 
-    sections_insert(cb.partial_sections, {0, block_size}); // the entire cache block is now fetched
+    if (!cb.reqs.empty()) {
+      cb.cstate = cache_state::fetching;
+      sections_insert(cb.partial_sections, s_pd);
+      return true;
+    } else {
+      return false;
+    }
   }
 
   void add_dirty_cache_block(cache_block& cb) {
@@ -685,6 +701,7 @@ private:
 
 public:
   constexpr static std::size_t block_size = P::block_size;
+  constexpr static std::size_t sub_block_size = P::sub_block_size;
 
   pcas_if(std::size_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
 
@@ -1329,7 +1346,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, std::size_t nelems) {
 
           cb.transaction_id = transaction_id_;
 
-          fetch_begin(cb);
+          fetch_begin(cb, {0, block_size});
         }
       }
     });
@@ -1410,22 +1427,19 @@ inline bool pcas_if<P>::checkout_impl_tlb(const void* ptr, std::size_t size) {
         }
       }
 
+      section section_in_block = {raw_ptr - cb.vm_addr,
+                                  raw_ptr + size - cb.vm_addr};
+
       if constexpr (Mode == access_mode::write) {
-        std::size_t offset_in_block_b = raw_ptr - cb.vm_addr;
-        std::size_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
-        sections_insert(cb.partial_sections, {offset_in_block_b, offset_in_block_e});
-      }
+        sections_insert(cb.partial_sections, section_in_block);
 
-      if constexpr (Mode != access_mode::write) {
-        if (needs_fetch(cb)) {
-          // fetch the rest of the block
-          fetch_begin(cb);
-
+      } else {
+        if (fetch_begin(cb, section_in_block)) {
           // Immediately wait for communication completion here because it is a fast path;
           // i.e., there is only one cache block to be checked out.
-          PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
-          MPI_Wait(&cb.req, MPI_STATUS_IGNORE);
-          PCAS_CHECK(cb.req == MPI_REQUEST_NULL);
+          PCAS_CHECK(!cb.reqs.empty());
+          MPI_Waitall(cb.reqs.size(), cb.reqs.data(), MPI_STATUSES_IGNORE);
+          cb.reqs.clear();
 
           cb.cstate = cache_state::valid;
         }
@@ -1518,24 +1532,22 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
           }
         }
 
-        // If only a part of the block is written, we need to fetch the block
-        // when this block is checked out again with read access mode.
-        if constexpr (Mode == access_mode::write) {
-          std::size_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
-          std::size_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
-          sections_insert(cb.partial_sections, {offset_in_block_b, offset_in_block_e});
-        }
+        section section_in_block = {std::max(offset_b, o) - o,
+                                    std::min(offset_e - o, block_size)};
 
-        // Suppose that a cache block is represented as [a1, a2].
-        // If a1 is checked out with write-only access mode, then [a1, a2] is allocated a cache entry,
-        // but fetch for a1 and a2 is skipped.  Later, if a2 is checked out with read access mode,
-        // the data for a2 would not be fetched because it is already in the cache.
-        // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
-        // has been already fetched or not.
-        if constexpr (Mode != access_mode::write) {
-        if (needs_fetch(cb)) {
-            fetch_begin(cb);
-          }
+        if constexpr (Mode == access_mode::write) {
+          // If only a part of the block is written, we need to fetch the block
+          // when this block is checked out again with read access mode.
+          sections_insert(cb.partial_sections, section_in_block);
+
+        } else {
+          // Suppose that a cache block is represented as [a1, a2].
+          // If a1 is checked out with write-only access mode, then [a1, a2] is allocated a cache entry,
+          // but fetch for a1 and a2 is skipped.  Later, if a2 is checked out with read access mode,
+          // the data for a2 would not be fetched because it is already in the cache.
+          // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
+          // has been already fetched or not.
+          fetch_begin(cb, section_in_block);
         }
 
         bool is_prefetch = o >= offset_e;
@@ -1545,9 +1557,9 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
           }
 
           if (cb.cstate == cache_state::fetching) {
-            PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
-            reqs.push_back(cb.req);
-            cb.req = MPI_REQUEST_NULL;
+            PCAS_CHECK(!cb.reqs.empty());
+            reqs.insert(reqs.end(), cb.reqs.begin(), cb.reqs.end());
+            cb.reqs.clear();
           }
 
           cb.cstate = cache_state::valid;
@@ -1612,16 +1624,14 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
       }
     }
 
-    if constexpr (Mode == access_mode::write) {
-      std::size_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
-      std::size_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
-      sections_insert(cb.partial_sections, {offset_in_block_b, offset_in_block_e});
-    }
+    section section_in_block = {std::max(offset_b, o) - o,
+                                std::min(offset_e - o, block_size)};
 
-    if constexpr (Mode != access_mode::write) {
-      if (needs_fetch(cb)) {
-        fetch_begin(cb);
-      }
+    if constexpr (Mode == access_mode::write) {
+      sections_insert(cb.partial_sections, section_in_block);
+
+    } else {
+      fetch_begin(cb, section_in_block);
     }
 
     if constexpr (DoCheckout) {
@@ -1629,9 +1639,9 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
     }
 
     if (cb.cstate == cache_state::fetching) {
-      PCAS_CHECK(cb.req != MPI_REQUEST_NULL);
-      reqs.push_back(cb.req);
-      cb.req = MPI_REQUEST_NULL;
+      PCAS_CHECK(!cb.reqs.empty());
+      reqs.insert(reqs.end(), cb.reqs.begin(), cb.reqs.end());
+      cb.reqs.clear();
     }
 
     cb.cstate = cache_state::valid;
@@ -1709,9 +1719,9 @@ inline bool pcas_if<P>::checkin_impl_tlb(const void* ptr, std::size_t size) {
       if constexpr (Mode != access_mode::read) {
         bool is_new_dirty_block = cb.dirty_sections.empty();
 
-        std::size_t offset_in_block_b = raw_ptr - cb.vm_addr;
-        std::size_t offset_in_block_e = raw_ptr + size - cb.vm_addr;
-        sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+        section section_in_block = {raw_ptr - cb.vm_addr,
+                                    raw_ptr + size - cb.vm_addr};
+        sections_insert(cb.dirty_sections, section_in_block);
 
         if (is_new_dirty_block) {
           add_dirty_cache_block(cb);
@@ -1755,9 +1765,9 @@ inline void pcas_if<P>::checkin_impl_coll(const void* ptr, std::size_t size) {
         if constexpr (Mode != access_mode::read) {
           bool is_new_dirty_block = cb.dirty_sections.empty();
 
-          std::size_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
-          std::size_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
-          sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+          section section_in_block = {std::max(offset_b, o) - o,
+                                      std::min(offset_e - o, block_size)};
+          sections_insert(cb.dirty_sections, section_in_block);
 
           if (is_new_dirty_block) {
             add_dirty_cache_block(cb);
@@ -1795,9 +1805,9 @@ inline void pcas_if<P>::checkin_impl_local(const void* ptr, std::size_t size) {
     if constexpr (Mode != access_mode::read) {
       bool is_new_dirty_block = cb.dirty_sections.empty();
 
-      std::size_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
-      std::size_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
-      sections_insert(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+      section section_in_block = {std::max(offset_b, o) - o,
+                                  std::min(offset_e - o, block_size)};
+      sections_insert(cb.dirty_sections, section_in_block);
 
       if (is_new_dirty_block) {
         add_dirty_cache_block(cb);
