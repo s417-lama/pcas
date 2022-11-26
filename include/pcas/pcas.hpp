@@ -1101,7 +1101,8 @@ template <typename ConstT, typename T>
 inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std::size_t nelems) {
   static_assert(std::is_same_v<std::remove_const_t<ConstT>, T>,
                 "from_ptr must be of the same type as to_ptr ignoring const");
-  static_assert(std::is_trivially_copyable_v<T>, "get_nocache requires trivially copyable types");
+  // FIXME: currently disable this check to allow for nocache version experiments
+  /* static_assert(std::is_trivially_copyable_v<T>, "get_nocache requires trivially copyable types"); */
 
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
@@ -1174,7 +1175,8 @@ template <typename P>
 template <typename T>
 inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, std::size_t nelems) {
   static_assert(!std::is_const_v<T>, "to_ptr should not be const");
-  static_assert(std::is_trivially_copyable_v<T>, "put_nocache requires trivially copyable types");
+  // FIXME: currently disable this check to allow for nocache version experiments
+  /* static_assert(std::is_trivially_copyable_v<T>, "put_nocache requires trivially copyable types"); */
 
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Put>(size);
