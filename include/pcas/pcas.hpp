@@ -130,9 +130,9 @@ private:
     std::vector<MPI_Request> reqs;
     sections                 dirty_sections;
     sections                 partial_sections; // for write-only update
-    this_t&                  outer;
+    this_t*                  outer;
 
-    cache_block(this_t& outer_ref) : outer(outer_ref) {}
+    cache_block(this_t* outer_p) : outer(outer_p) {}
 
     void invalidate() {
       if (cstate == cache_state::fetching) {
@@ -170,7 +170,7 @@ private:
     /* Callback functions for cache_system class */
 
     bool is_evictable() const {
-      return checkout_count == 0 && transaction_id != outer.transaction_id_ &&
+      return checkout_count == 0 && transaction_id != outer->transaction_id_ &&
              !flushing && dirty_sections.empty();
     }
 
@@ -184,7 +184,7 @@ private:
       mapped = false;
 
       // for safety
-      outer.cache_tlb_.clear();
+      outer->cache_tlb_.clear();
     }
 
     void on_cache_map(cache_entry_num_t b) {
@@ -208,9 +208,9 @@ private:
     int                 checkout_count = 0;
     std::byte*          prev_vm_addr   = nullptr;
     bool                mapped         = false;
-    this_t&             outer;
+    this_t*             outer;
 
-    home_block(this_t& outer_ref) : outer(outer_ref) {}
+    home_block(this_t* outer_p) : outer(outer_p) {}
 
     void map() {
       pm->map(vm_addr, pm_offset, size);
@@ -227,7 +227,7 @@ private:
     /* Callback functions for cache_system class */
 
     bool is_evictable() const {
-      return checkout_count == 0 && transaction_id != outer.transaction_id_;
+      return checkout_count == 0 && transaction_id != outer->transaction_id_;
     }
 
     void on_evict() {
@@ -237,7 +237,7 @@ private:
       mapped = false;
 
       // for safety
-      outer.home_tlb_.clear();
+      outer->home_tlb_.clear();
     }
 
     void on_cache_map(cache_entry_num_t b) {
@@ -769,8 +769,8 @@ inline pcas_if<P>::pcas_if(std::size_t cache_size, MPI_Comm comm)
   : validate_dummy_(validate_input(cache_size, comm)),
     topo_(comm),
     mem_objs_(1), // mem_obj_id = 0 should be empty
-    mmap_cache_(calc_home_mmap_limit(cache_size / block_size), *this),
-    cache_(cache_size / block_size, *this),
+    mmap_cache_(calc_home_mmap_limit(cache_size / block_size), home_block(this)),
+    cache_(cache_size / block_size, cache_block(this)),
     cache_pm_(cache_shmem_name(rank()), cache_size, true, true),
     allocator_(topo_),
     rm_(comm),

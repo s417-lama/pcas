@@ -27,14 +27,14 @@ class cache_system {
     cache_entry_num_t                               entry_num = std::numeric_limits<cache_entry_num_t>::max();
     typename std::list<cache_entry_num_t>::iterator lru_it;
 
-    template <typename... Args>
-    cache_entry(Args&&... args) : entry(std::forward<Args>(args)...) {}
+    cache_entry(const Entry& e) : entry(e) {}
   };
 
   cache_entry_num_t                          nentries_;
   std::vector<cache_entry>                   entries_; // cache_entry_num_t -> cache_entry
   std::unordered_map<Key, cache_entry_num_t> table_; // hash table (Key -> cache_entry_num_t)
   std::list<cache_entry_num_t>               lru_; // front (oldest) <----> back (newest)
+  Entry                                      entry_init_;
 
   void move_to_back_lru(cache_entry& cb) {
     lru_.splice(lru_.end(), lru_, cb.lru_it);
@@ -62,12 +62,12 @@ class cache_system {
   }
 
 public:
-  template <typename... Args>
-  cache_system(cache_entry_num_t nentries, Args&&... args)
-    : nentries_(nentries) {
+  cache_system(cache_entry_num_t nentries) : cache_system(nentries, Entry{}) {}
+  cache_system(cache_entry_num_t nentries, const Entry& e)
+    : nentries_(nentries), entry_init_(e) {
     table_.reserve(nentries_);
     for (cache_entry_num_t b = 0; b < nentries_; b++) {
-      cache_entry& cb = entries_.emplace_back(std::forward<Args>(args)...);
+      cache_entry& cb = entries_.emplace_back(e);
       cb.allocated = false;
       cb.entry_num = b;
       lru_.push_front(b);
@@ -115,6 +115,8 @@ public:
       cache_entry& cb = entries_[b];
       PCAS_CHECK(cb.entry.is_evictable());
       cb.entry.on_evict();
+      cb.key = {};
+      cb.entry = entry_init_;
       table_.erase(key);
       cb.allocated = false;
     }
