@@ -135,6 +135,40 @@ PCAS_TEST_CASE("[pcas::util] next_pow2") {
   PCAS_CHECK(next_pow2((uint64_t(1) << 38) - 100) == uint64_t(1) << 38);
 }
 
+template <typename T>
+constexpr inline bool is_pow2(T x) {
+  return !(x & (x - 1));
+}
+
+template <typename T>
+constexpr inline T round_down_pow2(T x, T alignment) {
+  PCAS_CHECK(is_pow2(alignment));
+  return x & ~(alignment - 1);
+}
+
+template <typename T>
+constexpr inline T round_up_pow2(T x, T alignment) {
+  PCAS_CHECK(is_pow2(alignment));
+  return (x + alignment - 1) & ~(alignment - 1);
+}
+
+PCAS_TEST_CASE("[pcas::util] round up/down for integers") {
+  PCAS_CHECK(is_pow2(128));
+  PCAS_CHECK(!is_pow2(129));
+  PCAS_CHECK(round_down_pow2(1100, 128) == 1024);
+  PCAS_CHECK(round_down_pow2(128, 128) == 128);
+  PCAS_CHECK(round_down_pow2(129, 128) == 128);
+  PCAS_CHECK(round_down_pow2(255, 128) == 128);
+  PCAS_CHECK(round_down_pow2(73, 128) == 0);
+  PCAS_CHECK(round_down_pow2(0, 128) == 0);
+  PCAS_CHECK(round_up_pow2(1100, 128) == 1152);
+  PCAS_CHECK(round_up_pow2(128, 128) == 128);
+  PCAS_CHECK(round_up_pow2(129, 128) == 256);
+  PCAS_CHECK(round_up_pow2(255, 128) == 256);
+  PCAS_CHECK(round_up_pow2(73, 128) == 128);
+  PCAS_CHECK(round_up_pow2(0, 128) == 0);
+}
+
 class win_manager {
   MPI_Win win_ = MPI_WIN_NULL;
 public:

@@ -178,7 +178,7 @@ public:
     }
 
     // Align with block size
-    std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
+    std::size_t real_bytes = round_up_pow2(bytes, P::block_size);
 
     // FIXME: assumption that freelist returns block-aligned address
     auto s = freelist_get(freelist_, real_bytes);
@@ -198,7 +198,7 @@ public:
   }
 
   void do_deallocate(void* p, std::size_t bytes, [[maybe_unused]] std::size_t alignment) override {
-    std::size_t real_bytes = (bytes + P::block_size - 1) / P::block_size * P::block_size;
+    std::size_t real_bytes = round_up_pow2(bytes, P::block_size);
     span s {reinterpret_cast<std::size_t>(p), real_bytes};
 
     PCAS_CHECK(reinterpret_cast<std::size_t>(p) % P::block_size == 0);
@@ -248,7 +248,7 @@ public:
     }
     PCAS_CHECK(s->size == real_bytes);
 
-    auto addr = (s->addr + alignment - 1) / alignment * alignment;
+    auto addr = round_up_pow2(s->addr, alignment);
 
     PCAS_CHECK(addr >= s->addr);
     PCAS_CHECK(s->addr + s->size >= addr + bytes);
@@ -311,8 +311,8 @@ class std_pool_resource_impl {
   }
 
   std::size_t get_header_disp(const void* p, std::size_t alignment) const {
-    std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
-    auto h = reinterpret_cast<const header*>(reinterpret_cast<const std::byte*>(p) - n_pad * alignment);
+    std::size_t pad_bytes = round_up_pow2(sizeof(header), alignment);
+    auto h = reinterpret_cast<const header*>(reinterpret_cast<const std::byte*>(p) - pad_bytes);
     const void* flag_addr = &h->freed;
 
     if constexpr (P::use_mpi_win_dynamic) {
@@ -349,11 +349,11 @@ public:
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
     auto ev = logger::template record<logger_kind::MemAlloc>(bytes);
 
-    std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
-    std::size_t real_bytes = bytes + n_pad * alignment;
+    std::size_t pad_bytes = round_up_pow2(sizeof(header), alignment);
+    std::size_t real_bytes = bytes + pad_bytes;
 
     std::byte* p = reinterpret_cast<std::byte*>(mr_.allocate(real_bytes, alignment));
-    std::byte* ret = p + n_pad * alignment;
+    std::byte* ret = p + pad_bytes;
 
     PCAS_CHECK(ret + bytes <= p + real_bytes);
     PCAS_CHECK(p + sizeof(header) <= ret);
@@ -371,10 +371,10 @@ public:
   void do_deallocate(void* p, std::size_t bytes, [[maybe_unused]] std::size_t alignment) {
     auto ev = logger::template record<logger_kind::MemFree>(bytes);
 
-    std::size_t n_pad = (sizeof(header) + alignment - 1) / alignment;
-    std::size_t real_bytes = bytes + n_pad * alignment;
+    std::size_t pad_bytes = round_up_pow2(sizeof(header), alignment);
+    std::size_t real_bytes = bytes + pad_bytes;
 
-    header* h = reinterpret_cast<header*>(reinterpret_cast<std::byte*>(p) - n_pad * alignment);
+    header* h = reinterpret_cast<header*>(reinterpret_cast<std::byte*>(p) - pad_bytes);
     remove_header_from_list(h);
 
     mr_.deallocate(h, real_bytes, alignment);

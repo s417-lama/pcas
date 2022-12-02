@@ -89,7 +89,7 @@ public:
 
     if (addr == nullptr) {
       uintptr_t allocated_addr = reinterpret_cast<uintptr_t>(allocated_p);
-      uintptr_t ret_addr = (allocated_addr + alignment - 1) / alignment * alignment;
+      uintptr_t ret_addr = round_up_pow2(allocated_addr, alignment);
       std::byte* ret_p = reinterpret_cast<std::byte*>(ret_addr);
 
       PCAS_CHECK(ret_addr >= allocated_addr);

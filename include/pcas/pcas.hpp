@@ -47,7 +47,6 @@ struct policy_default {
   template <std::size_t BlockSize>
   using default_mem_mapper = mem_mapper::cyclic<BlockSize>;
   constexpr static std::size_t block_size = 65536;
-  constexpr static std::size_t sub_block_size = 4096;
   constexpr static bool enable_write_through = false;
   constexpr static bool use_mpi_win_dynamic = true;
 };
@@ -316,6 +315,8 @@ private:
 
   bool validate_dummy_; // for initialization
 
+  const std::size_t sub_block_size_;
+
   topology topo_;
 
   std::vector<std::optional<mem_obj>> mem_objs_;
@@ -355,7 +356,7 @@ private:
   // Initializaiton
   // -----------------------------------------------------------------------------
 
-  bool validate_input(std::size_t cache_size, MPI_Comm comm) const {
+  bool validate_input(std::size_t cache_size, std::size_t sub_block_size, MPI_Comm comm) const {
     int mpi_initialized = 0;
     MPI_Initialized(&mpi_initialized);
     if (!mpi_initialized) {
@@ -369,6 +370,14 @@ private:
 
     if (cache_size % block_size != 0) {
       die("The cache size (%ld) must be a multiple of the block size (%ld).", cache_size, block_size);
+    }
+
+    if (sub_block_size == 0 || !is_pow2(sub_block_size)) {
+      die("The sub block size (%ld) must be a power of two (> 0).", sub_block_size);
+    }
+
+    if (sub_block_size > block_size) {
+      die("The sub block size (%ld) cannot exceed the block size (%ld).", sub_block_size, block_size);
     }
 
     if (comm == MPI_COMM_NULL) {
@@ -476,12 +485,8 @@ private:
   // -----------------------------------------------------------------------------
 
   section pad_fetch_section(section s) {
-    static_assert(block_size >= sub_block_size);
-    static_assert(sub_block_size > 0);
-    static_assert(block_size % sub_block_size == 0);
-
-    return {s.first / sub_block_size * sub_block_size,
-            (s.second + sub_block_size - 1) / sub_block_size * sub_block_size};
+    return {round_down_pow2(s.first, uint32_t(sub_block_size_)),
+            round_up_pow2(s.second, uint32_t(sub_block_size_))};
   }
 
   // return true if fetch is actually issued
@@ -701,9 +706,10 @@ private:
 
 public:
   constexpr static std::size_t block_size = P::block_size;
-  constexpr static std::size_t sub_block_size = P::sub_block_size;
 
-  pcas_if(std::size_t cache_size = 1024 * block_size, MPI_Comm comm = MPI_COMM_WORLD);
+  pcas_if(std::size_t cache_size     = 1024 * block_size,
+          std::size_t sub_block_size = block_size,
+          MPI_Comm comm              = MPI_COMM_WORLD);
 
   topology::rank_t rank() const { return topo_.global_rank(); }
   topology::rank_t nproc() const { return topo_.global_nproc(); }
@@ -765,8 +771,9 @@ public:
 };
 
 template <typename P>
-inline pcas_if<P>::pcas_if(std::size_t cache_size, MPI_Comm comm)
-  : validate_dummy_(validate_input(cache_size, comm)),
+inline pcas_if<P>::pcas_if(std::size_t cache_size, std::size_t sub_block_size, MPI_Comm comm)
+  : validate_dummy_(validate_input(cache_size, sub_block_size, comm)),
+    sub_block_size_(sub_block_size),
     topo_(comm),
     mem_objs_(1), // mem_obj_id = 0 should be empty
     mmap_cache_(calc_home_mmap_limit(cache_size / block_size), home_block(this)),
@@ -860,7 +867,7 @@ inline void pcas_if<P>::free(global_ptr<T> ptr, std::size_t nelems) {
       const std::size_t offset_b = reinterpret_cast<std::size_t>(raw_ptr);
       const std::size_t offset_e = offset_b + size;
 
-      const std::size_t block_offset_b = offset_b / block_size * block_size;
+      const std::size_t block_offset_b = round_down_pow2(offset_b, block_size);
       const std::size_t block_offset_e = offset_e;
       for (std::size_t o = block_offset_b; o < block_offset_e; o += block_size) {
         std::byte* vm_addr = reinterpret_cast<std::byte*>(o);
@@ -872,9 +879,10 @@ inline void pcas_if<P>::free(global_ptr<T> ptr, std::size_t nelems) {
             complete_flush();
           }
 
-          std::size_t offset_in_block_b = (offset_b > o) ? offset_b - o : 0;
-          std::size_t offset_in_block_e = (offset_e < o + block_size) ? offset_e - o : block_size;
-          sections_remove(cb.dirty_sections, {offset_in_block_b, offset_in_block_e});
+          section section_in_block = {std::max(offset_b, o) - o,
+                                      std::min(offset_e - o, block_size)};
+
+          sections_remove(cb.dirty_sections, section_in_block);
         }
       }
 
@@ -1329,7 +1337,7 @@ inline void pcas_if<P>::willread(global_ptr<T> ptr, std::size_t nelems) {
   try {
     for_each_mem_block(mo, raw_ptr, size, [&](const auto& bi) {
       if (!mo.is_locally_accessible(bi.owner)) {
-        const std::size_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+        const std::size_t block_offset_b = std::max(bi.offset_b, round_down_pow2(offset_b, block_size));
         const std::size_t block_offset_e = std::min(bi.offset_e, offset_e);
         for (std::size_t o = block_offset_b; o < block_offset_e; o += block_size) {
           std::byte* vm_addr = reinterpret_cast<std::byte*>(mo.vm().addr()) + o;
@@ -1503,7 +1511,7 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
       }
     } else {
       // for each cache block
-      const std::size_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+      const std::size_t block_offset_b = std::max(bi.offset_b, round_down_pow2(offset_b, block_size));
       const std::size_t block_offset_e = std::min(bi.offset_e, offset_b + size_pf);
       for (std::size_t o = block_offset_b; o < block_offset_e; o += block_size) {
         std::byte* vm_addr = reinterpret_cast<std::byte*>(mo.vm().addr()) + o;
@@ -1600,7 +1608,7 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
 
   std::vector<MPI_Request> reqs;
 
-  const std::size_t block_offset_b = offset_b / block_size * block_size;
+  const std::size_t block_offset_b = round_down_pow2(offset_b, block_size);
   const std::size_t block_offset_e = offset_e;
   for (std::size_t o = block_offset_b; o < block_offset_e; o += block_size) {
     std::byte* vm_addr = reinterpret_cast<std::byte*>(o);
@@ -1758,7 +1766,7 @@ inline void pcas_if<P>::checkin_impl_coll(const void* ptr, std::size_t size) {
         hb.checkout_count--;
       }
     } else {
-      const std::size_t block_offset_b = std::max(bi.offset_b, offset_b / block_size * block_size);
+      const std::size_t block_offset_b = std::max(bi.offset_b, round_down_pow2(offset_b, block_size));
       const std::size_t block_offset_e = std::min(bi.offset_e, offset_e);
       for (std::size_t o = block_offset_b; o < block_offset_e; o += block_size) {
         std::byte* vm_addr = reinterpret_cast<std::byte*>(mo.vm().addr()) + o;
@@ -1798,7 +1806,7 @@ inline void pcas_if<P>::checkin_impl_local(const void* ptr, std::size_t size) {
   const std::size_t offset_b = reinterpret_cast<std::size_t>(ptr);
   const std::size_t offset_e = offset_b + size;
 
-  const std::size_t block_offset_b = offset_b / block_size * block_size;
+  const std::size_t block_offset_b = round_down_pow2(offset_b, block_size);
   const std::size_t block_offset_e = offset_e;
   for (std::size_t o = block_offset_b; o < block_offset_e; o += block_size) {
     std::byte* vm_addr = reinterpret_cast<std::byte*>(o);
