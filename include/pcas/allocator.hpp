@@ -32,15 +32,8 @@ class allocator_if final : public pmr::memory_resource {
 protected:
   const topology& topo_;
 
-  // FIXME: make them configurable
-  static constexpr std::size_t global_max_size_ = std::size_t(1) << 44;
-  static constexpr std::size_t global_base_addr_ = 0x100000000000;
-
-  static_assert(global_base_addr_ % P::block_size == 0);
-  static_assert(global_max_size_ % P::block_size == 0);
-
   const std::size_t local_max_size_;
-  const std::size_t local_base_addr_;
+  const std::size_t global_max_size_;
 
   virtual_mem vm_;
   physical_mem pm_;
@@ -50,7 +43,7 @@ protected:
   typename P::template allocator_impl_t<P> allocator_;
 
   std::size_t get_local_max_size() const {
-    std::size_t upper_limit = global_max_size_ / next_pow2(topo_.global_nproc());
+    std::size_t upper_limit = (std::size_t(1) << 44) / next_pow2(topo_.global_nproc());
     std::size_t default_local_size;
     if constexpr (P::use_mpi_win_dynamic) {
       default_local_size = upper_limit;
@@ -82,7 +75,6 @@ protected:
       pm = physical_mem(allocator_shmem_name(topo_.inter_rank()), global_max_size_, false, false);
     }
 
-    PCAS_CHECK(vm_.addr() == reinterpret_cast<void*>(global_base_addr_));
     PCAS_CHECK(vm_.size() == global_max_size_);
     pm.map(vm_.addr(), 0, vm_.size());
 
@@ -93,7 +85,8 @@ protected:
     if constexpr (P::use_mpi_win_dynamic) {
       return win_manager{topo_.global_comm()};
     } else {
-      return win_manager{topo_.global_comm(), reinterpret_cast<void*>(local_base_addr_), local_max_size_};
+      auto local_base_addr = reinterpret_cast<std::byte*>(vm_.addr()) + local_max_size_ * topo_.global_rank();
+      return win_manager{topo_.global_comm(), local_base_addr, local_max_size_};
     }
   }
 
@@ -101,28 +94,27 @@ public:
   allocator_if(const topology& topo) :
     topo_(topo),
     local_max_size_(get_local_max_size()),
-    local_base_addr_(global_base_addr_ + local_max_size_ * topo_.global_rank()),
-    vm_(reinterpret_cast<void*>(global_base_addr_), global_max_size_),
+    global_max_size_(local_max_size_ * topo_.global_nproc()),
+    vm_(reserve_same_vm_coll(topo.global_comm(), global_max_size_, local_max_size_)),
     pm_(init_pm()),
     win_(create_win()),
-    allocator_(topo_, global_base_addr_, local_base_addr_, local_max_size_, win_.win()) {}
+    allocator_(topo_, vm_, win_.win()) {}
 
   MPI_Win win() const { return win_.win(); }
 
-  static bool belongs_to(const void* p) {
-    return global_base_addr_ <= reinterpret_cast<uintptr_t>(p) &&
-           reinterpret_cast<uintptr_t>(p) < global_base_addr_ + global_max_size_;
+  bool belongs_to(const void* p) {
+    return vm_.addr() <= p && p < reinterpret_cast<std::byte*>(vm_.addr()) + global_max_size_;
   }
 
   topology::rank_t get_owner(const void* p) const {
-    return (reinterpret_cast<uintptr_t>(p) - global_base_addr_) / local_max_size_;
+    return (reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(vm_.addr())) / local_max_size_;
   }
 
   std::size_t get_disp(const void* p) const {
     if constexpr (P::use_mpi_win_dynamic) {
       return reinterpret_cast<uintptr_t>(p);
     } else {
-      return (reinterpret_cast<uintptr_t>(p) - global_base_addr_) % local_max_size_;
+      return (reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(vm_.addr())) % local_max_size_;
     }
   }
 
@@ -155,20 +147,20 @@ public:
 template <typename P>
 class mpi_win_resource final : public pmr::memory_resource {
   const topology&   topo_;
-  const std::size_t local_base_addr_;
   const std::size_t local_max_size_;
+  const std::size_t local_base_addr_;
   const MPI_Win     win_;
 
   std::list<span> freelist_;
 
 public:
   mpi_win_resource(const topology& topo,
-                   std::size_t     local_base_addr,
                    std::size_t     local_max_size,
+                   std::size_t     local_base_addr,
                    MPI_Win         win) :
     topo_(topo),
-    local_base_addr_(local_base_addr),
     local_max_size_(local_max_size),
+    local_base_addr_(local_base_addr),
     win_(win),
     freelist_(1, {local_base_addr, local_max_size}) {}
 
@@ -275,9 +267,9 @@ public:
 template <typename P>
 class std_pool_resource_impl {
   const topology&                   topo_;
-  const std::size_t                 global_base_addr_;
-  const std::size_t                 local_base_addr_;
+  const virtual_mem&                vm_;
   const std::size_t                 local_max_size_;
+  const std::size_t                 local_base_addr_;
   MPI_Win                           win_;
   mpi_win_resource<P>               win_mr_;
   block_resource                    block_mr_;
@@ -318,7 +310,7 @@ class std_pool_resource_impl {
     if constexpr (P::use_mpi_win_dynamic) {
       return reinterpret_cast<uintptr_t>(flag_addr);
     } else {
-      return (reinterpret_cast<uintptr_t>(flag_addr) - global_base_addr_) % local_max_size_;
+      return (reinterpret_cast<uintptr_t>(flag_addr) - reinterpret_cast<uintptr_t>(vm_.addr())) % local_max_size_;
     }
   }
 
@@ -331,17 +323,15 @@ class std_pool_resource_impl {
   }
 
 public:
-  std_pool_resource_impl(const topology& topo,
-                         std::size_t     global_base_addr,
-                         std::size_t     local_base_addr,
-                         std::size_t     local_max_size,
-                         MPI_Win         win) :
+  std_pool_resource_impl(const topology&    topo,
+                         const virtual_mem& vm,
+                         MPI_Win            win) :
     topo_(topo),
-    global_base_addr_(global_base_addr),
-    local_base_addr_(local_base_addr),
-    local_max_size_(local_max_size),
+    vm_(vm),
+    local_max_size_(vm_.size() / topo_.global_nproc()),
+    local_base_addr_(reinterpret_cast<uintptr_t>(vm_.addr()) + local_max_size_ * topo_.global_rank()),
     win_(win),
-    win_mr_(topo, local_base_addr_, local_max_size_, win),
+    win_mr_(topo, local_max_size_, local_base_addr_, win),
     block_mr_(&win_mr_, std::size_t(get_env("PCAS_ALLOCATOR_BLOCK_SIZE", 2, topo_.global_rank())) * 1024 * 1024),
     mr_(my_pool_options(), &block_mr_),
     max_unflushed_free_objs_(get_env("PCAS_ALLOCATOR_MAX_UNFLUSHED_FREE_OBJS", 10, topo_.global_rank())) {}

@@ -851,7 +851,7 @@ inline void pcas_if<P>::free(global_ptr<T> ptr, std::size_t nelems) {
 
   std::byte* raw_ptr = reinterpret_cast<std::byte*>(ptr.raw_ptr());
 
-  if (allocator::belongs_to(raw_ptr)) { // local memory object
+  if (allocator_.belongs_to(raw_ptr)) { // local memory object
     if (nelems == 0) {
       die("Please specify the number of elements (nelems) when freeing local memory objects.");
     }
@@ -1119,7 +1119,7 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
 
   const void* raw_ptr = from_ptr.raw_ptr();
 
-  if (allocator::belongs_to(raw_ptr)) {
+  if (allocator_.belongs_to(raw_ptr)) {
     const topology::rank_t target_rank = allocator_.get_owner(raw_ptr);
     PCAS_CHECK(0 <= target_rank);
     PCAS_CHECK(target_rank < nproc());
@@ -1191,7 +1191,7 @@ inline void pcas_if<P>::put_nocache(const T* from_ptr, global_ptr<T> to_ptr, std
 
   void* raw_ptr = to_ptr.raw_ptr();
 
-  if (allocator::belongs_to(raw_ptr)) {
+  if (allocator_.belongs_to(raw_ptr)) {
     const topology::rank_t target_rank = allocator_.get_owner(raw_ptr);
     PCAS_CHECK(0 <= target_rank);
     PCAS_CHECK(target_rank < nproc());
@@ -1391,7 +1391,7 @@ inline void pcas_if<P>::checkout_impl(const void* ptr, std::size_t size) {
     return;
   }
 
-  if (allocator::belongs_to(ptr)) {
+  if (allocator_.belongs_to(ptr)) {
     checkout_impl_local<Mode, DoCheckout>(ptr, size);
   } else {
     checkout_impl_coll<Mode, DoCheckout>(ptr, size);
@@ -1688,7 +1688,7 @@ inline void pcas_if<P>::checkin_impl(const void* ptr, std::size_t size) {
     return;
   }
 
-  if (allocator::belongs_to(ptr)) {
+  if (allocator_.belongs_to(ptr)) {
     checkin_impl_local<Mode, DoCheckout>(ptr, size);
   } else {
     checkin_impl_coll<Mode, DoCheckout>(ptr, size);
