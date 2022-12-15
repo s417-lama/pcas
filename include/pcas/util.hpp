@@ -222,6 +222,65 @@ inline section<T> section_merge(section<T> s1, section<T> s2) {
 }
 
 template <typename T>
+inline bool section_overlap(section<T> s1, section<T> s2) {
+  return s1.first < s2.second && s1.second < s2.first;
+}
+
+template <typename T>
+inline bool section_contain(section<T> s1, section<T> s2) {
+  // true if s1 contains s2
+  return s1.first <= s2.first && s2.second <= s1.second;
+}
+
+template <typename T>
+inline bool sections_overlap(const sections<T>& ss, section<T> s) {
+  for (const auto& s_ : ss) {
+    if (s.second <= s_.first) break;
+    if (s.first < s_.second) return true;
+  }
+  return false;
+}
+
+PCAS_TEST_CASE("[pcas::util] sections overlap") {
+  sections<int> ss{{2, 5}, {6, 9}, {11, 20}, {50, 100}};
+  PCAS_CHECK(sections_overlap(ss, {2, 5}));
+  PCAS_CHECK(sections_overlap(ss, {11, 20}));
+  PCAS_CHECK(sections_overlap(ss, {50, 100}));
+  PCAS_CHECK(sections_overlap(ss, {0, 110}));
+  PCAS_CHECK(sections_overlap(ss, {4, 7}));
+  PCAS_CHECK(sections_overlap(ss, {10, 12}));
+  PCAS_CHECK(sections_overlap(ss, {9, 21}));
+  PCAS_CHECK(!sections_overlap(ss, {10, 11}));
+  PCAS_CHECK(!sections_overlap(ss, {0, 2}));
+  PCAS_CHECK(!sections_overlap(ss, {100, 1000}));
+  PCAS_CHECK(!sections_overlap(ss, {5, 5}));
+}
+
+template <typename T>
+inline bool sections_contain(const sections<T>& ss, section<T> s) {
+  for (const auto& s_ : ss) {
+    if (s.first < s_.first) break;
+    if (s.second <= s_.second) return true;
+  }
+  return false;
+}
+
+PCAS_TEST_CASE("[pcas::util] sections contain") {
+  sections<int> ss{{2, 5}, {6, 9}, {11, 20}, {50, 100}};
+  PCAS_CHECK(sections_contain(ss, {2, 5}));
+  PCAS_CHECK(sections_contain(ss, {3, 5}));
+  PCAS_CHECK(sections_contain(ss, {2, 4}));
+  PCAS_CHECK(sections_contain(ss, {3, 4}));
+  PCAS_CHECK(sections_contain(ss, {7, 9}));
+  PCAS_CHECK(sections_contain(ss, {50, 100}));
+  PCAS_CHECK(!sections_contain(ss, {9, 11}));
+  PCAS_CHECK(!sections_contain(ss, {3, 6}));
+  PCAS_CHECK(!sections_contain(ss, {7, 10}));
+  PCAS_CHECK(!sections_contain(ss, {2, 100}));
+  PCAS_CHECK(!sections_contain(ss, {0, 3}));
+}
+
+template <typename T>
 inline void sections_insert(sections<T>& ss, section<T> s) {
   auto it = ss.before_begin();
 

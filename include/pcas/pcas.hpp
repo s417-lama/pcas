@@ -19,6 +19,7 @@
 #include "pcas/allocator.hpp"
 #include "pcas/topology.hpp"
 #include "pcas/mem_obj.hpp"
+#include "pcas/whitelist.hpp"
 
 namespace pcas {
 
@@ -625,9 +626,19 @@ private:
     }
   }
 
-  void cache_invalidate_all() {
+  void cache_invalidate_all(const whitelist& wl) {
     cache_.for_each_entry([&](cache_block& cb) {
-      cb.invalidate();
+      // FIXME: this check is for prefetching
+      if (cb.cstate == cache_state::fetching) {
+        cb.invalidate();
+      } else if (cb.cstate == cache_state::valid) {
+        // When the whitelist does not cover the whole block,
+        // we conservatively invalidate the whole block.
+        // TODO: handling for overlapped case
+        if (!wl.contain(cb.vm_addr, block_size)) {
+          cb.invalidate();
+        }
+      }
     });
     cache_tlb_.clear();
   }
@@ -755,6 +766,8 @@ public:
   void release_lazy(release_handler* handler);
 
   void acquire(release_handler handler = {.rank = 0, .epoch = 0});
+
+  void acquire(const whitelist& wl, release_handler handler = {.rank = 0, .epoch = 0});
 
   void barrier();
 
@@ -2088,6 +2101,11 @@ inline void pcas_if<P>::release_lazy(release_handler* handler) {
 
 template <typename P>
 inline void pcas_if<P>::acquire(release_handler handler) {
+  acquire(whitelist{}, handler);
+}
+
+template <typename P>
+inline void pcas_if<P>::acquire(const whitelist& wl, release_handler handler) {
   auto ev = logger::template record<logger_kind::Acquire>();
   ensure_all_cache_clean();
 
@@ -2106,7 +2124,7 @@ inline void pcas_if<P>::acquire(release_handler handler) {
     }
   }
 
-  cache_invalidate_all();
+  cache_invalidate_all(wl);
 }
 
 template <typename P>
