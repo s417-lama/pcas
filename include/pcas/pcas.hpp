@@ -100,6 +100,8 @@ public:
   using logger_kind = typename logger::kind::value;
 
 private:
+  using block_section = section<uint32_t>;
+  using block_sections = sections<uint32_t>;
 
   // cache block
   // -----------------------------------------------------------------------------
@@ -127,8 +129,8 @@ private:
     mem_obj_id_t             mem_obj_id     = 0;
     MPI_Win                  win            = MPI_WIN_NULL;
     std::vector<MPI_Request> reqs;
-    sections                 dirty_sections;
-    sections                 partial_sections; // for write-only update
+    block_sections           dirty_sections;
+    block_sections           partial_sections; // for write-only update
     this_t*                  outer;
 
     cache_block(this_t* outer_p) : outer(outer_p) {}
@@ -484,28 +486,28 @@ private:
   // Cached data management
   // -----------------------------------------------------------------------------
 
-  section pad_fetch_section(section s) {
-    return {round_down_pow2(s.first, uint32_t(sub_block_size_)),
-            round_up_pow2(s.second, uint32_t(sub_block_size_))};
+  block_section pad_fetch_section(block_section bs) {
+    return {round_down_pow2(bs.first, uint32_t(sub_block_size_)),
+            round_up_pow2(bs.second, uint32_t(sub_block_size_))};
   }
 
   // return true if fetch is actually issued
-  bool fetch_begin(cache_block& cb, section s) {
+  bool fetch_begin(cache_block& cb, block_section bs) {
     PCAS_CHECK(cb.owner < topo_.global_nproc());
 
     if (!cb.partial_sections.empty() &&
-        *cb.partial_sections.begin() == section{0, block_size}) {
+        *cb.partial_sections.begin() == block_section{0, block_size}) {
       // fast path (the entire block is already fetched)
       return false;
     }
 
-    section s_pd = pad_fetch_section(s);
+    block_section bs_pd = pad_fetch_section(bs);
 
     std::byte* cache_block_ptr = reinterpret_cast<std::byte*>(cache_pm_.anon_vm_addr());
 
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
-         sections_inverse(cb.partial_sections, s_pd)) {
+         sections_inverse(cb.partial_sections, bs_pd)) {
       PCAS_CHECK(cb.entry_num < cache_.num_entries());
       MPI_Request req;
       MPI_Rget(cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
@@ -522,7 +524,7 @@ private:
 
     if (!cb.reqs.empty()) {
       cb.cstate = cache_state::fetching;
-      sections_insert(cb.partial_sections, s_pd);
+      sections_insert(cb.partial_sections, bs_pd);
       return true;
     } else {
       return false;
@@ -879,10 +881,10 @@ inline void pcas_if<P>::free(global_ptr<T> ptr, std::size_t nelems) {
             complete_flush();
           }
 
-          section section_in_block = {std::max(offset_b, o) - o,
-                                      std::min(offset_e - o, block_size)};
+          block_section bs = {std::max(offset_b, o) - o,
+                              std::min(offset_e - o, block_size)};
 
-          sections_remove(cb.dirty_sections, section_in_block);
+          sections_remove(cb.dirty_sections, bs);
         }
       }
 
@@ -1437,8 +1439,8 @@ inline bool pcas_if<P>::checkout_impl_tlb(const void* ptr, std::size_t size) {
         }
       }
 
-      section section_in_block = {raw_ptr - cb.vm_addr,
-                                  raw_ptr + size - cb.vm_addr};
+      block_section section_in_block = {raw_ptr - cb.vm_addr,
+                                        raw_ptr + size - cb.vm_addr};
 
       if constexpr (Mode == access_mode::write) {
         sections_insert(cb.partial_sections, section_in_block);
@@ -1542,8 +1544,8 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
           }
         }
 
-        section section_in_block = {std::max(offset_b, o) - o,
-                                    std::min(offset_e - o, block_size)};
+        block_section section_in_block = {std::max(offset_b, o) - o,
+                                          std::min(offset_e - o, block_size)};
 
         if constexpr (Mode == access_mode::write) {
           // If only a part of the block is written, we need to fetch the block
@@ -1634,14 +1636,14 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
       }
     }
 
-    section section_in_block = {std::max(offset_b, o) - o,
-                                std::min(offset_e - o, block_size)};
+    block_section bs = {std::max(offset_b, o) - o,
+                        std::min(offset_e - o, block_size)};
 
     if constexpr (Mode == access_mode::write) {
-      sections_insert(cb.partial_sections, section_in_block);
+      sections_insert(cb.partial_sections, bs);
 
     } else {
-      fetch_begin(cb, section_in_block);
+      fetch_begin(cb, bs);
     }
 
     if constexpr (DoCheckout) {
@@ -1729,9 +1731,9 @@ inline bool pcas_if<P>::checkin_impl_tlb(const void* ptr, std::size_t size) {
       if constexpr (Mode != access_mode::read) {
         bool is_new_dirty_block = cb.dirty_sections.empty();
 
-        section section_in_block = {raw_ptr - cb.vm_addr,
-                                    raw_ptr + size - cb.vm_addr};
-        sections_insert(cb.dirty_sections, section_in_block);
+        block_section bs = {raw_ptr - cb.vm_addr,
+                            raw_ptr + size - cb.vm_addr};
+        sections_insert(cb.dirty_sections, bs);
 
         if (is_new_dirty_block) {
           add_dirty_cache_block(cb);
@@ -1775,9 +1777,9 @@ inline void pcas_if<P>::checkin_impl_coll(const void* ptr, std::size_t size) {
         if constexpr (Mode != access_mode::read) {
           bool is_new_dirty_block = cb.dirty_sections.empty();
 
-          section section_in_block = {std::max(offset_b, o) - o,
-                                      std::min(offset_e - o, block_size)};
-          sections_insert(cb.dirty_sections, section_in_block);
+          block_section bs = {std::max(offset_b, o) - o,
+                              std::min(offset_e - o, block_size)};
+          sections_insert(cb.dirty_sections, bs);
 
           if (is_new_dirty_block) {
             add_dirty_cache_block(cb);
@@ -1815,9 +1817,9 @@ inline void pcas_if<P>::checkin_impl_local(const void* ptr, std::size_t size) {
     if constexpr (Mode != access_mode::read) {
       bool is_new_dirty_block = cb.dirty_sections.empty();
 
-      section section_in_block = {std::max(offset_b, o) - o,
-                                  std::min(offset_e - o, block_size)};
-      sections_insert(cb.dirty_sections, section_in_block);
+      block_section bs = {std::max(offset_b, o) - o,
+                          std::min(offset_e - o, block_size)};
+      sections_insert(cb.dirty_sections, bs);
 
       if (is_new_dirty_block) {
         add_dirty_cache_block(cb);

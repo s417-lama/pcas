@@ -210,14 +210,19 @@ public:
 // Section
 // -----------------------------------------------------------------------------
 
-using section = std::pair<uint32_t, uint32_t>;
-using sections = std::forward_list<section>;
+template <typename T>
+using section = std::pair<T, T>;
 
-inline section section_merge(section s1, section s2) {
-  return section{std::min(s1.first, s2.first), std::max(s1.second, s2.second)};
+template <typename T>
+using sections = std::forward_list<section<T>>;
+
+template <typename T>
+inline section<T> section_merge(section<T> s1, section<T> s2) {
+  return section<T>{std::min(s1.first, s2.first), std::max(s1.second, s2.second)};
 }
 
-inline void sections_insert(sections& ss, section s) {
+template <typename T>
+inline void sections_insert(sections<T>& ss, section<T> s) {
   auto it = ss.before_begin();
 
   // skip until it overlaps s (or s < it)
@@ -239,44 +244,45 @@ inline void sections_insert(sections& ss, section s) {
 }
 
 PCAS_TEST_CASE("[pcas::util] sections insert") {
-  sections ss;
+  sections<int> ss;
   sections_insert(ss, {2, 5});
-  PCAS_CHECK(ss == (sections{{2, 5}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 5}}));
   sections_insert(ss, {11, 20});
-  PCAS_CHECK(ss == (sections{{2, 5}, {11, 20}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 5}, {11, 20}}));
   sections_insert(ss, {20, 21});
-  PCAS_CHECK(ss == (sections{{2, 5}, {11, 21}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 5}, {11, 21}}));
   sections_insert(ss, {15, 23});
-  PCAS_CHECK(ss == (sections{{2, 5}, {11, 23}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 5}, {11, 23}}));
   sections_insert(ss, {8, 23});
-  PCAS_CHECK(ss == (sections{{2, 5}, {8, 23}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 5}, {8, 23}}));
   sections_insert(ss, {7, 25});
-  PCAS_CHECK(ss == (sections{{2, 5}, {7, 25}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 5}, {7, 25}}));
   sections_insert(ss, {0, 7});
-  PCAS_CHECK(ss == (sections{{0, 25}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 25}}));
   sections_insert(ss, {30, 50});
-  PCAS_CHECK(ss == (sections{{0, 25}, {30, 50}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 25}, {30, 50}}));
   sections_insert(ss, {30, 50});
-  PCAS_CHECK(ss == (sections{{0, 25}, {30, 50}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 25}, {30, 50}}));
   sections_insert(ss, {35, 45});
-  PCAS_CHECK(ss == (sections{{0, 25}, {30, 50}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 25}, {30, 50}}));
   sections_insert(ss, {60, 100});
-  PCAS_CHECK(ss == (sections{{0, 25}, {30, 50}, {60, 100}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 25}, {30, 50}, {60, 100}}));
   sections_insert(ss, {0, 120});
-  PCAS_CHECK(ss == (sections{{0, 120}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 120}}));
   sections_insert(ss, {200, 300});
-  PCAS_CHECK(ss == (sections{{0, 120}, {200, 300}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 120}, {200, 300}}));
   sections_insert(ss, {600, 700});
-  PCAS_CHECK(ss == (sections{{0, 120}, {200, 300}, {600, 700}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 120}, {200, 300}, {600, 700}}));
   sections_insert(ss, {400, 500});
-  PCAS_CHECK(ss == (sections{{0, 120}, {200, 300}, {400, 500}, {600, 700}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 120}, {200, 300}, {400, 500}, {600, 700}}));
   sections_insert(ss, {300, 600});
-  PCAS_CHECK(ss == (sections{{0, 120}, {200, 700}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 120}, {200, 700}}));
   sections_insert(ss, {50, 600});
-  PCAS_CHECK(ss == (sections{{0, 700}}));
+  PCAS_CHECK(ss == (sections<int>{{0, 700}}));
 }
 
-inline void sections_remove(sections& ss, section s) {
+template <typename T>
+inline void sections_remove(sections<T>& ss, section<T> s) {
   auto it = ss.before_begin();
 
   while (std::next(it) != ss.end()) {
@@ -299,7 +305,7 @@ inline void sections_remove(sections& ss, section s) {
       it++;
     } else if (std::next(it)->first <= s.first && s.second <= std::next(it)->second) {
       // std::next(it) contains s
-      section new_s = {std::next(it)->first, s.first};
+      section<T> new_s = {std::next(it)->first, s.first};
       std::next(it)->first = s.second;
       ss.insert_after(it, new_s);
       it++;
@@ -310,25 +316,26 @@ inline void sections_remove(sections& ss, section s) {
 }
 
 PCAS_TEST_CASE("[pcas::util] sections remove") {
-  sections ss{{2, 5}, {6, 9}, {11, 20}, {50, 100}};
+  sections<int> ss{{2, 5}, {6, 9}, {11, 20}, {50, 100}};
   sections_remove(ss, {6, 9});
-  PCAS_CHECK(ss == (sections{{2, 5}, {11, 20}, {50, 100}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 5}, {11, 20}, {50, 100}}));
   sections_remove(ss, {4, 10});
-  PCAS_CHECK(ss == (sections{{2, 4}, {11, 20}, {50, 100}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 4}, {11, 20}, {50, 100}}));
   sections_remove(ss, {70, 80});
-  PCAS_CHECK(ss == (sections{{2, 4}, {11, 20}, {50, 70}, {80, 100}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 4}, {11, 20}, {50, 70}, {80, 100}}));
   sections_remove(ss, {18, 55});
-  PCAS_CHECK(ss == (sections{{2, 4}, {11, 18}, {55, 70}, {80, 100}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 4}, {11, 18}, {55, 70}, {80, 100}}));
   sections_remove(ss, {10, 110});
-  PCAS_CHECK(ss == (sections{{2, 4}}));
+  PCAS_CHECK(ss == (sections<int>{{2, 4}}));
   sections_remove(ss, {2, 4});
-  PCAS_CHECK(ss == (sections{}));
+  PCAS_CHECK(ss == (sections<int>{}));
   sections_remove(ss, {2, 4});
-  PCAS_CHECK(ss == (sections{}));
+  PCAS_CHECK(ss == (sections<int>{}));
 }
 
-inline sections sections_inverse(const sections& ss, section s) {
-  sections ret;
+template <typename T>
+inline sections<T> sections_inverse(const sections<T>& ss, section<T> s) {
+  sections<T> ret;
   auto it = ret.before_begin();
   for (auto [b, e] : ss) {
     if (s.first < b) {
@@ -346,18 +353,18 @@ inline sections sections_inverse(const sections& ss, section s) {
 }
 
 PCAS_TEST_CASE("[pcas::util] sections inverse") {
-  sections ss{{2, 5}, {6, 9}, {11, 20}, {50, 100}};
-  PCAS_CHECK(sections_inverse(ss, {0, 120}) == (sections{{0, 2}, {5, 6}, {9, 11}, {20, 50}, {100, 120}}));
-  PCAS_CHECK(sections_inverse(ss, {0, 100}) == (sections{{0, 2}, {5, 6}, {9, 11}, {20, 50}}));
-  PCAS_CHECK(sections_inverse(ss, {0, 25}) == (sections{{0, 2}, {5, 6}, {9, 11}, {20, 25}}));
-  PCAS_CHECK(sections_inverse(ss, {8, 15}) == (sections{{9, 11}}));
-  PCAS_CHECK(sections_inverse(ss, {30, 40}) == (sections{{30, 40}}));
-  PCAS_CHECK(sections_inverse(ss, {50, 100}) == (sections{}));
-  PCAS_CHECK(sections_inverse(ss, {60, 90}) == (sections{}));
-  PCAS_CHECK(sections_inverse(ss, {2, 5}) == (sections{}));
-  PCAS_CHECK(sections_inverse(ss, {2, 6}) == (sections{{5, 6}}));
-  sections ss_empty{};
-  PCAS_CHECK(sections_inverse(ss_empty, {0, 100}) == (sections{{0, 100}}));
+  sections<int> ss{{2, 5}, {6, 9}, {11, 20}, {50, 100}};
+  PCAS_CHECK(sections_inverse(ss, {0, 120}) == (sections<int>{{0, 2}, {5, 6}, {9, 11}, {20, 50}, {100, 120}}));
+  PCAS_CHECK(sections_inverse(ss, {0, 100}) == (sections<int>{{0, 2}, {5, 6}, {9, 11}, {20, 50}}));
+  PCAS_CHECK(sections_inverse(ss, {0, 25}) == (sections<int>{{0, 2}, {5, 6}, {9, 11}, {20, 25}}));
+  PCAS_CHECK(sections_inverse(ss, {8, 15}) == (sections<int>{{9, 11}}));
+  PCAS_CHECK(sections_inverse(ss, {30, 40}) == (sections<int>{{30, 40}}));
+  PCAS_CHECK(sections_inverse(ss, {50, 100}) == (sections<int>{}));
+  PCAS_CHECK(sections_inverse(ss, {60, 90}) == (sections<int>{}));
+  PCAS_CHECK(sections_inverse(ss, {2, 5}) == (sections<int>{}));
+  PCAS_CHECK(sections_inverse(ss, {2, 6}) == (sections<int>{{5, 6}}));
+  sections<int> ss_empty{};
+  PCAS_CHECK(sections_inverse(ss_empty, {0, 100}) == (sections<int>{{0, 100}}));
 }
 
 // Freelist
