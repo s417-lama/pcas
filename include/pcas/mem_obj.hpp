@@ -29,8 +29,8 @@ class mem_obj_if {
   win_manager                       win_;
   mem_block_num_t                   last_checkout_block_num_ = std::numeric_limits<mem_block_num_t>::max();
 
-  static bool num_prefetch_blocks(topology::rank_t global_rank) {
-    static bool n_prefetch_ = get_env("PCAS_PREFETCH_BLOCKS", 0, global_rank);
+  int num_prefetch_blocks() const {
+    static int n_prefetch_ = getenv_coll("PCAS_PREFETCH_BLOCKS", 0, topo_.global_comm());
     return n_prefetch_;
   }
 
@@ -98,7 +98,7 @@ public:
 
   std::size_t size_with_prefetch(std::size_t offset, std::size_t size) {
     std::size_t size_pf = size;
-    std::size_t n_prefetch = num_prefetch_blocks(topo_.global_rank());
+    std::size_t n_prefetch = num_prefetch_blocks();
     if (n_prefetch > 0) {
       mem_block_num_t block_num_b = offset / P::block_size;
       mem_block_num_t block_num_e = (offset + size + P::block_size - 1) / P::block_size;

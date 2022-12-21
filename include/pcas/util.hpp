@@ -72,7 +72,7 @@ inline void die(const char* fmt, ...) {
 }
 
 template <typename T>
-inline T get_env_(const char* env_var, T default_val) {
+inline T getenv_with_default(const char* env_var, T default_val) {
   if (const char* val_str = std::getenv(env_var)) {
     T val;
     std::stringstream ss(val_str);
@@ -87,13 +87,23 @@ inline T get_env_(const char* env_var, T default_val) {
 }
 
 template <typename T>
-inline T get_env(const char* env_var, T default_val, int rank) {
-  static bool print_env = get_env_("PCAS_PRINT_ENV", false);
+inline T getenv_coll(const char* env_var, T default_val, MPI_Comm comm) {
+  static bool print_env = getenv_with_default("PCAS_PRINT_ENV", false);
 
-  T val = get_env_(env_var, default_val);
-  if (print_env && rank == 0) {
-    std::cout << env_var << " = " << val << std::endl;
+  int rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  T val;
+
+  if (rank == 0) {
+    val = getenv_with_default(env_var, default_val);
+    if (print_env) {
+      std::cout << env_var << " = " << val << std::endl;
+    }
   }
+
+  MPI_Bcast(&val, sizeof(T), MPI_BYTE, 0, comm);
+
   return val;
 }
 

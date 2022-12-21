@@ -51,7 +51,7 @@ protected:
       default_local_size = std::size_t(128) * 1024 * 1024;
     }
 
-    auto ret = std::size_t(get_env("PCAS_ALLOCATOR_MAX_LOCAL_SIZE", default_local_size / 1024 / 1024, topo_.global_rank())) * 1024 * 1024; // MB
+    auto ret = std::size_t(getenv_coll("PCAS_ALLOCATOR_MAX_LOCAL_SIZE", default_local_size / 1024 / 1024, topo_.global_comm())) * 1024 * 1024; // MB
     PCAS_CHECK(ret <= upper_limit);
     return ret;
   }
@@ -332,9 +332,9 @@ public:
     local_base_addr_(reinterpret_cast<uintptr_t>(vm_.addr()) + local_max_size_ * topo_.global_rank()),
     win_(win),
     win_mr_(topo, local_max_size_, local_base_addr_, win),
-    block_mr_(&win_mr_, std::size_t(get_env("PCAS_ALLOCATOR_BLOCK_SIZE", 2, topo_.global_rank())) * 1024 * 1024),
+    block_mr_(&win_mr_, std::size_t(getenv_coll("PCAS_ALLOCATOR_BLOCK_SIZE", 2, topo_.global_comm())) * 1024 * 1024),
     mr_(my_pool_options(), &block_mr_),
-    max_unflushed_free_objs_(get_env("PCAS_ALLOCATOR_MAX_UNFLUSHED_FREE_OBJS", 10, topo_.global_rank())) {}
+    max_unflushed_free_objs_(getenv_coll("PCAS_ALLOCATOR_MAX_UNFLUSHED_FREE_OBJS", 10, topo_.global_comm())) {}
 
   void* do_allocate(std::size_t bytes, std::size_t alignment) {
     auto ev = logger::template record<logger_kind::MemAlloc>(bytes);

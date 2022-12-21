@@ -797,9 +797,9 @@ inline pcas_if<P>::pcas_if(std::size_t cache_size, std::size_t sub_block_size, M
     allocator_(topo_),
     rm_(comm),
     flushing_flags_(1, false),
-    max_dirty_cache_blocks_(get_env("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, rank()) / block_size),
-    lazy_release_check_interval_(get_env("PCAS_LAZY_RELEASE_CHECK_INTERVAL", 10, rank())),
-    make_mpi_progress_in_busy_loop_(get_env("PCAS_MAKE_MPI_PROGRESS_IN_BUSY_LOOP", true, rank())) {
+    max_dirty_cache_blocks_(getenv_coll("PCAS_MAX_DIRTY_CACHE_SIZE", cache_size / 4, topo_.global_comm()) / block_size),
+    lazy_release_check_interval_(getenv_coll("PCAS_LAZY_RELEASE_CHECK_INTERVAL", 10, topo_.global_comm())),
+    make_mpi_progress_in_busy_loop_(getenv_coll("PCAS_MAKE_MPI_PROGRESS_IN_BUSY_LOOP", true, topo_.global_comm())) {
 
   logger::init(rank(), nproc());
 

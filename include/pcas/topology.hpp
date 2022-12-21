@@ -92,7 +92,7 @@ private:
 public:
   topology(MPI_Comm comm) :
     cg_global_(comm, false),
-    shared_memory_enabled_(get_env("PCAS_ENABLE_SHARED_MEMORY", 1, global_rank())),
+    shared_memory_enabled_(getenv_coll("PCAS_ENABLE_SHARED_MEMORY", 1, global_comm())),
     cg_intra_(create_intra_comm(), shared_memory_enabled_),
     cg_inter_(create_inter_comm(), shared_memory_enabled_),
     process_map_(create_process_map()),
