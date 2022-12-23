@@ -26,6 +26,10 @@ public:
     FlushEarly,
     FlushConflicted,
 
+    CommGet,
+    CommPut,
+    CommFlush,
+
     _NKinds,
   };
 
@@ -94,6 +98,10 @@ public:
 
       case value::FlushEarly:      return "flush_early";
       case value::FlushConflicted: return "flush_conflicted";
+
+      case value::CommGet:         return "comm_get";
+      case value::CommPut:         return "comm_put";
+      case value::CommFlush:       return "comm_flush";
 
       default:                     return "other";
     }

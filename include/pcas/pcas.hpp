@@ -510,13 +510,17 @@ private:
     for (auto [offset_in_block_b, offset_in_block_e] :
          sections_inverse(cb.partial_sections, bs_pd)) {
       PCAS_CHECK(cb.entry_num < cache_.num_entries());
+
+      std::size_t size = offset_in_block_e - offset_in_block_b;
+      auto ev = logger::template record<logger_kind::CommGet>(size);
+
       MPI_Request req;
       MPI_Rget(cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
-               offset_in_block_e - offset_in_block_b,
+               size,
                MPI_BYTE,
                cb.owner,
                cb.pm_offset + offset_in_block_b,
-               offset_in_block_e - offset_in_block_b,
+               size,
                MPI_BYTE,
                cb.win,
                &req);
@@ -529,6 +533,13 @@ private:
       return true;
     } else {
       return false;
+    }
+  }
+
+  void fetch_complete(std::vector<MPI_Request>& reqs) {
+    if (!reqs.empty()) {
+      auto ev = logger::template record<logger_kind::CommFlush>();
+      MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
     }
   }
 
@@ -553,12 +564,14 @@ private:
     std::byte* cache_block_ptr = reinterpret_cast<std::byte*>(cache_pm_.anon_vm_addr());
 
     for (auto [offset_in_block_b, offset_in_block_e] : cb.dirty_sections) {
+      std::size_t size = offset_in_block_e - offset_in_block_b;
+      auto ev = logger::template record<logger_kind::CommPut>(size);
       MPI_Put(cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
-              offset_in_block_e - offset_in_block_b,
+              size,
               MPI_BYTE,
               cb.owner,
               cb.pm_offset + offset_in_block_b,
-              offset_in_block_e - offset_in_block_b,
+              size,
               MPI_BYTE,
               cb.win);
     }
@@ -609,6 +622,7 @@ private:
       }
 
       for (auto win : flushing_wins) {
+        auto ev = logger::template record<logger_kind::CommFlush>();
         MPI_Win_flush_all(win);
       }
 
@@ -1189,9 +1203,7 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
     });
   }
 
-  if (!reqs.empty()) {
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-  }
+  fetch_complete(reqs);
 }
 
 template <typename P>
@@ -1463,7 +1475,7 @@ inline bool pcas_if<P>::checkout_impl_tlb(const void* ptr, std::size_t size) {
           // Immediately wait for communication completion here because it is a fast path;
           // i.e., there is only one cache block to be checked out.
           PCAS_CHECK(!cb.reqs.empty());
-          MPI_Waitall(cb.reqs.size(), cb.reqs.data(), MPI_STATUSES_IGNORE);
+          fetch_complete(cb.reqs);
           cb.reqs.clear();
 
           cb.cstate = cache_state::valid;
@@ -1602,9 +1614,7 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
   // Overlap communication and memory remapping
   ensure_remapped();
 
-  if (!reqs.empty()) {
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-  }
+  fetch_complete(reqs);
 }
 
 template <typename P>
@@ -1678,9 +1688,7 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
 
   ensure_remapped();
 
-  if (!reqs.empty()) {
-    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-  }
+  fetch_complete(reqs);
 }
 
 template <typename P>
