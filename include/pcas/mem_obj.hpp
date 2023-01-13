@@ -74,7 +74,9 @@ public:
     effective_size_(mmapper_->get_effective_size()),
     vm_(reserve_same_vm_coll(topo_.global_comm(), effective_size_, P::block_size)),
     home_pms_(init_home_pms()),
-    win_(topo_.global_comm(), home_pm().anon_vm_addr(), local_size_) {}
+    win_(topo_.global_comm(), home_pm().anon_vm_addr(), local_size_) {
+    num_prefetch_blocks(); // ensure init
+  }
 
   const mem_mapper::base& mem_mapper() const { return *mmapper_; }
 
