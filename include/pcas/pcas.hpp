@@ -129,7 +129,6 @@ private:
     std::size_t              pm_offset      = 0;
     mem_obj_id_t             mem_obj_id     = 0;
     MPI_Win                  win            = MPI_WIN_NULL;
-    std::vector<MPI_Request> reqs;
     block_sections           dirty_sections;
     block_sections           partial_sections; // for write-only update
     this_t*                  outer;
@@ -137,20 +136,7 @@ private:
     cache_block(this_t* outer_p) : outer(outer_p) {}
 
     void invalidate() {
-      if (cstate == cache_state::fetching) {
-        // Only for prefetching blocks
-        PCAS_CHECK(!reqs.empty());
-        for (auto&& req : reqs) {
-          // FIXME: MPI_Cancel causes segfault
-          /* MPI_Cancel(&req); */
-          /* MPI_Request_free(&req); */
-          MPI_Wait(&req, MPI_STATUS_IGNORE);
-          PCAS_CHECK(req == MPI_REQUEST_NULL);
-        }
-        reqs.clear();
-      }
       PCAS_CHECK(!flushing);
-      PCAS_CHECK(reqs.empty());
       PCAS_CHECK(dirty_sections.empty());
       partial_sections.clear();
       cstate = cache_state::invalid;
@@ -506,6 +492,8 @@ private:
 
     std::byte* cache_block_ptr = reinterpret_cast<std::byte*>(cache_pm_.anon_vm_addr());
 
+    bool fetched = false;
+
     // fetch only nondirty sections
     for (auto [offset_in_block_b, offset_in_block_e] :
          sections_inverse(cb.partial_sections, bs_pd)) {
@@ -514,33 +502,28 @@ private:
       std::size_t size = offset_in_block_e - offset_in_block_b;
       auto ev = logger::template record<logger_kind::CommGet>(size);
 
-      MPI_Request req;
-      MPI_Rget(cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
-               size,
-               MPI_BYTE,
-               cb.owner,
-               cb.pm_offset + offset_in_block_b,
-               size,
-               MPI_BYTE,
-               cb.win,
-               &req);
-      cb.reqs.push_back(req);
+      MPI_Get(cache_block_ptr + cb.entry_num * block_size + offset_in_block_b,
+              size,
+              MPI_BYTE,
+              cb.owner,
+              cb.pm_offset + offset_in_block_b,
+              size,
+              MPI_BYTE,
+              cb.win);
+
+      fetched = true;
     }
 
-    if (!cb.reqs.empty()) {
-      cb.cstate = cache_state::fetching;
+    if (fetched) {
       sections_insert(cb.partial_sections, bs_pd);
-      return true;
-    } else {
-      return false;
     }
+
+    return fetched;
   }
 
-  void fetch_complete(std::vector<MPI_Request>& reqs) {
-    if (!reqs.empty()) {
-      auto ev = logger::template record<logger_kind::CommFlush>();
-      MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-    }
+  void fetch_complete(MPI_Win win) {
+    auto ev = logger::template record<logger_kind::CommFlush>();
+    MPI_Win_flush_all(win);
   }
 
   void add_dirty_cache_block(cache_block& cb) {
@@ -663,17 +646,15 @@ private:
   epoch_t get_remote_epoch(int target_rank) {
     epoch_t remote_epoch;
 
-    MPI_Request req;
-    MPI_Rget(&remote_epoch,
-             sizeof(epoch_t),
-             MPI_BYTE,
-             target_rank,
-             offsetof(release_remote_region, epoch),
-             sizeof(epoch_t),
-             MPI_BYTE,
-             rm_.win(),
-             &req);
-    MPI_Wait(&req, MPI_STATUS_IGNORE);
+    MPI_Get(&remote_epoch,
+            sizeof(epoch_t),
+            MPI_BYTE,
+            target_rank,
+            offsetof(release_remote_region, epoch),
+            sizeof(epoch_t),
+            MPI_BYTE,
+            rm_.win());
+    MPI_Win_flush(target_rank, rm_.win());
 
     return remote_epoch;
   }
@@ -1144,8 +1125,6 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
   std::size_t size = nelems * sizeof(T);
   auto ev = logger::template record<logger_kind::Get>(size);
 
-  std::vector<MPI_Request> reqs;
-
   const void* raw_ptr = from_ptr.raw_ptr();
 
   if (allocator_.belongs_to(raw_ptr)) {
@@ -1156,17 +1135,15 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
     if (topo_.is_locally_accessible(target_rank)) {
       std::memcpy(to_ptr, raw_ptr, size);
     } else {
-      MPI_Request req;
-      MPI_Rget(reinterpret_cast<std::byte*>(to_ptr),
-               size,
-               MPI_BYTE,
-               target_rank,
-               allocator_.get_disp(raw_ptr),
-               size,
-               MPI_BYTE,
-               allocator_.win(),
-               &req);
-      reqs.push_back(req);
+      MPI_Get(reinterpret_cast<std::byte*>(to_ptr),
+              size,
+              MPI_BYTE,
+              target_rank,
+              allocator_.get_disp(raw_ptr),
+              size,
+              MPI_BYTE,
+              allocator_.win());
+      fetch_complete(allocator_.win());
     }
 
   } else {
@@ -1175,6 +1152,8 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
     const std::size_t offset_b = reinterpret_cast<std::size_t>(raw_ptr) -
                                  reinterpret_cast<std::size_t>(mo.vm().addr());
     const std::size_t offset_e = offset_b + size;
+
+    bool fetched = false;
 
     for_each_mem_block(mo, raw_ptr, size, [&](const auto& bi) {
       std::size_t block_offset_b = std::max(bi.offset_b, offset_b);
@@ -1188,22 +1167,22 @@ inline void pcas_if<P>::get_nocache(global_ptr<ConstT> from_ptr, T* to_ptr, std:
                     reinterpret_cast<const std::byte*>(from_vm_addr) + pm_offset,
                     block_offset_e - block_offset_b);
       } else {
-        MPI_Request req;
-        MPI_Rget(reinterpret_cast<std::byte*>(to_ptr) - offset_b + block_offset_b,
-                 block_offset_e - block_offset_b,
-                 MPI_BYTE,
-                 bi.owner,
-                 pm_offset,
-                 block_offset_e - block_offset_b,
-                 MPI_BYTE,
-                 mo.win(),
-                 &req);
-        reqs.push_back(req);
+        MPI_Get(reinterpret_cast<std::byte*>(to_ptr) - offset_b + block_offset_b,
+                block_offset_e - block_offset_b,
+                MPI_BYTE,
+                bi.owner,
+                pm_offset,
+                block_offset_e - block_offset_b,
+                MPI_BYTE,
+                mo.win());
+        fetched = true;
       }
     });
-  }
 
-  fetch_complete(reqs);
+    if (fetched) {
+      fetch_complete(mo.win());
+    }
+  }
 }
 
 template <typename P>
@@ -1474,10 +1453,7 @@ inline bool pcas_if<P>::checkout_impl_tlb(const void* ptr, std::size_t size) {
         if (fetch_begin(cb, section_in_block)) {
           // Immediately wait for communication completion here because it is a fast path;
           // i.e., there is only one cache block to be checked out.
-          PCAS_CHECK(!cb.reqs.empty());
-          fetch_complete(cb.reqs);
-          cb.reqs.clear();
-
+          fetch_complete(cb.win);
           cb.cstate = cache_state::valid;
         }
       }
@@ -1504,42 +1480,34 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
 
   PCAS_CHECK(offset_e <= mo.size());
 
-  std::size_t size_pf = size;
-  if constexpr (Mode != access_mode::write) {
-    size_pf = mo.size_with_prefetch(offset_b, size);
-  }
+  bool fetched = false;
 
-  std::vector<MPI_Request> reqs;
-
-  for_each_mem_block(mo, ptr, size_pf, [&](const auto& bi) {
+  for_each_mem_block(mo, ptr, size, [&](const auto& bi) {
     if (topo_.is_locally_accessible(bi.owner)) {
-      bool is_prefetch = bi.offset_b >= offset_e;
-      if (!is_prefetch) {
-        std::byte* vm_addr = reinterpret_cast<std::byte*>(mo.vm().addr()) + bi.offset_b;
+      std::byte* vm_addr = reinterpret_cast<std::byte*>(mo.vm().addr()) + bi.offset_b;
 
-        home_block& hb = ensure_mmap_cached_strict(vm_addr);
+      home_block& hb = ensure_mmap_cached_strict(vm_addr);
 
-        if (!hb.mapped) {
-          int target_intra_rank = topo_.intra_rank(bi.owner);
-          hb.pm = &mo.home_pm(target_intra_rank);
-          hb.pm_offset = bi.pm_offset;
-          hb.vm_addr = vm_addr;
-          hb.size = bi.offset_e - bi.offset_b;
-          remap_home_blocks_.push_back(&hb);
-        }
-
-        hb.transaction_id = transaction_id_;
-
-        if constexpr (DoCheckout) {
-          hb.checkout_count++;
-        }
-
-        home_tlb_.add(&hb);
+      if (!hb.mapped) {
+        int target_intra_rank = topo_.intra_rank(bi.owner);
+        hb.pm = &mo.home_pm(target_intra_rank);
+        hb.pm_offset = bi.pm_offset;
+        hb.vm_addr = vm_addr;
+        hb.size = bi.offset_e - bi.offset_b;
+        remap_home_blocks_.push_back(&hb);
       }
+
+      hb.transaction_id = transaction_id_;
+
+      if constexpr (DoCheckout) {
+        hb.checkout_count++;
+      }
+
+      home_tlb_.add(&hb);
     } else {
       // for each cache block
       const std::size_t block_offset_b = std::max(bi.offset_b, round_down_pow2(offset_b, block_size));
-      const std::size_t block_offset_e = std::min(bi.offset_e, offset_b + size_pf);
+      const std::size_t block_offset_e = std::min(bi.offset_e, offset_b + size);
       for (std::size_t o = block_offset_b; o < block_offset_e; o += block_size) {
         std::byte* vm_addr = reinterpret_cast<std::byte*>(mo.vm().addr()) + o;
 
@@ -1584,25 +1552,20 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
           // the data for a2 would not be fetched because it is already in the cache.
           // Thus, we allocate a `partial` flag to each cache entry to indicate if the entire cache block
           // has been already fetched or not.
-          fetch_begin(cb, section_in_block);
+          if (fetch_begin(cb, section_in_block)) {
+            fetched = true;
+          }
         }
 
-        bool is_prefetch = o >= offset_e;
-        if (!is_prefetch) {
-          if constexpr (DoCheckout) {
-            cb.checkout_count++;
-          }
-
-          if (cb.cstate == cache_state::fetching) {
-            PCAS_CHECK(!cb.reqs.empty());
-            reqs.insert(reqs.end(), cb.reqs.begin(), cb.reqs.end());
-            cb.reqs.clear();
-          }
-
-          cb.cstate = cache_state::valid;
-
-          cache_tlb_.add(&cb);
+        if constexpr (DoCheckout) {
+          cb.checkout_count++;
         }
+
+        PCAS_CHECK(cb.cstate != cache_state::fetching);
+
+        cb.cstate = cache_state::valid;
+
+        cache_tlb_.add(&cb);
       }
     }
   });
@@ -1614,7 +1577,9 @@ inline void pcas_if<P>::checkout_impl_coll(const void* ptr, std::size_t size) {
   // Overlap communication and memory remapping
   ensure_remapped();
 
-  fetch_complete(reqs);
+  if (fetched) {
+    fetch_complete(mo.win());
+  }
 }
 
 template <typename P>
@@ -1631,7 +1596,7 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
   const std::size_t offset_b = reinterpret_cast<std::size_t>(ptr);
   const std::size_t offset_e = offset_b + size;
 
-  std::vector<MPI_Request> reqs;
+  bool fetched = false;
 
   const std::size_t block_offset_b = round_down_pow2(offset_b, block_size);
   const std::size_t block_offset_e = offset_e;
@@ -1666,18 +1631,16 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
       sections_insert(cb.partial_sections, bs);
 
     } else {
-      fetch_begin(cb, bs);
+      if (fetch_begin(cb, bs)) {
+        fetched = true;
+      }
     }
 
     if constexpr (DoCheckout) {
       cb.checkout_count++;
     }
 
-    if (cb.cstate == cache_state::fetching) {
-      PCAS_CHECK(!cb.reqs.empty());
-      reqs.insert(reqs.end(), cb.reqs.begin(), cb.reqs.end());
-      cb.reqs.clear();
-    }
+    PCAS_CHECK(cb.cstate != cache_state::fetching);
 
     cb.cstate = cache_state::valid;
 
@@ -1688,7 +1651,9 @@ inline void pcas_if<P>::checkout_impl_local(const void* ptr, std::size_t size) {
 
   ensure_remapped();
 
-  fetch_complete(reqs);
+  if (fetched) {
+    fetch_complete(allocator_.win());
+  }
 }
 
 template <typename P>

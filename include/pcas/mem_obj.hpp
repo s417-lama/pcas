@@ -27,12 +27,6 @@ class mem_obj_if {
   virtual_mem                       vm_;
   std::vector<physical_mem>         home_pms_; // intra-rank -> pm
   win_manager                       win_;
-  mem_block_num_t                   last_checkout_block_num_ = std::numeric_limits<mem_block_num_t>::max();
-
-  int num_prefetch_blocks() const {
-    static int n_prefetch_ = getenv_coll("PCAS_PREFETCH_BLOCKS", 0, topo_.global_comm());
-    return n_prefetch_;
-  }
 
   static std::string home_shmem_name(mem_obj_id_t id, int global_rank) {
     std::stringstream ss;
@@ -74,9 +68,7 @@ public:
     effective_size_(mmapper_->get_effective_size()),
     vm_(reserve_same_vm_coll(topo_.global_comm(), effective_size_, P::block_size)),
     home_pms_(init_home_pms()),
-    win_(topo_.global_comm(), home_pm().anon_vm_addr(), local_size_) {
-    num_prefetch_blocks(); // ensure init
-  }
+    win_(topo_.global_comm(), home_pm().anon_vm_addr(), local_size_) {}
 
   const mem_mapper::base& mem_mapper() const { return *mmapper_; }
 
@@ -97,22 +89,6 @@ public:
   }
 
   MPI_Win win() const { return win_.win(); }
-
-  std::size_t size_with_prefetch(std::size_t offset, std::size_t size) {
-    std::size_t size_pf = size;
-    std::size_t n_prefetch = num_prefetch_blocks();
-    if (n_prefetch > 0) {
-      mem_block_num_t block_num_b = offset / P::block_size;
-      mem_block_num_t block_num_e = (offset + size + P::block_size - 1) / P::block_size;
-      if (block_num_b <= last_checkout_block_num_ + 1 &&
-          last_checkout_block_num_ + 1 < block_num_e) {
-        // If it seems sequential access, do prefetch
-        size_pf = std::min(size + n_prefetch * P::block_size, size_ - offset);
-      }
-      last_checkout_block_num_ = block_num_e - 1;
-    }
-    return size_pf;
-  }
 
 };
 
