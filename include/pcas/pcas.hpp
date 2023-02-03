@@ -315,6 +315,10 @@ private:
   cache_t cache_;
   physical_mem cache_pm_;
 
+  // The cache region is not remotely accessible, but we make an MPI window here because
+  // it will pre-register the memory region for RDMA and MPI_Get to the cache will speedup.
+  win_manager cache_win_;
+
   std::vector<home_block*> remap_home_blocks_;
   std::vector<cache_block*> remap_cache_blocks_;
 
@@ -789,6 +793,7 @@ inline pcas_if<P>::pcas_if(std::size_t cache_size, std::size_t sub_block_size, M
     mmap_cache_(calc_home_mmap_limit(cache_size / block_size), home_block(this)),
     cache_(cache_size / block_size, cache_block(this)),
     cache_pm_(cache_shmem_name(rank()), cache_size, true, true),
+    cache_win_(comm, cache_pm_.anon_vm_addr(), cache_size),
     allocator_(topo_),
     rm_(comm),
     flushing_flags_(1, false),
