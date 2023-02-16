@@ -184,11 +184,11 @@ class win_manager {
 public:
   win_manager(MPI_Comm comm) {
     MPI_Win_create_dynamic(MPI_INFO_NULL, comm, &win_);
-    MPI_Win_lock_all(0, win_);
+    MPI_Win_lock_all(MPI_MODE_NOCHECK, win_);
   }
   win_manager(MPI_Comm comm, std::size_t size, void** vm_addr) {
     MPI_Win_allocate(size, 1, MPI_INFO_NULL, comm, vm_addr, &win_);
-    MPI_Win_lock_all(0, win_);
+    MPI_Win_lock_all(MPI_MODE_NOCHECK, win_);
   }
   win_manager(MPI_Comm comm, void* vm_addr, std::size_t size) {
     MPI_Win_create(vm_addr,
@@ -197,7 +197,7 @@ public:
                    MPI_INFO_NULL,
                    comm,
                    &win_);
-    MPI_Win_lock_all(0, win_);
+    MPI_Win_lock_all(MPI_MODE_NOCHECK, win_);
   }
   ~win_manager() {
     if (win_ != MPI_WIN_NULL) {
